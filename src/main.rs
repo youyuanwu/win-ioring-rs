@@ -1,9 +1,7 @@
-use windows::{
-    core::*, 
-    Win32::Foundation::*,
-    Win32::Storage::FileSystem::*,
-    Win32::Security::*
-};
+use windows::{core::*, Win32::Foundation::*, Win32::Storage::FileSystem::*};
+
+use std::fs::File;
+use std::os::windows::io::*;
 
 fn main() -> Result<()> {
     let res: IORING_CAPABILITIES;
@@ -20,29 +18,18 @@ fn main() -> Result<()> {
     }
     println!("ring created");
 
-    // open file handle
-    let lpfilename : PCSTR;
-
-    let dwdesiredaccess = FILE_READ_DATA;
-    let dwsharemode = FILE_SHARE_READ;
-    let lpsecurityattributes = SECURITY_ATTRIBUTES::default();
-    let dwcreationdisposition = OPEN_EXISTING;
-    let dwflagsandattributes = FILE_ATTRIBUTE_NORMAL;
-    let htemplatefile = HANDLE::default();
-    let f_handle : HANDLE;
-    unsafe{
-        lpfilename = PCSTR(String::from("README.md\0").as_mut_vec().as_ptr());
-        f_handle = CreateFileA(lpfilename, dwdesiredaccess, dwsharemode, &lpsecurityattributes, dwcreationdisposition, dwflagsandattributes, htemplatefile)?;
-    }
+    // open file from std
+    let file = File::open("README.md").expect("cannot open");
+    let raw_handle = file.as_raw_handle();
     println!("file opened");
 
     let mut file_ref = IORING_HANDLE_REF::default();
     let mut file_handle_ref = IORING_HANDLE_REF_0::default();
-    file_handle_ref.Handle = f_handle;
+    file_handle_ref.Handle = HANDLE(raw_handle as isize);
     file_ref.Handle = file_handle_ref;
-    
+
     let read_flags = IORING_SQE_FLAGS::default();
-    
+
     let mut dataref = IORING_BUFFER_REF::default();
     let mut data_ref_0 = IORING_BUFFER_REF_0::default();
     let mut buffer = vec![0; 255];
@@ -67,8 +54,8 @@ fn main() -> Result<()> {
 
     println!("read built");
 
-    let numentry : u32;
-    unsafe{
+    let numentry: u32;
+    unsafe {
         numentry = SubmitIoRing(ring, 1 /*waitOperations*/, 4294967295u32)?;
     }
 
