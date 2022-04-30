@@ -5,7 +5,6 @@ use std::os::windows::io::*;
 
 use win_ioring_rs::*;
 
-
 fn main() -> Result<()> {
     let mut ring: IoRing = IoRing::new(20).unwrap();
 
@@ -17,10 +16,17 @@ fn main() -> Result<()> {
     println!("file opened");
 
     let mut buffer = vec![0; 255];
+    let len = buffer.len();
+    
+    let buffers = vec![(buffer.as_mut_ptr(), len)];
+
+    ring.BuildIoRingRegisterBuffers(buffers, 10)?;
+
+    ring.BuildIoRingRegisterFileHandles(vec![raw_handle], 11)?;
 
     let args = args::ReadArg::new()
-        .with_buffer(buffer.as_mut_ptr())
-        .with_file(raw_handle)
+        .with_registered_buffer(0/*index*/,0/*buffer offset */)
+        .with_regestered_file(0)
         .with_numofbytestoread(20) // buffer needs to be bigger
         .with_offset(0)
         .with_userdata(11);
@@ -38,6 +44,5 @@ fn main() -> Result<()> {
     println!("ring closed");
 
     println!("data read: [{}]", String::from_utf8_lossy(&buffer));
-    // println!("data read raw: {:?}", buffer);
     Ok(())
 }

@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-pub mod entry;
+pub mod args;
 
 use windows::{core::*, Win32::Storage::FileSystem::*};
 
@@ -29,33 +29,38 @@ impl IoRing {
 
     pub fn BuildIoRingReadFile(
         &mut self,
-        raw_handle: RawHandle,
-        buff: *mut u8,
-        len: usize,
-        offset: u64,
-        userdata: usize,
+        args : args::ReadArg
     ) -> std::result::Result<(), Error> {
         let read_flags = IOSQE_FLAGS_NONE;
 
-        let file_ref = IORING_HANDLE_REF {
-            Kind: IORING_REF_RAW,
-            Handle: IORING_HANDLE_REF_0 {
-                Handle: HANDLE(raw_handle as isize),
-            },
-        };
-
-        let dataref = IORING_BUFFER_REF {
-            Kind: IORING_REF_RAW,
-            Buffer: IORING_BUFFER_REF_0 {
-                Address: buff as *mut std::ffi::c_void,
-            },
-        };
-
         unsafe {
             BuildIoRingReadFile(
-                self.ring, file_ref, dataref, len as u32, offset, userdata, read_flags,
+                self.ring, args.handle_ref, args.data_ref, args.numofbytestoread, args.offset, args.userdata, read_flags,
             )
         }
+    }
+
+    pub fn BuildIoRingRegisterFileHandles(
+        &mut self,
+        raw_handle_vec: Vec<RawHandle>,
+        userdata: usize
+    )-> std::result::Result<(), Error>{
+        let handle_vec : Vec<HANDLE> = raw_handle_vec.iter().map(
+            |&h| HANDLE(h as isize)
+        ).collect();
+        unsafe{BuildIoRingRegisterFileHandles(self.ring, &handle_vec[..], userdata)}
+    }
+
+    pub fn BuildIoRingRegisterBuffers(
+        &mut self,
+        buffers: Vec<(*mut u8, usize)>,
+        userdata: usize
+    )-> std::result::Result<(), Error>{
+        let buffer_infos: Vec<IORING_BUFFER_INFO> = buffers.iter().map(
+            |buff| IORING_BUFFER_INFO{Address: buff.0 as *mut std::ffi::c_void, Length: buff.1 as u32}
+        ).collect();
+
+        unsafe{BuildIoRingRegisterBuffers(self.ring, &buffer_infos[..], userdata)}
     }
 
     pub fn SubmitIoRing(
