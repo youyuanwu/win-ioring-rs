@@ -14,7 +14,11 @@ impl IoRing {
     // entries is size of the queue
     pub fn new(entries: u32) -> io::Result<IoRing> {
         let res: IORING_CAPABILITIES = unsafe { QueryIoRingCapabilities()? };
-        let flags = IORING_CREATE_FLAGS::default();
+        // currently win32 only has none flags
+        let flags = IORING_CREATE_FLAGS{
+            Required: IORING_CREATE_REQUIRED_FLAGS_NONE,
+            Advisory: IORING_CREATE_ADVISORY_FLAGS_NONE
+        };
 
         let innerring: *mut HIORING__ =
             unsafe { CreateIoRing(res.MaxVersion, flags, entries, entries)? };
@@ -23,7 +27,7 @@ impl IoRing {
 
     pub fn BuildIoRingReadFile(&mut self, entry : entry::Read) -> std::result::Result<(),Error> {
 
-        let read_flags = IORING_SQE_FLAGS::default();
+        let read_flags = IOSQE_FLAGS_NONE;
 
         unsafe {
             BuildIoRingReadFile(

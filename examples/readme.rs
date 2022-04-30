@@ -13,7 +13,7 @@ fn main() -> Result<()> {
 
     // open file from std
     let file = File::open("README.md").expect("cannot open");
-    let raw_handle = file.as_raw_handle();
+    let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
     let mut buffer = vec![0; 255];

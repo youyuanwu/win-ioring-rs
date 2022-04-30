@@ -13,18 +13,19 @@ pub struct Read {
 
 impl Read {
     pub fn new(raw_handle: RawHandle, buf: & mut Vec<u8>, len: usize) -> io::Result<Read> {
-        let mut file_ref = IORING_HANDLE_REF::default();
-        let mut file_handle_ref = IORING_HANDLE_REF_0::default();
-        file_handle_ref.Handle = HANDLE(raw_handle as isize);
-        file_ref.Handle = file_handle_ref;
+        let file_ref = IORING_HANDLE_REF{
+            Kind: IORING_REF_RAW,
+            Handle : IORING_HANDLE_REF_0{
+                Handle: HANDLE(raw_handle as isize)
+            }
+        };
 
-        //let read_flags = IORING_SQE_FLAGS::default();
-
-        let mut dataref = IORING_BUFFER_REF::default();
-        let mut data_ref_0 = IORING_BUFFER_REF_0::default();
-        //let mut buffer = vec![0; 255];
-        data_ref_0.Address = buf.as_mut_ptr() as *mut std::ffi::c_void;
-        dataref.Buffer = data_ref_0;
+        let dataref = IORING_BUFFER_REF{
+            Kind : IORING_REF_RAW,
+            Buffer : IORING_BUFFER_REF_0{
+                Address : buf.as_mut_ptr() as *mut std::ffi::c_void
+            }
+        };
         return Ok(Read {
             handle_ref: file_ref,
             data_ref: dataref,
