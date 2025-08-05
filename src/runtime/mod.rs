@@ -10,29 +10,31 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::sync::{oneshot, Notify};
+use futures::channel::oneshot;
 use windows::core::HRESULT;
 
-use crate::io_ring::IoRing;
+use crate::{io_ring::IoRing, sys::AsyncEvent};
 
 #[cfg(test)]
 mod tests;
+
+pub mod rt;
 
 pub type BufResult = (windows::core::Result<()>, Vec<u8>);
 
 pub struct Driver {
     io_ring: Handle,
-    event: crate::event::AsyncEvent,
+    event: AsyncEvent,
     // receives notifications there are submissions pushed.
-    submit_notify_rx: Rc<Notify>,
-    shutdown_notify_rx: Rc<Notify>,
+    submit_notify_rx: Rc<AsyncEvent>,
+    shutdown_notify_rx: Rc<AsyncEvent>,
 }
 
 pub struct HandleInner {
     io_ring: IoRing,
     // signals there are submissions pushed.
-    submit_notify_tx: Rc<Notify>,
-    shutdown_notify_tx: Rc<Notify>,
+    submit_notify_tx: Rc<AsyncEvent>,
+    shutdown_notify_tx: Rc<AsyncEvent>,
 }
 
 impl Drop for HandleInner {
@@ -62,7 +64,8 @@ impl Handle {
     /// User needs to ensure all operations are completed before calling this.
     pub fn shutdown(&self) {
         // Notify the driver to shutdown.
-        self.as_inner().shutdown_notify_tx.notify_one();
+        self.as_inner().shutdown_notify_tx.signal().unwrap();
+        // We never reset the event because we do not support restart.
     }
 }
 
@@ -76,13 +79,13 @@ enum UserData {
 
 impl Driver {
     pub fn new(mut io_ring: IoRing) -> Self {
-        let event = crate::event::AsyncEvent::new().expect("Failed to create AsyncEvent");
+        let event = crate::sys::AsyncEvent::new().expect("Failed to create AsyncEvent");
         io_ring
             .set_io_ring_completion_event(event.handle())
             .expect("Failed to set completion event");
 
-        let submit_notify = Rc::new(Notify::new());
-        let shutdown_notify = Rc::new(Notify::new());
+        let submit_notify = Rc::new(AsyncEvent::new_manual_reset().unwrap());
+        let shutdown_notify = Rc::new(AsyncEvent::new_manual_reset().unwrap());
         Self {
             io_ring: Handle {
                 inner: Rc::new(RefCell::new(HandleInner {
@@ -104,16 +107,17 @@ impl Driver {
     // Run the loop to process completions
     pub async fn drive(&self) {
         loop {
-            tokio::select! {
+            futures::select! {
                 // Wait for new submissions
-                _ = self.submit_notify_rx.notified() => {
+                _ = self.submit_notify_rx.wait().fuse() => {
+                    self.submit_notify_rx.reset().unwrap();
                     // Submit pending operations
                     let mut inner = self.io_ring.as_inner();
                     let ring = &mut inner.borrow_mut().io_ring;
                     ring.submit(0, 0).unwrap();
                 }
                 // Wait for completions
-                _ = self.event.wait() => {
+                _ = self.event.wait().fuse() => {
                     // Reset the event for next completion
                     self.event.reset().unwrap();
                     // process all completions.
@@ -132,7 +136,7 @@ impl Driver {
                     }
 
                 }
-                _ = self.shutdown_notify_rx.notified() => {
+                _ = self.shutdown_notify_rx.wait().fuse() => {
                     // Shutdown signal received, break the loop
                     // TODO: user is responsible for ensure all operations are completed before shutdown.
                     break;
@@ -151,7 +155,7 @@ impl Handle {
         offset: u64,
     ) -> windows::core::Result<ReadFut> {
         let mut inner = self.inner.as_ref().borrow_mut();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = futures::channel::oneshot::channel();
 
         let ring = &mut inner.io_ring;
         let ptr = buffer.as_mut_ptr() as *mut _;
@@ -170,7 +174,7 @@ impl Handle {
 
         // Signal the driver there is a new entry.
         // Driver does not process it until the next await point.
-        inner.submit_notify_tx.notify_one();
+        inner.submit_notify_tx.signal().unwrap();
 
         // signal submission ready.
         Ok(ReadFut::new(rx))

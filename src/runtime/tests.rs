@@ -1,6 +1,5 @@
 use crate::io_ring::IoRing;
 
-#[tokio::test(flavor = "current_thread")]
 async fn readme_test_async() {
     let local = tokio::task::LocalSet::new();
     local
@@ -28,4 +27,15 @@ async fn readme_test_async() {
             driver.await.unwrap();
         })
         .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tokio_readme_test() {
+    readme_test_async().await;
+}
+
+// Custom runtime test.
+#[test]
+fn rt_readme_test() {
+    crate::runtime::rt::Runtime::new().block_on(readme_test_async());
 }

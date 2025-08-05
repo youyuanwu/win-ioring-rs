@@ -1,7 +1,7 @@
 use std::{cell::RefCell, fs::File, rc::Rc};
 
-use crate::event::AsyncEvent;
-use crate::io_ring::{ops::ReadOp, BufferInfo, IoRing};
+use crate::io_ring::{BufferInfo, IoRing, ops::ReadOp};
+use crate::sys::AsyncEvent;
 
 #[test]
 fn readme_test() {
@@ -137,7 +137,7 @@ async fn readme_test_async() {
         .run_until(async move {
             let ring_cp2 = ring_cp.clone();
             // spawn read task.
-            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let t1 = tokio::task::spawn_local(async move {
                 let ctx = Box::into_raw(Box::new(tx));
                 let op = ReadOp::builder()
@@ -170,13 +170,13 @@ async fn readme_test_async() {
                     if ctx == 0 {
                         continue; // skip if no user data for registering handles.
                     }
-                    let ctx = cp.UserData as *mut tokio::sync::oneshot::Sender<()>;
+                    let ctx = cp.UserData as *mut futures::channel::oneshot::Sender<()>;
                     let tx = unsafe { Box::from_raw(ctx) };
                     tx.send(()).unwrap();
                     println!("Completion received");
                 }
             });
-            let (r1, r2) = tokio::join!(t1, t2);
+            let (r1, r2) = futures::join!(t1, t2);
             r1.unwrap();
             r2.unwrap();
         })

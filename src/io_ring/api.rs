@@ -1,4 +1,4 @@
-use windows::{core::*, Win32::Storage::FileSystem::*};
+use windows::{Win32::Storage::FileSystem::*, core::*};
 
 use windows::Win32::Foundation::*;
 
@@ -130,10 +130,9 @@ impl IoRing {
         userdata: usize,
     ) -> std::result::Result<(), Error> {
         // Convert the types.
-        let buffers = std::slice::from_raw_parts(
-            buffers.as_ptr() as *const IORING_BUFFER_INFO,
-            buffers.len(),
-        );
+        let buffers = unsafe {
+            std::slice::from_raw_parts(buffers.as_ptr() as *const IORING_BUFFER_INFO, buffers.len())
+        };
         unsafe { BuildIoRingRegisterBuffers(self.ring, buffers, userdata) }
     }
 

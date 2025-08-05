@@ -1,12 +1,12 @@
 use futures::FutureExt;
+use futures::channel::oneshot;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::oneshot;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWait,
-    WaitForSingleObject, INFINITE, WT_EXECUTEONLYONCE,
+    CreateEventW, INFINITE, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWait,
+    WT_EXECUTEONLYONCE, WaitForSingleObject,
 };
 
 /// An async wrapper around Windows Event objects using RegisterWaitForSingleObject.
@@ -176,7 +176,8 @@ unsafe extern "system" fn wait_callback(
 ) {
     if !context.is_null() {
         // Convert back to sender and send completion signal
-        let sender: Box<oneshot::Sender<()>> = Box::from_raw(context as *mut oneshot::Sender<()>);
+        let sender: Box<oneshot::Sender<()>> =
+            unsafe { Box::from_raw(context as *mut oneshot::Sender<()>) };
         let _ = sender.send(());
     }
 }
@@ -202,7 +203,7 @@ impl Drop for AsyncEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_async_event_signal_and_wait() -> windows::core::Result<()> {
