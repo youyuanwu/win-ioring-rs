@@ -63,8 +63,8 @@ impl AsyncEvent {
         unsafe {
             match WaitForSingleObject(self.handle, timeout) {
                 WAIT_OBJECT_0 => Ok(()),
-                WAIT_TIMEOUT => Err(windows::core::Error::from_win32()),
-                _ => Err(windows::core::Error::from_win32()),
+                WAIT_TIMEOUT => Err(windows::core::Error::from_thread()),
+                _ => Err(windows::core::Error::from_thread()),
             }
         }
     }
