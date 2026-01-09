@@ -72,4 +72,35 @@ mod yield_tests {
         assert_eq!(data1.as_slice(), &[0, 1]);
         assert_eq!(data2.as_slice(), &[1, 0]);
     }
+
+    /// Test to demonstrate deadlock scenario caused by Rust temporary lifetime extension.
+    #[test]
+    fn test_deadlock_demo() {
+        use std::sync::Arc;
+        let tasks = Arc::new(Mutex::new(Vec::<Box<dyn FnOnce() + 'static + Send>>::new()));
+        let tasks_clone = tasks.clone();
+        tasks.lock().unwrap().push(Box::new(move || {
+            // task to try run the next task
+            let task = tasks_clone.lock().unwrap().pop();
+            if let Some(task) = task {
+                task();
+            }
+        }));
+
+        // run all tasks
+        loop {
+            let task = tasks.lock().unwrap().pop();
+            if let Some(task) = task {
+                task();
+            } else {
+                break;
+            }
+        }
+
+        // This following code deadlocks because lock is held while trying execute next task
+        // The temporary lock guard is extended to the body of the while let loop.
+        // while let Some(task) = tasks.lock().unwrap().pop() {
+        //     task();
+        // }
+    }
 }
