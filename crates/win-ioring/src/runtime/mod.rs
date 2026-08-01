@@ -17,6 +17,8 @@ use crate::{io_ring::IoRing, sys::AsyncEvent};
 
 pub type BufResult = (windows::core::Result<()>, Vec<u8>);
 
+pub mod slab;
+
 pub struct Driver {
     io_ring: Handle,
     event: AsyncEvent,

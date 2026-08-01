@@ -1,0 +1,845 @@
+//! Driver-owned storage for in-flight operations.
+//!
+//! An operation's state — including the caller's buffer — must outlive the
+//! future awaiting it, because the kernel keeps a pointer into that buffer until
+//! the operation completes, and a future can be dropped at any time. The slab is
+//! where that state lives.
+//!
+//! # Why payloads are boxed
+//!
+//! The slab's own storage grows, which moves its elements. Each payload is
+//! therefore held behind its own [`Box`], so the address handed to the kernel
+//! stays put no matter how many further operations are inserted. Nothing in this
+//! module ever moves a payload out of its box while the slot is occupied.
+//!
+//! # Tokens
+//!
+//! Every slot is addressed by a [`Token`], a `usize` suitable for use as the
+//! platform's user data. A token encodes three things:
+//!
+//! - a **kind**, distinguishing an operation's completion from the completion of
+//!   a cancellation request, since the platform reports both and they must not
+//!   be confused;
+//! - a **slot index**;
+//! - a **generation**, incremented each time a slot is reused, so that a
+//!   completion arriving for a long-finished operation cannot be mistaken for
+//!   the operation now occupying that slot.
+//!
+//! # Slot state
+//!
+//! State is two orthogonal dimensions rather than one flat enum, because
+//! "the future was dropped" and "how far the operation has progressed" vary
+//! independently:
+//!
+//! - [`Lifecycle`] tracks progress: described, built into the submission queue,
+//!   or submitted to the kernel.
+//! - [`Observer`] tracks whether a future is still waiting.
+//!
+//! Dropping a future moves the observer dimension; a submission retry moves the
+//! lifecycle dimension. Keeping them separate is what lets the driver tell a
+//! detached-but-unsubmitted operation from a detached-and-submitted one, which
+//! need different handling: only the latter can be cancelled.
+//!
+//! [`SlotState::Tombstone`] is a third, terminal state, entered when an
+//! operation's own completion arrives while cancellation requests against it are
+//! still outstanding.
+
+use std::any::Any;
+
+/// How far an operation has progressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// The payload is placed but nothing has been built into the submission
+    /// queue. Dropping here is free: no queue entry references the buffer.
+    Described,
+    /// A submission queue entry exists. The entry cannot be withdrawn, so the
+    /// payload must be retained even if the future goes away.
+    Built,
+    /// The kernel has accepted the operation.
+    Submitted,
+}
+
+/// Whether a future is still waiting on an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observer {
+    /// A future is waiting for this operation's result.
+    Live,
+    /// The future was dropped. The operation still runs to completion, but
+    /// nobody wants the answer.
+    Detached,
+}
+
+/// What kind of completion a token identifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// The completion of an operation.
+    Operation,
+    /// The completion of a cancellation request.
+    Cancel,
+}
+
+/// Number of bits a token spends on the kind discriminant.
+const KIND_BITS: u32 = 1;
+/// Number of bits a token spends on the slot index.
+const INDEX_BITS: u32 = 16;
+/// Number of bits left over for the generation counter.
+///
+/// This is 15 on a 32-bit target and 47 on a 64-bit one. The layout is
+/// deliberately identical on both so that reasoning about it does not depend on
+/// the pointer width.
+const GENERATION_BITS: u32 = usize::BITS - KIND_BITS - INDEX_BITS;
+
+/// The largest number of slots the token layout can address.
+pub const MAX_SLOTS: usize = 1 << INDEX_BITS;
+
+const KIND_MASK: usize = (1 << KIND_BITS) - 1;
+const INDEX_MASK: usize = (1 << INDEX_BITS) - 1;
+const GENERATION_MASK: usize = (1usize << GENERATION_BITS) - 1;
+
+/// Identifies a slot, and what sort of completion to expect for it.
+///
+/// Tokens are handed to the platform as user data and come back on completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Token(usize);
+
+impl Token {
+    fn new(kind: TokenKind, index: usize, generation: usize) -> Self {
+        debug_assert!(index < MAX_SLOTS);
+        let kind_bit = match kind {
+            TokenKind::Operation => 0,
+            TokenKind::Cancel => 1,
+        };
+        Token(
+            kind_bit
+                | ((index & INDEX_MASK) << KIND_BITS)
+                | ((generation & GENERATION_MASK) << (KIND_BITS + INDEX_BITS)),
+        )
+    }
+
+    /// Returns what kind of completion this token identifies.
+    pub fn kind(self) -> TokenKind {
+        if self.0 & KIND_MASK == 0 {
+            TokenKind::Operation
+        } else {
+            TokenKind::Cancel
+        }
+    }
+
+    fn index(self) -> usize {
+        (self.0 >> KIND_BITS) & INDEX_MASK
+    }
+
+    fn generation(self) -> usize {
+        (self.0 >> (KIND_BITS + INDEX_BITS)) & GENERATION_MASK
+    }
+
+    /// Returns the same slot and generation, but identifying a cancellation
+    /// request's own completion rather than the operation's.
+    pub fn to_cancel(self) -> Token {
+        Token::new(TokenKind::Cancel, self.index(), self.generation())
+    }
+
+    /// Returns the same slot and generation, identifying the operation.
+    pub fn to_operation(self) -> Token {
+        Token::new(TokenKind::Operation, self.index(), self.generation())
+    }
+
+    /// Returns the raw value to hand to the platform as user data.
+    pub fn as_user_data(self) -> usize {
+        self.0
+    }
+
+    /// Reconstructs a token from platform user data.
+    pub fn from_user_data(value: usize) -> Self {
+        Token(value)
+    }
+}
+
+/// The state of a slot.
+enum SlotState {
+    /// Free, awaiting reuse. Holds the next free index, forming a free list.
+    Vacant { next_free: Option<usize> },
+    /// Holds a live operation.
+    Occupied {
+        lifecycle: Lifecycle,
+        observer: Observer,
+        /// Boxed so its address is independent of the slab's own storage.
+        payload: Box<dyn Any>,
+        /// Cancellation requests issued against this operation that have not
+        /// yet reported their own completion.
+        pending_cancels: u32,
+    },
+    /// The operation completed, but cancellation requests against it are still
+    /// outstanding. The payload is gone; only the accounting remains, so the
+    /// slot index cannot be reused until those cancels report.
+    Tombstone { pending_cancels: u32 },
+}
+
+struct Slot {
+    generation: usize,
+    state: SlotState,
+}
+
+/// The outcome of looking a token up.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// The token refers to a live slot.
+    Live,
+    /// The token refers to a tombstoned slot: the operation is over but
+    /// cancellations against it are still outstanding.
+    Tombstoned,
+    /// The token does not refer to anything the slab is tracking. This covers a
+    /// stale token whose slot has since been reused, an index out of range, and
+    /// a token for a vacant slot.
+    Unknown,
+}
+
+/// Driver-owned storage for in-flight operations.
+pub struct OpSlab {
+    slots: Vec<Slot>,
+    free_head: Option<usize>,
+    occupied: usize,
+}
+
+impl OpSlab {
+    /// Creates an empty slab.
+    pub fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free_head: None,
+            occupied: 0,
+        }
+    }
+
+    /// Returns the number of slots holding a live operation.
+    ///
+    /// Tombstones are not counted: their operation has already completed.
+    pub fn occupied(&self) -> usize {
+        self.occupied
+    }
+
+    /// Returns the number of slots that still expect a completion of any kind,
+    /// including tombstones awaiting cancellation completions.
+    ///
+    /// Shutdown uses this to decide whether the kernel is quiescent.
+    pub fn outstanding(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| match &s.state {
+                SlotState::Vacant { .. } => false,
+                SlotState::Occupied { .. } => true,
+                SlotState::Tombstone { pending_cancels } => *pending_cancels > 0,
+            })
+            .count()
+    }
+
+    /// Places a payload in the slab and returns its operation token.
+    ///
+    /// The slot starts in [`Lifecycle::Described`] with a [`Observer::Live`]
+    /// future.
+    ///
+    /// # Errors
+    ///
+    /// Returns the payload unchanged if the slab is full, which happens when
+    /// [`MAX_SLOTS`] slots are already in use.
+    pub fn insert(&mut self, payload: Box<dyn Any>) -> Result<Token, Box<dyn Any>> {
+        let index = match self.free_head {
+            Some(index) => {
+                let SlotState::Vacant { next_free } = self.slots[index].state else {
+                    unreachable!("free list pointed at an occupied slot");
+                };
+                self.free_head = next_free;
+                index
+            }
+            None => {
+                if self.slots.len() >= MAX_SLOTS {
+                    return Err(payload);
+                }
+                self.slots.push(Slot {
+                    generation: 0,
+                    state: SlotState::Vacant { next_free: None },
+                });
+                self.slots.len() - 1
+            }
+        };
+
+        let slot = &mut self.slots[index];
+        slot.state = SlotState::Occupied {
+            lifecycle: Lifecycle::Described,
+            observer: Observer::Live,
+            payload,
+            pending_cancels: 0,
+        };
+        self.occupied += 1;
+        Ok(Token::new(TokenKind::Operation, index, slot.generation))
+    }
+
+    fn slot_for(&self, token: Token) -> Option<&Slot> {
+        let slot = self.slots.get(token.index())?;
+        if slot.generation == token.generation() {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    fn slot_for_mut(&mut self, token: Token) -> Option<&mut Slot> {
+        let generation = token.generation();
+        let slot = self.slots.get_mut(token.index())?;
+        if slot.generation == generation {
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// Classifies a token without modifying anything.
+    pub fn lookup(&self, token: Token) -> Lookup {
+        match self.slot_for(token).map(|s| &s.state) {
+            Some(SlotState::Occupied { .. }) => Lookup::Live,
+            Some(SlotState::Tombstone { .. }) => Lookup::Tombstoned,
+            _ => Lookup::Unknown,
+        }
+    }
+
+    /// Returns the payload for a live slot.
+    ///
+    /// The reference borrows through the box, so the payload cannot be moved
+    /// while the slot is occupied.
+    pub fn payload_mut(&mut self, token: Token) -> Option<&mut dyn Any> {
+        match self.slot_for_mut(token)?.state {
+            SlotState::Occupied {
+                ref mut payload, ..
+            } => Some(payload.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Returns the lifecycle and observer state of a live slot.
+    pub fn state(&self, token: Token) -> Option<(Lifecycle, Observer)> {
+        match self.slot_for(token)?.state {
+            SlotState::Occupied {
+                lifecycle,
+                observer,
+                ..
+            } => Some((lifecycle, observer)),
+            _ => None,
+        }
+    }
+
+    /// Advances a slot's lifecycle.
+    ///
+    /// Returns `false` if the token does not refer to a live slot. Lifecycle
+    /// only ever moves forward; an attempt to move it backwards is ignored.
+    pub fn set_lifecycle(&mut self, token: Token, next: Lifecycle) -> bool {
+        let Some(slot) = self.slot_for_mut(token) else {
+            return false;
+        };
+        match slot.state {
+            SlotState::Occupied {
+                ref mut lifecycle, ..
+            } => {
+                let forward = matches!(
+                    (*lifecycle, next),
+                    (Lifecycle::Described, Lifecycle::Built)
+                        | (Lifecycle::Described, Lifecycle::Submitted)
+                        | (Lifecycle::Built, Lifecycle::Submitted)
+                );
+                if forward {
+                    *lifecycle = next;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Marks that the future awaiting this operation has been dropped.
+    ///
+    /// Returns the lifecycle the operation had reached, which determines what
+    /// the caller must do next: a [`Lifecycle::Described`] operation can be
+    /// released immediately, a [`Lifecycle::Built`] one must be retained, and a
+    /// [`Lifecycle::Submitted`] one may be worth cancelling.
+    pub fn detach(&mut self, token: Token) -> Option<Lifecycle> {
+        match self.slot_for_mut(token)?.state {
+            SlotState::Occupied {
+                lifecycle,
+                ref mut observer,
+                ..
+            } => {
+                *observer = Observer::Detached;
+                Some(lifecycle)
+            }
+            _ => None,
+        }
+    }
+
+    /// Records that a cancellation request has been issued against a slot.
+    ///
+    /// Returns the token to give that cancellation request as its own user
+    /// data, or `None` if the slot is not tracking anything.
+    pub fn register_cancel(&mut self, token: Token) -> Option<Token> {
+        let slot = self.slot_for_mut(token)?;
+        match slot.state {
+            SlotState::Occupied {
+                ref mut pending_cancels,
+                ..
+            }
+            | SlotState::Tombstone {
+                ref mut pending_cancels,
+            } => {
+                *pending_cancels += 1;
+                Some(token.to_cancel())
+            }
+            SlotState::Vacant { .. } => None,
+        }
+    }
+
+    /// Handles an operation's own terminal completion.
+    ///
+    /// Returns the payload so the caller can resolve the future and release the
+    /// buffer. If cancellation requests against this operation are still
+    /// outstanding, the slot becomes a tombstone and its index is withheld from
+    /// reuse until those cancellations report; otherwise the slot is freed
+    /// immediately.
+    ///
+    /// Returns `None` for a token the slab is not tracking, which is how a
+    /// stale or unrecognised completion is safely ignored.
+    pub fn complete(&mut self, token: Token) -> Option<Box<dyn Any>> {
+        let index = token.index();
+        let generation = token.generation();
+        let slot = self.slots.get_mut(index)?;
+        if slot.generation != generation {
+            return None;
+        }
+        // Check before taking. Replacing first and restoring on mismatch would
+        // corrupt a tombstone's cancellation accounting.
+        if !matches!(slot.state, SlotState::Occupied { .. }) {
+            return None;
+        }
+        let SlotState::Occupied {
+            payload,
+            pending_cancels,
+            ..
+        } = std::mem::replace(&mut slot.state, SlotState::Vacant { next_free: None })
+        else {
+            unreachable!("state was checked to be occupied");
+        };
+
+        self.occupied -= 1;
+        if pending_cancels > 0 {
+            slot.state = SlotState::Tombstone { pending_cancels };
+        } else {
+            self.free_slot(index);
+        }
+        Some(payload)
+    }
+
+    /// Handles a cancellation request's own completion.
+    ///
+    /// Returns `true` if the slot was accounted for. When the last outstanding
+    /// cancellation against a tombstoned slot reports, the slot is finally
+    /// freed for reuse.
+    pub fn complete_cancel(&mut self, token: Token) -> bool {
+        let index = token.index();
+        let generation = token.generation();
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.generation != generation {
+            return false;
+        }
+        match slot.state {
+            SlotState::Occupied {
+                ref mut pending_cancels,
+                ..
+            } => {
+                *pending_cancels = pending_cancels.saturating_sub(1);
+                true
+            }
+            SlotState::Tombstone {
+                ref mut pending_cancels,
+            } => {
+                *pending_cancels = pending_cancels.saturating_sub(1);
+                if *pending_cancels == 0 {
+                    self.free_slot(index);
+                }
+                true
+            }
+            SlotState::Vacant { .. } => false,
+        }
+    }
+
+    /// Frees a slot and bumps its generation so outstanding tokens for it
+    /// become stale.
+    fn free_slot(&mut self, index: usize) {
+        let free_head = self.free_head;
+        let slot = &mut self.slots[index];
+        // Wrapping is deliberate. After 2^GENERATION_BITS reuses of one slot a
+        // stale token could alias again; that is 32768 reuses on a 32-bit
+        // target and 2^47 on a 64-bit one.
+        slot.generation = slot.generation.wrapping_add(1) & GENERATION_MASK;
+        slot.state = SlotState::Vacant {
+            next_free: free_head,
+        };
+        self.free_head = Some(index);
+    }
+
+    /// Removes every remaining payload, returning them to the caller.
+    ///
+    /// Used at teardown once the kernel is known to be finished with them.
+    pub fn drain(&mut self) -> Vec<Box<dyn Any>> {
+        let mut out = Vec::new();
+        for index in 0..self.slots.len() {
+            let state = std::mem::replace(
+                &mut self.slots[index].state,
+                SlotState::Vacant { next_free: None },
+            );
+            match state {
+                SlotState::Occupied { payload, .. } => {
+                    self.occupied -= 1;
+                    out.push(payload);
+                    self.free_slot(index);
+                }
+                other => self.slots[index].state = other,
+            }
+        }
+        out
+    }
+
+    /// Deliberately leaks every remaining payload.
+    ///
+    /// Used at teardown when the kernel may still hold pointers into those
+    /// buffers and quiescence could not be established. Leaking is the correct
+    /// trade against a use-after-free.
+    pub fn leak(&mut self) -> usize {
+        let mut leaked = 0;
+        for index in 0..self.slots.len() {
+            let state = std::mem::replace(
+                &mut self.slots[index].state,
+                SlotState::Vacant { next_free: None },
+            );
+            if let SlotState::Occupied { payload, .. } = state {
+                std::mem::forget(payload);
+                self.occupied -= 1;
+                leaked += 1;
+            }
+        }
+        leaked
+    }
+}
+
+impl Default for OpSlab {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(v: u32) -> Box<dyn Any> {
+        Box::new(vec![v; 8])
+    }
+
+    fn payload_addr(slab: &mut OpSlab, token: Token) -> *const u8 {
+        slab.payload_mut(token)
+            .unwrap()
+            .downcast_ref::<Vec<u32>>()
+            .unwrap()
+            .as_ptr() as *const u8
+    }
+
+    /// The whole design rests on a payload's address being independent of the
+    /// slab's own storage, which reallocates as it grows.
+    #[test]
+    fn payload_addresses_survive_slab_growth() {
+        let mut slab = OpSlab::new();
+        let mut tokens = Vec::new();
+        let mut addrs = Vec::new();
+
+        for i in 0..8 {
+            let t = slab.insert(payload(i)).unwrap();
+            addrs.push(payload_addr(&mut slab, t));
+            tokens.push(t);
+        }
+
+        // Force many reallocations of the slab's own vector.
+        for i in 8..2048 {
+            slab.insert(payload(i)).unwrap();
+        }
+
+        for (t, expected) in tokens.iter().zip(&addrs) {
+            assert_eq!(
+                payload_addr(&mut slab, *t),
+                *expected,
+                "payload moved when the slab grew"
+            );
+        }
+    }
+
+    #[test]
+    fn token_fields_round_trip() {
+        let t = Token::new(TokenKind::Operation, 1234, 56);
+        assert_eq!(t.kind(), TokenKind::Operation);
+        assert_eq!(t.index(), 1234);
+        assert_eq!(t.generation(), 56);
+
+        let c = t.to_cancel();
+        assert_eq!(c.kind(), TokenKind::Cancel);
+        assert_eq!(c.index(), 1234);
+        assert_eq!(c.generation(), 56);
+        assert_eq!(c.to_operation(), t);
+
+        assert_eq!(Token::from_user_data(t.as_user_data()), t);
+    }
+
+    #[test]
+    fn max_index_and_generation_do_not_collide() {
+        let max_index = MAX_SLOTS - 1;
+        let max_generation = GENERATION_MASK;
+        let t = Token::new(TokenKind::Cancel, max_index, max_generation);
+        assert_eq!(t.kind(), TokenKind::Cancel);
+        assert_eq!(t.index(), max_index);
+        assert_eq!(t.generation(), max_generation);
+    }
+
+    /// A completion for a long-finished operation must never be attributed to
+    /// whatever now occupies that slot.
+    #[test]
+    fn recycled_slots_reject_stale_tokens() {
+        let mut slab = OpSlab::new();
+        let first = slab.insert(payload(1)).unwrap();
+        assert_eq!(slab.lookup(first), Lookup::Live);
+
+        slab.complete(first).unwrap();
+        assert_eq!(slab.lookup(first), Lookup::Unknown);
+
+        let second = slab.insert(payload(2)).unwrap();
+        // The slot index is reused, but the generation differs.
+        assert_eq!(first.index(), second.index());
+        assert_ne!(first.generation(), second.generation());
+
+        assert_eq!(slab.lookup(first), Lookup::Unknown);
+        assert!(slab.complete(first).is_none());
+        // The live operation is untouched by the stale completion.
+        assert_eq!(slab.lookup(second), Lookup::Live);
+    }
+
+    #[test]
+    fn unknown_tokens_are_ignored() {
+        let mut slab = OpSlab::new();
+        let bogus = Token::new(TokenKind::Operation, 9999, 3);
+        assert_eq!(slab.lookup(bogus), Lookup::Unknown);
+        assert!(slab.complete(bogus).is_none());
+        assert!(!slab.complete_cancel(bogus.to_cancel()));
+        assert!(slab.detach(bogus).is_none());
+    }
+
+    #[test]
+    fn lifecycle_only_moves_forward() {
+        let mut slab = OpSlab::new();
+        let t = slab.insert(payload(1)).unwrap();
+        assert_eq!(slab.state(t).unwrap().0, Lifecycle::Described);
+
+        assert!(slab.set_lifecycle(t, Lifecycle::Built));
+        assert_eq!(slab.state(t).unwrap().0, Lifecycle::Built);
+
+        // Backwards is ignored rather than panicking.
+        assert!(slab.set_lifecycle(t, Lifecycle::Described));
+        assert_eq!(slab.state(t).unwrap().0, Lifecycle::Built);
+
+        assert!(slab.set_lifecycle(t, Lifecycle::Submitted));
+        assert_eq!(slab.state(t).unwrap().0, Lifecycle::Submitted);
+    }
+
+    /// Dropping a future moves the observer dimension only, leaving the
+    /// lifecycle intact. This is what lets the driver tell a detached-built
+    /// operation from a detached-submitted one.
+    #[test]
+    fn detach_reports_lifecycle_and_leaves_it_alone() {
+        let mut slab = OpSlab::new();
+
+        let described = slab.insert(payload(1)).unwrap();
+        assert_eq!(slab.detach(described), Some(Lifecycle::Described));
+        assert_eq!(
+            slab.state(described).unwrap(),
+            (Lifecycle::Described, Observer::Detached)
+        );
+
+        let built = slab.insert(payload(2)).unwrap();
+        slab.set_lifecycle(built, Lifecycle::Built);
+        assert_eq!(slab.detach(built), Some(Lifecycle::Built));
+        assert_eq!(
+            slab.state(built).unwrap(),
+            (Lifecycle::Built, Observer::Detached)
+        );
+
+        // A detached-built slot can still be promoted by a retry, at which
+        // point it becomes cancellable.
+        assert!(slab.set_lifecycle(built, Lifecycle::Submitted));
+        assert_eq!(
+            slab.state(built).unwrap(),
+            (Lifecycle::Submitted, Observer::Detached)
+        );
+    }
+
+    /// The operation's own completion releases the buffer; the cancellation's
+    /// completion must not, and must not free the slot early either.
+    #[test]
+    fn tombstone_withholds_the_slot_until_cancels_report() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(7)).unwrap();
+        let cancel = slab.register_cancel(op).unwrap();
+        assert_eq!(cancel.kind(), TokenKind::Cancel);
+
+        // The operation finishes first. Its payload comes back, but the slot
+        // must not be reusable while the cancellation is still outstanding.
+        let recovered = slab.complete(op).unwrap();
+        assert_eq!(recovered.downcast_ref::<Vec<u32>>().unwrap()[0], 7);
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
+        assert_eq!(slab.outstanding(), 1);
+
+        let next = slab.insert(payload(8)).unwrap();
+        assert_ne!(
+            next.index(),
+            op.index(),
+            "a tombstoned slot index was reused too early"
+        );
+
+        // The cancellation reports last, releasing the slot.
+        assert!(slab.complete_cancel(cancel));
+        assert_eq!(slab.lookup(op), Lookup::Unknown);
+    }
+
+    #[test]
+    fn cancel_completing_before_its_target_is_accounted_for() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(3)).unwrap();
+        let cancel = slab.register_cancel(op).unwrap();
+
+        // The cancellation reports first; the operation is still live.
+        assert!(slab.complete_cancel(cancel));
+        assert_eq!(slab.lookup(op), Lookup::Live);
+
+        // The operation's own completion then frees everything.
+        assert!(slab.complete(op).is_some());
+        assert_eq!(slab.lookup(op), Lookup::Unknown);
+        assert_eq!(slab.outstanding(), 0);
+    }
+
+    #[test]
+    fn multiple_cancels_against_one_operation_are_counted() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(1)).unwrap();
+        let c1 = slab.register_cancel(op).unwrap();
+        let c2 = slab.register_cancel(op).unwrap();
+        assert_eq!(c1, c2, "cancel tokens for one slot are indistinguishable");
+
+        slab.complete(op).unwrap();
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
+
+        assert!(slab.complete_cancel(c1));
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned, "one cancel still out");
+
+        assert!(slab.complete_cancel(c2));
+        assert_eq!(slab.lookup(op), Lookup::Unknown);
+    }
+
+    /// A duplicate completion for an operation that has already completed must
+    /// not disturb the tombstone left behind for its outstanding cancellations.
+    #[test]
+    fn double_completion_does_not_corrupt_a_tombstone() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(5)).unwrap();
+        let cancel = slab.register_cancel(op).unwrap();
+
+        assert!(slab.complete(op).is_some());
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
+
+        // A repeat completion for the same token yields nothing and leaves the
+        // tombstone's accounting intact.
+        assert!(slab.complete(op).is_none());
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
+        assert_eq!(slab.outstanding(), 1);
+
+        // The outstanding cancellation still resolves the slot correctly.
+        assert!(slab.complete_cancel(cancel));
+        assert_eq!(slab.lookup(op), Lookup::Unknown);
+        assert_eq!(slab.outstanding(), 0);
+
+        // And the freed index is genuinely reusable afterwards.
+        let reused = slab.insert(payload(6)).unwrap();
+        assert_eq!(reused.index(), op.index());
+    }
+
+    #[test]
+    fn generation_wraps_without_panicking() {
+        let mut slab = OpSlab::new();
+        // Reuse a single slot enough times to exercise the counter.
+        let mut last = slab.insert(payload(0)).unwrap();
+        for _ in 0..1000 {
+            slab.complete(last).unwrap();
+            last = slab.insert(payload(0)).unwrap();
+            assert_eq!(last.index(), 0, "expected the free list to reuse slot 0");
+        }
+        assert_eq!(slab.lookup(last), Lookup::Live);
+    }
+
+    #[test]
+    fn occupied_and_outstanding_track_separately() {
+        let mut slab = OpSlab::new();
+        assert_eq!(slab.occupied(), 0);
+        assert_eq!(slab.outstanding(), 0);
+
+        let a = slab.insert(payload(1)).unwrap();
+        let b = slab.insert(payload(2)).unwrap();
+        assert_eq!(slab.occupied(), 2);
+        assert_eq!(slab.outstanding(), 2);
+
+        let cancel = slab.register_cancel(a).unwrap();
+        slab.complete(a).unwrap();
+        // `a` is tombstoned: no longer occupied, but still outstanding.
+        assert_eq!(slab.occupied(), 1);
+        assert_eq!(slab.outstanding(), 2);
+
+        slab.complete_cancel(cancel);
+        assert_eq!(slab.outstanding(), 1);
+
+        slab.complete(b).unwrap();
+        assert_eq!(slab.occupied(), 0);
+        assert_eq!(slab.outstanding(), 0);
+    }
+
+    #[test]
+    fn drain_returns_every_payload() {
+        let mut slab = OpSlab::new();
+        for i in 0..5 {
+            slab.insert(payload(i)).unwrap();
+        }
+        let drained = slab.drain();
+        assert_eq!(drained.len(), 5);
+        assert_eq!(slab.occupied(), 0);
+        assert_eq!(slab.outstanding(), 0);
+    }
+
+    #[test]
+    fn leak_forgets_payloads_without_dropping_them() {
+        use std::rc::Rc;
+
+        let witness = Rc::new(());
+        let mut slab = OpSlab::new();
+        for _ in 0..3 {
+            slab.insert(Box::new(witness.clone())).unwrap();
+        }
+        assert_eq!(Rc::strong_count(&witness), 4);
+
+        let leaked = slab.leak();
+        assert_eq!(leaked, 3);
+        assert_eq!(slab.occupied(), 0);
+        // The clones were forgotten rather than dropped, which is exactly what
+        // teardown needs when the kernel may still reach the buffers.
+        assert_eq!(Rc::strong_count(&witness), 4);
+    }
+}
