@@ -15,14 +15,6 @@ use windows::core::HRESULT;
 
 use crate::{io_ring::IoRing, sys::AsyncEvent};
 
-#[cfg(test)]
-mod tests;
-
-pub mod rt;
-
-#[allow(dead_code)]
-mod sched;
-
 pub type BufResult = (windows::core::Result<()>, Vec<u8>);
 
 pub struct Driver {

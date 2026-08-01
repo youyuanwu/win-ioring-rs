@@ -1,0 +1,14 @@
+[package]
+name = "win-ioring-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+futures.workspace = true
+
+[dev-dependencies]
+win-ioring.workspace = true
+tokio.workspace = true
+windows.workspace = true

@@ -11,7 +11,7 @@ use std::{
 
 /// A handle that can be awaited to get the result of a spawned task
 pub struct JoinHandle<T> {
-    receiver: crate::runtime::rt::oneshot::Receiver<T>,
+    receiver: crate::rt::oneshot::Receiver<T>,
 }
 
 impl<T> Future for JoinHandle<T> {
@@ -217,10 +217,7 @@ impl TaskSpawner {
         task_id
     }
 
-    fn spawn_with_handle<F, T>(
-        &mut self,
-        future: F,
-    ) -> (TaskId, crate::runtime::rt::oneshot::Receiver<T>)
+    fn spawn_with_handle<F, T>(&mut self, future: F) -> (TaskId, crate::rt::oneshot::Receiver<T>)
     where
         F: Future<Output = T> + 'static,
         T: 'static,
@@ -228,7 +225,7 @@ impl TaskSpawner {
         let task_id = self.next_task_id;
         self.next_task_id += 1;
 
-        let (tx, rx) = crate::runtime::rt::oneshot::channel();
+        let (tx, rx) = crate::rt::oneshot::channel();
 
         let wrapped_future = async move {
             let result = future.await;
@@ -1286,7 +1283,7 @@ mod tests {
                     }
                 }
                 // Yield to allow the runtime to process wakes
-                crate::runtime::rt::yield_now().await;
+                crate::rt::yield_now().await;
             }
         });
 
@@ -1337,7 +1334,7 @@ mod tests {
             let task = rt1.spawn_thread_safe(async move {
                 // Wait a bit to ensure the receiver is ready
                 for _ in 0..10 {
-                    crate::runtime::rt::yield_now().await;
+                    crate::rt::yield_now().await;
                 }
 
                 // Send the value

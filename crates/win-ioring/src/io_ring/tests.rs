@@ -3,6 +3,8 @@ use std::{cell::RefCell, fs::File, rc::Rc};
 use crate::io_ring::{BufferInfo, IoRing, ops::ReadOp};
 use crate::sys::AsyncEvent;
 
+const README_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md");
+
 #[test]
 fn readme_test() {
     let event = AsyncEvent::new().unwrap();
@@ -12,7 +14,7 @@ fn readme_test() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open("README.md").expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
@@ -56,7 +58,7 @@ fn readme_register_test() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open("README.md").expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
@@ -109,7 +111,7 @@ async fn readme_test_async() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open("README.md").expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 

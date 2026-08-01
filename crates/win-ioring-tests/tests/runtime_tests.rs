@@ -1,4 +1,5 @@
-use crate::io_ring::IoRing;
+use win_ioring::io_ring::IoRing;
+use win_ioring_tests::README_PATH;
 
 #[tokio::test(flavor = "current_thread")]
 async fn tokio_readme_test() {
@@ -6,7 +7,7 @@ async fn tokio_readme_test() {
     local
         .run_until(async {
             let io_ring = IoRing::builder().build().unwrap();
-            let driver = crate::runtime::Driver::new(io_ring);
+            let driver = win_ioring::runtime::Driver::new(io_ring);
             let mut h_ring = driver.handle();
 
             let driver = tokio::task::spawn_local(async move {
@@ -14,8 +15,9 @@ async fn tokio_readme_test() {
                 driver.drive().await;
             });
 
-            let file =
-                crate::file::File::from_std(std::fs::File::open("README.md").expect("cannot open"));
+            let file = win_ioring::file::File::from_std(
+                std::fs::File::open(README_PATH).expect("cannot open"),
+            );
 
             let (hr, buffer) = h_ring
                 .build_read_file(&file, vec![0_u8; 20], 20, 0)
@@ -33,11 +35,11 @@ async fn tokio_readme_test() {
 // Custom runtime test.
 #[test]
 fn rt_readme_test() {
-    let mut rt = crate::runtime::rt::Runtime::new();
+    let mut rt = win_ioring_tests::rt::Runtime::new();
     let handle = rt.handle();
     rt.block_on(async move {
         let io_ring = IoRing::builder().build().unwrap();
-        let driver = crate::runtime::Driver::new(io_ring);
+        let driver = win_ioring::runtime::Driver::new(io_ring);
         let mut h_ring = driver.handle();
 
         // OS needs to call the waker from the other thread.
@@ -47,8 +49,9 @@ fn rt_readme_test() {
             driver.drive().await;
         });
 
-        let file =
-            crate::file::File::from_std(std::fs::File::open("README.md").expect("cannot open"));
+        let file = win_ioring::file::File::from_std(
+            std::fs::File::open(README_PATH).expect("cannot open"),
+        );
 
         let (hr, buffer) = h_ring
             .build_read_file(&file, vec![0_u8; 20], 20, 0)
