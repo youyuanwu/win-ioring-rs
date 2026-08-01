@@ -203,6 +203,10 @@ pub struct OpSlab {
     slots: Vec<Slot>,
     free_head: Option<usize>,
     occupied: usize,
+    /// Set by [`OpSlab::leak`]. A leaked slab has abandoned buffers the kernel
+    /// may still write into, and its token namespace has been discarded, so it
+    /// must never hand out a token again.
+    poisoned: bool,
 }
 
 impl OpSlab {
@@ -212,7 +216,13 @@ impl OpSlab {
             slots: Vec::new(),
             free_head: None,
             occupied: 0,
+            poisoned: false,
         }
+    }
+
+    /// Returns `true` if this slab has been leaked and is no longer usable.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Returns the number of slots holding a live operation.
@@ -245,8 +255,12 @@ impl OpSlab {
     /// # Errors
     ///
     /// Returns the payload unchanged if the slab is full, which happens when
-    /// [`MAX_SLOTS`] slots are already in use.
+    /// [`MAX_SLOTS`] slots are already in use, or if the slab has been leaked
+    /// and is therefore poisoned.
     pub fn insert(&mut self, payload: Box<dyn Any>) -> Result<Token, Box<dyn Any>> {
+        if self.poisoned {
+            return Err(payload);
+        }
         let index = match self.free_head {
             Some(index) => {
                 let SlotState::Vacant { next_free } = self.slots[index].state else {
@@ -381,10 +395,11 @@ impl OpSlab {
     /// Records that a cancellation request has been issued against a slot.
     ///
     /// Returns the token to give that cancellation request as its own user
-    /// data, or `None` if there is nothing to cancel — because the token is
-    /// unknown, is not an operation token, or names an operation that has
-    /// already completed. Cancelling a finished operation is a no-op rather
-    /// than an error.
+    /// data, or `None` if there is nothing to do — because the token is
+    /// unknown, is not an operation token, names an operation that has already
+    /// completed, or names one that is **already being cancelled**. Cancelling
+    /// twice is a no-op rather than an error, so at most one cancellation is
+    /// ever outstanding per operation.
     pub fn register_cancel(&mut self, token: Token) -> Option<Token> {
         if token.kind() != TokenKind::Operation {
             return None;
@@ -395,7 +410,12 @@ impl OpSlab {
                 ref mut pending_cancels,
                 ..
             } => {
-                *pending_cancels += 1;
+                if *pending_cancels > 0 {
+                    // Already being cancelled; issuing another request would
+                    // achieve nothing and would inflate the accounting.
+                    return None;
+                }
+                *pending_cancels = 1;
                 Some(token.to_cancel())
             }
             // The operation is already over. There is nothing left to cancel,
@@ -549,9 +569,11 @@ impl OpSlab {
     /// buffers and quiescence could not be established. Leaking is the correct
     /// trade against a use-after-free.
     ///
-    /// This is a **terminal** operation: the slab is emptied entirely and must
-    /// not be used afterwards. Returning the leaked slots to the free list
-    /// would be wrong, since the kernel may still write into them.
+    /// This is a **terminal** operation. The slab is emptied and poisoned: it
+    /// will refuse to insert anything afterwards. That matters because leaking
+    /// discards the token namespace along with the slots, so a fresh insert
+    /// could otherwise mint a token identical to one the kernel still holds,
+    /// and a late completion would then release an unrelated payload.
     pub fn leak(&mut self) -> usize {
         let mut leaked = 0;
         for slot in self.slots.drain(..) {
@@ -562,6 +584,7 @@ impl OpSlab {
         }
         self.free_head = None;
         self.occupied = 0;
+        self.poisoned = true;
         leaked
     }
 }
@@ -779,21 +802,23 @@ mod tests {
         assert_eq!(slab.outstanding(), 0);
     }
 
+    /// FR-040: cancelling an operation that is already being cancelled is a
+    /// no-op, so at most one cancellation is ever outstanding per operation.
     #[test]
-    fn multiple_cancels_against_one_operation_are_counted() {
+    fn repeated_cancellation_is_a_no_op() {
         let mut slab = OpSlab::new();
         let op = slab.insert(payload(1)).unwrap();
-        let c1 = slab.register_cancel(op).unwrap();
-        let c2 = slab.register_cancel(op).unwrap();
-        assert_eq!(c1, c2, "cancel tokens for one slot are indistinguishable");
+        let first = slab.register_cancel(op).unwrap();
+        assert!(
+            slab.register_cancel(op).is_none(),
+            "a second cancellation must not be issued"
+        );
 
         slab.complete(op).unwrap();
         assert_eq!(slab.lookup(op), Lookup::Tombstoned);
 
-        assert!(slab.complete_cancel(c1));
-        assert_eq!(slab.lookup(op), Lookup::Tombstoned, "one cancel still out");
-
-        assert!(slab.complete_cancel(c2));
+        // The single outstanding cancellation resolves the slot.
+        assert!(slab.complete_cancel(first));
         assert_eq!(slab.lookup(op), Lookup::Unknown);
     }
 
@@ -981,10 +1006,11 @@ mod tests {
         assert_eq!(Rc::strong_count(&witness), 4);
     }
 
-    /// `leak` is terminal. It must leave no half-built free list behind that a
-    /// later insert could walk into.
+    /// `leak` is terminal. Reusing the slab afterwards would mint tokens
+    /// identical to ones the kernel still holds, so a late completion could
+    /// release an unrelated payload.
     #[test]
-    fn leak_empties_the_slab_rather_than_corrupting_the_free_list() {
+    fn leak_poisons_the_slab_against_reuse() {
         let mut slab = OpSlab::new();
         let a = slab.insert(payload(1)).unwrap();
         let b = slab.insert(payload(2)).unwrap();
@@ -992,15 +1018,21 @@ mod tests {
         slab.complete(a).unwrap();
 
         slab.leak();
+        assert!(slab.is_poisoned());
         assert_eq!(slab.occupied(), 0);
         assert_eq!(slab.outstanding(), 0);
         assert_eq!(slab.lookup(a), Lookup::Unknown);
         assert_eq!(slab.lookup(b), Lookup::Unknown);
 
-        // Inserting again must produce a coherent slot rather than following a
-        // dangling free-list index.
-        let fresh = slab.insert(payload(3)).unwrap();
-        assert_eq!(slab.lookup(fresh), Lookup::Live);
-        assert_eq!(slab.occupied(), 1);
+        // A fresh insert would otherwise reuse index 0 generation 0, exactly
+        // the token the kernel still holds for the leaked operation.
+        assert!(
+            slab.insert(payload(3)).is_err(),
+            "a leaked slab must refuse to mint new tokens"
+        );
+        assert_eq!(slab.occupied(), 0);
+
+        // Late completions for the leaked operations are inert.
+        assert!(slab.complete(b).is_none());
     }
 }
