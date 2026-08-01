@@ -155,6 +155,22 @@ impl Token {
     }
 }
 
+/// Whether a cancellation has ever been requested against an operation.
+///
+/// A counter cannot express this: it distinguishes "currently pending" from
+/// "not pending", but not "never requested" from "already done". FR-040 makes
+/// cancelling an already-cancelled operation a no-op, which needs the latter
+/// distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelState {
+    /// No cancellation has been requested.
+    NeverRequested,
+    /// A cancellation was requested and its own completion has not arrived.
+    Pending,
+    /// A cancellation was requested and has since completed.
+    Completed,
+}
+
 /// The state of a slot.
 enum SlotState {
     /// Free, awaiting reuse. Holds the next free index, forming a free list.
@@ -165,14 +181,12 @@ enum SlotState {
         observer: Observer,
         /// Boxed so its address is independent of the slab's own storage.
         payload: Box<dyn Any>,
-        /// Cancellation requests issued against this operation that have not
-        /// yet reported their own completion.
-        pending_cancels: u32,
+        cancel: CancelState,
     },
-    /// The operation completed, but cancellation requests against it are still
-    /// outstanding. The payload is gone; only the accounting remains, so the
-    /// slot index cannot be reused until those cancels report.
-    Tombstone { pending_cancels: u32 },
+    /// The operation completed while a cancellation against it was still
+    /// outstanding. The payload is gone; the slot index is withheld from reuse
+    /// until that cancellation reports.
+    Tombstone,
     /// The slot has exhausted its generation counter and is permanently
     /// withdrawn from use, so that no stale token can ever alias a future
     /// occupant.
@@ -241,8 +255,7 @@ impl OpSlab {
             .iter()
             .filter(|s| match &s.state {
                 SlotState::Vacant { .. } | SlotState::Retired => false,
-                SlotState::Occupied { .. } => true,
-                SlotState::Tombstone { pending_cancels } => *pending_cancels > 0,
+                SlotState::Occupied { .. } | SlotState::Tombstone => true,
             })
             .count()
     }
@@ -286,7 +299,7 @@ impl OpSlab {
             lifecycle: Lifecycle::Described,
             observer: Observer::Live,
             payload,
-            pending_cancels: 0,
+            cancel: CancelState::NeverRequested,
         };
         self.occupied += 1;
         Ok(Token::new(TokenKind::Operation, index, slot.generation))
@@ -315,7 +328,7 @@ impl OpSlab {
     pub fn lookup(&self, token: Token) -> Lookup {
         match self.slot_for(token).map(|s| &s.state) {
             Some(SlotState::Occupied { .. }) => Lookup::Live,
-            Some(SlotState::Tombstone { .. }) => Lookup::Tombstoned,
+            Some(SlotState::Tombstone) => Lookup::Tombstoned,
             _ => Lookup::Unknown,
         }
     }
@@ -397,9 +410,9 @@ impl OpSlab {
     /// Returns the token to give that cancellation request as its own user
     /// data, or `None` if there is nothing to do — because the token is
     /// unknown, is not an operation token, names an operation that has already
-    /// completed, or names one that is **already being cancelled**. Cancelling
-    /// twice is a no-op rather than an error, so at most one cancellation is
-    /// ever outstanding per operation.
+    /// completed, or names one that has **ever** been cancelled before.
+    /// Cancelling twice is a no-op rather than an error, so exactly one
+    /// cancellation is ever issued per operation.
     pub fn register_cancel(&mut self, token: Token) -> Option<Token> {
         if token.kind() != TokenKind::Operation {
             return None;
@@ -407,20 +420,14 @@ impl OpSlab {
         let slot = self.slot_for_mut(token)?;
         match slot.state {
             SlotState::Occupied {
-                ref mut pending_cancels,
+                cancel: ref mut cancel @ CancelState::NeverRequested,
                 ..
             } => {
-                if *pending_cancels > 0 {
-                    // Already being cancelled; issuing another request would
-                    // achieve nothing and would inflate the accounting.
-                    return None;
-                }
-                *pending_cancels = 1;
+                *cancel = CancelState::Pending;
                 Some(token.to_cancel())
             }
-            // The operation is already over. There is nothing left to cancel,
-            // and incrementing the tombstone would withhold its index forever.
-            SlotState::Tombstone { .. } | SlotState::Vacant { .. } | SlotState::Retired => None,
+            // Already cancelled once, already over, or not tracking anything.
+            _ => None,
         }
     }
 
@@ -452,17 +459,15 @@ impl OpSlab {
             return None;
         }
         let SlotState::Occupied {
-            payload,
-            pending_cancels,
-            ..
+            payload, cancel, ..
         } = std::mem::replace(&mut slot.state, SlotState::Vacant { next_free: None })
         else {
             unreachable!("state was checked to be occupied");
         };
 
         self.occupied -= 1;
-        if pending_cancels > 0 {
-            slot.state = SlotState::Tombstone { pending_cancels };
+        if cancel == CancelState::Pending {
+            slot.state = SlotState::Tombstone;
         } else {
             self.free_slot(index);
         }
@@ -471,9 +476,8 @@ impl OpSlab {
 
     /// Handles a cancellation request's own completion.
     ///
-    /// Returns `true` if the completion was accounted for. When the last
-    /// outstanding cancellation against a tombstoned slot reports, the slot is
-    /// finally freed for reuse.
+    /// Returns `true` if the completion was accounted for. When a cancellation
+    /// against a tombstoned slot reports, the slot is finally freed for reuse.
     ///
     /// Returns `false` for a token that is not a cancellation token, for one
     /// the slab is not tracking, and for a slot that was not expecting a
@@ -493,28 +497,19 @@ impl OpSlab {
         }
         match slot.state {
             SlotState::Occupied {
-                ref mut pending_cancels,
+                cancel: ref mut cancel @ CancelState::Pending,
                 ..
             } => {
-                if *pending_cancels == 0 {
-                    return false;
-                }
-                *pending_cancels -= 1;
+                // Remember that a cancellation happened, so a later request is
+                // correctly refused as a no-op.
+                *cancel = CancelState::Completed;
                 true
             }
-            SlotState::Tombstone {
-                ref mut pending_cancels,
-            } => {
-                if *pending_cancels == 0 {
-                    return false;
-                }
-                *pending_cancels -= 1;
-                if *pending_cancels == 0 {
-                    self.free_slot(index);
-                }
+            SlotState::Tombstone => {
+                self.free_slot(index);
                 true
             }
-            SlotState::Vacant { .. } | SlotState::Retired => false,
+            _ => false,
         }
     }
 
@@ -802,8 +797,9 @@ mod tests {
         assert_eq!(slab.outstanding(), 0);
     }
 
-    /// FR-040: cancelling an operation that is already being cancelled is a
-    /// no-op, so at most one cancellation is ever outstanding per operation.
+    /// FR-040: cancelling an operation that has ever been cancelled is a no-op.
+    /// A counter could not express this, because it cannot tell "never
+    /// requested" from "already done".
     #[test]
     fn repeated_cancellation_is_a_no_op() {
         let mut slab = OpSlab::new();
@@ -811,15 +807,22 @@ mod tests {
         let first = slab.register_cancel(op).unwrap();
         assert!(
             slab.register_cancel(op).is_none(),
-            "a second cancellation must not be issued"
+            "a second cancellation must not be issued while the first is pending"
         );
 
-        slab.complete(op).unwrap();
-        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
-
-        // The single outstanding cancellation resolves the slot.
+        // The crucial case: once the first cancellation has *completed*, a
+        // further request must still be refused.
         assert!(slab.complete_cancel(first));
+        assert!(
+            slab.register_cancel(op).is_none(),
+            "a cancellation must not be re-issued after the first one completed"
+        );
+
+        // With no cancellation outstanding, the operation's completion frees
+        // the slot directly rather than leaving a tombstone.
+        assert!(slab.complete(op).is_some());
         assert_eq!(slab.lookup(op), Lookup::Unknown);
+        assert_eq!(slab.outstanding(), 0);
     }
 
     /// A duplicate completion for an operation that has already completed must
