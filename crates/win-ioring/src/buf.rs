@@ -44,13 +44,26 @@ use crate::error::{Error, Result};
 /// buffer in its operation storage until the operation reaches terminal
 /// completion — is called the *in-flight window* below.
 ///
+/// An implementor cannot observe that window's exact boundaries, and does not
+/// need to: the crate takes the buffer by value when an operation starts and
+/// hands it back when the operation is over, so upholding these obligations
+/// from the moment ownership is transferred until the moment it is returned is
+/// always sufficient.
+///
 /// Implementors must guarantee all of the following.
 ///
 /// **Validity.** [`IoBuf::buf_ptr`] returns a pointer that is non-null,
 /// suitably aligned for `u8`, and valid for reads of [`IoBuf::buf_len`] bytes.
 /// Those bytes are initialized and lie within a single allocated object, and
 /// `buf_len` never exceeds `isize::MAX`. These requirements hold even when
-/// `buf_len` is zero, because the pointer is still formed into a slice.
+/// `buf_len` is zero.
+///
+/// **Coherence.** This obligation applies at all times, not only in flight.
+/// The type must not use interior mutability to alter its storage, pointer or
+/// extents: given any shared borrow, [`IoBuf::buf_ptr`] and [`IoBuf::buf_len`]
+/// must describe the same buffer, so that reading one and then the other
+/// cannot observe a torn view. Storage may change only through a `&mut`
+/// borrow, and only outside the in-flight window.
 ///
 /// **Stability.** For the whole in-flight window the pointer and length must
 /// not change. In particular, calling *any* method of this trait or of
@@ -85,10 +98,12 @@ pub unsafe trait IoBuf: 'static {
             // requirements of `from_raw_parts`.
             return &[];
         }
-        // SAFETY: the trait's validity contract guarantees `buf_ptr` is
-        // non-null, aligned, and valid for reads of `len` initialized bytes
-        // within a single allocation, with `len <= isize::MAX`. Its
-        // exclusivity contract rules out a conflicting alias for this borrow.
+        // SAFETY: the validity contract guarantees `buf_ptr` is non-null,
+        // aligned, and valid for reads of `len` initialized bytes within a
+        // single allocation, with `len <= isize::MAX`. The coherence contract
+        // guarantees the length read above still describes the pointer read
+        // here, since no interior mutability may intervene on a shared borrow.
+        // Exclusivity rules out a conflicting alias for this borrow.
         unsafe { std::slice::from_raw_parts(self.buf_ptr(), len) }
     }
 }
@@ -129,9 +144,10 @@ pub unsafe trait IoBufMut: IoBuf {
 
 // SAFETY: `Vec<u8>` keeps its bytes in a single stable heap allocation whose
 // address is non-null and aligned, and whose first `len` bytes are initialized.
-// None of the accessors below reallocate, so the pointer and extents stay put
-// for as long as the crate holds the value still. A `Vec` owns its allocation
-// exclusively, so no other alias can reach the bytes.
+// It has no interior mutability, so a shared borrow always sees a coherent
+// pointer and length. None of the accessors below reallocate, so the pointer
+// and extents stay put for as long as the crate holds the value still. A `Vec`
+// owns its allocation exclusively, so no other alias can reach the bytes.
 unsafe impl IoBuf for Vec<u8> {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -163,8 +179,9 @@ unsafe impl IoBufMut for Vec<u8> {
 }
 
 // SAFETY: a boxed slice owns a single stable heap allocation, non-null and
-// aligned, whose bytes are all initialized. Its length is fixed, so no accessor
-// can change the extents, and ownership is exclusive.
+// aligned, whose bytes are all initialized. It has no interior mutability, and
+// its length is fixed, so no accessor can change the extents and a shared
+// borrow always sees a coherent view. Ownership is exclusive.
 unsafe impl IoBuf for Box<[u8]> {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -175,8 +192,9 @@ unsafe impl IoBuf for Box<[u8]> {
     }
 }
 
-// SAFETY: every byte of a boxed slice is writable, and its length is fixed, so
-// capacity equals length.
+// SAFETY: every byte of a boxed slice is writable, its length is fixed so
+// capacity equals length, and `as_mut_ptr` reports the same address as
+// `as_ptr`.
 unsafe impl IoBufMut for Box<[u8]> {
     fn buf_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -193,8 +211,9 @@ unsafe impl IoBufMut for Box<[u8]> {
 }
 
 // SAFETY: an array's bytes are initialized by construction, live in a single
-// object, and are readable for its full length. The length is a constant, so no
-// accessor can change the extents.
+// object, and are readable for its full length. It has no interior mutability
+// and its length is a constant, so no accessor can change the extents and a
+// shared borrow always sees a coherent view.
 unsafe impl<const N: usize> IoBuf for [u8; N] {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -205,7 +224,9 @@ unsafe impl<const N: usize> IoBuf for [u8; N] {
     }
 }
 
-// SAFETY: every byte of the array is writable and its length is fixed.
+// SAFETY: every byte of the array is writable, its length is a constant so
+// capacity equals length, and `as_mut_ptr` reports the same address as
+// `as_ptr`.
 unsafe impl<const N: usize> IoBufMut for [u8; N] {
     fn buf_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
