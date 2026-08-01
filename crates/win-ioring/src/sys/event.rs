@@ -196,10 +196,19 @@ impl Drop for EventWaitFuture<'_> {
             return;
         };
 
+        if registration.shared.callback_ran.load(Ordering::Acquire) {
+            // The callback has already run, so it consumed the reference count
+            // and there is nothing to reclaim. Checking this *first* also
+            // avoids a self-deadlock: an executor may wake a task inline from
+            // the callback, and that task may drop this future, so blocking
+            // below would be waiting for the very callback we are inside.
+            let _ = unsafe { UnregisterWaitEx(registration.wait_handle, None) };
+            return;
+        }
+
         // `INVALID_HANDLE_VALUE` asks the operating system to wait until every
-        // callback for this registration has finished. Without it the callback
-        // could still be running here, and `callback_ran` below would be a
-        // guess rather than an answer.
+        // callback for this registration has finished. Without it the flag read
+        // below would be a guess rather than an answer.
         let _ = unsafe { UnregisterWaitEx(registration.wait_handle, Some(INVALID_HANDLE_VALUE)) };
 
         if !registration.shared.callback_ran.load(Ordering::Acquire) {

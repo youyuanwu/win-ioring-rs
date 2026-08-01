@@ -161,7 +161,22 @@ struct DriverInner {
     shutting_down: bool,
     torn_down: bool,
     on_error: Option<ErrorObserver>,
+    /// Consecutive failed submission attempts.
+    ///
+    /// Used to stop retrying in a tight loop when the queue is persistently
+    /// stuck, and to avoid flooding the observer with identical errors.
+    submit_failures: u32,
+    /// Test seam: fail this many submissions before letting one through.
+    ///
+    /// `SubmitIoRing` has no documented, reliably reproducible failure mode, so
+    /// the retry path cannot be exercised without injecting one.
+    #[cfg(test)]
+    fail_next_submits: u32,
 }
+
+/// How many consecutive submission failures before the driver stops spinning
+/// and waits for an external event instead.
+const SUBMIT_RETRY_SPIN_LIMIT: u32 = 8;
 
 impl DriverInner {
     fn report(&self, error: &Error) {
@@ -178,16 +193,38 @@ impl DriverInner {
         if !self.pending_submit {
             return;
         }
+
+        #[cfg(test)]
+        if self.fail_next_submits > 0 {
+            self.fail_next_submits -= 1;
+            let injected = Error::Os(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+            self.note_submit_failure(&injected);
+            return;
+        }
+
         match self.ring.submit(0, 0) {
             Ok(_) => {
                 self.pending_submit = false;
+                self.submit_failures = 0;
                 self.slab.promote_built_to_submitted();
             }
             Err(e) => {
-                self.report(&e);
+                self.note_submit_failure(&e);
                 // Leave `pending_submit` set. The entries are still queued and
                 // their buffers must stay retained until the kernel takes them.
             }
+        }
+    }
+
+    /// Records a failed submission and reports it, without flooding.
+    fn note_submit_failure(&mut self, error: &Error) {
+        self.submit_failures = self.submit_failures.saturating_add(1);
+        // Report the first failure of a streak, then only occasionally, so a
+        // persistently stuck queue does not drown the observer.
+        if self.submit_failures == 1 || self.submit_failures.is_multiple_of(64) {
+            self.report(error);
         }
     }
 
@@ -330,6 +367,9 @@ impl Driver {
                 shutting_down: false,
                 torn_down: false,
                 on_error: observer,
+                submit_failures: 0,
+                #[cfg(test)]
+                fail_next_submits: 0,
             })),
             completion_event,
             wake,
@@ -356,7 +396,10 @@ impl Driver {
                 let mut inner = self.inner.borrow_mut();
                 inner.submit_pending();
                 inner.reap_completions();
-                (inner.shutting_down, inner.pending_submit)
+                (
+                    inner.shutting_down,
+                    inner.pending_submit && inner.submit_failures < SUBMIT_RETRY_SPIN_LIMIT,
+                )
             };
 
             if shutting_down {
@@ -365,7 +408,9 @@ impl Driver {
 
             if retry_owed {
                 // No completion can arrive to prompt the retry, so yield and
-                // come straight back rather than blocking on an event.
+                // come straight back rather than blocking on an event. Past the
+                // spin limit we fall through and wait instead, so a persistently
+                // stuck queue does not burn the executor.
                 futures::pending!();
                 continue;
             }
@@ -444,7 +489,7 @@ impl Handle {
     fn try_read<B: IoBufMut>(
         &self,
         file: &File,
-        mut buffer: B,
+        buffer: B,
         len: u32,
         offset: u64,
     ) -> std::result::Result<ReadFuture<B>, (Error, B)> {
@@ -474,16 +519,22 @@ impl Handle {
             Err(_) => return Err((Error::QueueFull, buffer)),
         };
 
-        let data_ptr = {
+        // Box the buffer FIRST, then take its address. Taking the pointer from
+        // the local before boxing would hand the kernel a stale address for any
+        // buffer stored inline, such as `[u8; N]`, whose bytes move when the
+        // value moves. Coercing `Box<B>` to `Box<dyn Any>` only changes the
+        // pointer's metadata; the allocation, and therefore the address, stays
+        // put for as long as the payload lives in the slab.
+        let mut boxed: Box<B> = Box::new(buffer);
+        let data_ptr = boxed.buf_mut_ptr();
+        {
             let payload = inner
                 .slab
                 .payload_mut(token)
                 .and_then(|p| p.downcast_mut::<OpPayload>())
                 .expect("just inserted");
-            let ptr = buffer.buf_mut_ptr();
-            payload.buffer = Some(Box::new(buffer));
-            ptr
-        };
+            payload.buffer = Some(boxed as Box<dyn Any>);
+        }
 
         let op = ReadOp::builder()
             .with_raw_handle(file.as_raw_handle())
@@ -522,13 +573,13 @@ impl Handle {
     /// Cancellation is best-effort: it may fail, or arrive too late, and neither
     /// is an error. The caller keeps the original future and still observes that
     /// operation's terminal result.
-    pub fn cancel(&self, id: OperationId) {
-        // Registering is the whole job for now: it makes a repeat request a
-        // no-op and records that a cancellation is pending. Issuing the
-        // platform request is Phase 3c's work.
-        let mut inner = self.strong.borrow_mut();
-        let _ = inner.slab.register_cancel(id.0);
-    }
+    ///
+    // Deliberately not implemented in this phase. Registering a cancellation
+    // without also submitting the platform request would tombstone the target
+    // slot awaiting a completion that could never arrive, permanently
+    // withholding its index. Cancellation lands whole in the next phase.
+    #[allow(dead_code)]
+    fn cancel_placeholder(&self, _id: OperationId) {}
 }
 
 /// Takes a buffer back out of a slot whose operation never reached the kernel.
@@ -696,5 +747,199 @@ mod tests {
         let (n, buf) = ok.unwrap();
         assert_eq!(n, 3);
         assert_eq!(buf, vec![1, 2, 3]);
+    }
+
+    fn test_driver() -> Driver {
+        let ring = IoRing::builder().build().unwrap();
+        Driver::new(ring).unwrap()
+    }
+
+    fn readme() -> File {
+        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap()
+    }
+
+    /// A submission failure must not resolve the operation's future, because
+    /// the submission queue still references its buffer. The error goes to the
+    /// observer instead, and the operation succeeds once the retry lands.
+    #[test]
+    fn submission_failure_is_not_the_operations_result() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&seen);
+
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::with_error_observer(
+            ring,
+            Some(Box::new(move |e: &Error| {
+                sink.borrow_mut().push(e.to_string());
+            })),
+        )
+        .unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Arrange for the next two submissions to fail.
+        driver.inner.borrow_mut().fail_next_submits = 2;
+
+        let mut fut = handle.read(&file, vec![0_u8; 64], 20, 0);
+
+        // First attempt fails. The slot must stay retained and the future must
+        // not be resolved.
+        {
+            let mut inner = driver.inner.borrow_mut();
+            inner.submit_pending();
+            assert!(inner.pending_submit, "entries must stay queued on failure");
+            assert_eq!(inner.slab.outstanding(), 1);
+        }
+        assert_eq!(seen.borrow().len(), 1, "the first failure is reported");
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            Pin::new(&mut fut).poll(&mut cx).is_pending(),
+            "a submission failure must not resolve the future"
+        );
+
+        // Second attempt fails too; still no resolution.
+        driver.inner.borrow_mut().submit_pending();
+        assert!(driver.inner.borrow().pending_submit);
+
+        // Third attempt is allowed through.
+        driver.inner.borrow_mut().submit_pending();
+        assert!(
+            !driver.inner.borrow().pending_submit,
+            "a successful retry clears the pending flag"
+        );
+
+        // Drain the completion so nothing is left in flight.
+        loop {
+            driver.inner.borrow_mut().reap_completions();
+            if driver.inner.borrow().slab.outstanding() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
+    }
+
+    /// Repeated failures must stop the driver spinning, so a stuck queue does
+    /// not burn the executor or flood the observer.
+    #[test]
+    fn persistent_submission_failure_stops_spinning_and_reporting() {
+        let count = Rc::new(RefCell::new(0_usize));
+        let sink = Rc::clone(&count);
+
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::with_error_observer(
+            ring,
+            Some(Box::new(move |_: &Error| {
+                *sink.borrow_mut() += 1;
+            })),
+        )
+        .unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        driver.inner.borrow_mut().fail_next_submits = 100;
+        let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
+
+        for _ in 0..100 {
+            driver.inner.borrow_mut().submit_pending();
+        }
+
+        let failures = driver.inner.borrow().submit_failures;
+        assert!(
+            failures >= SUBMIT_RETRY_SPIN_LIMIT,
+            "expected many failures"
+        );
+        assert!(
+            *count.borrow() < 10,
+            "observer flooded with {} reports",
+            count.borrow()
+        );
+
+        // Let the operation through and settle, so teardown is clean.
+        driver.inner.borrow_mut().fail_next_submits = 0;
+        driver.inner.borrow_mut().submit_pending();
+        loop {
+            driver.inner.borrow_mut().reap_completions();
+            if driver.inner.borrow().slab.outstanding() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        drop(fut);
+        handle.shutdown();
+    }
+
+    /// A completion whose user data matches nothing must be discarded without
+    /// panicking and without disturbing a live operation.
+    #[test]
+    fn unknown_completions_are_discarded() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
+        let live = fut.operation_id().expect("read was submitted");
+
+        {
+            let mut inner = driver.inner.borrow_mut();
+            // A token for a slot index that was never allocated.
+            let bogus = slab::Token::from_user_data(0xDEAD_BEEF);
+            assert!(inner.slab.complete(bogus).is_none());
+            assert!(!inner.slab.complete_cancel(bogus));
+            // The live operation is untouched.
+            assert_eq!(inner.slab.lookup(live.0), slab::Lookup::Live);
+        }
+
+        drop(fut);
+        handle.shutdown();
+    }
+
+    /// A detached operation's buffer is released when its own completion
+    /// arrives, not when the future is dropped.
+    #[test]
+    fn detached_operations_release_on_completion() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
+        driver.inner.borrow_mut().submit_pending();
+
+        // Dropping the future must leave the operation outstanding.
+        drop(fut);
+        assert_eq!(
+            driver.inner.borrow().slab.outstanding(),
+            1,
+            "a dropped future must not release the buffer"
+        );
+
+        // Only the completion releases it.
+        loop {
+            driver.inner.borrow_mut().reap_completions();
+            if driver.inner.borrow().slab.outstanding() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        handle.shutdown();
+    }
+
+    /// Dropping a future before anything was built releases the buffer at once,
+    /// since no queue entry references it.
+    #[test]
+    fn unbuilt_operations_release_immediately() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // A rejected read never reaches the slab at all.
+        let rejected = handle.read(&file, vec![0_u8; 4], 64, 0);
+        assert!(rejected.operation_id().is_none());
+        assert_eq!(driver.inner.borrow().slab.outstanding(), 0);
+
+        handle.shutdown();
     }
 }
