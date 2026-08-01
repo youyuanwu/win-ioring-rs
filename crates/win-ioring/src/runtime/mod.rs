@@ -174,10 +174,6 @@ struct DriverInner {
     fail_next_submits: u32,
 }
 
-/// How many consecutive submission failures before the driver stops spinning
-/// and waits for an external event instead.
-const SUBMIT_RETRY_SPIN_LIMIT: u32 = 8;
-
 impl DriverInner {
     fn report(&self, error: &Error) {
         if let Some(observer) = &self.on_error {
@@ -396,10 +392,7 @@ impl Driver {
                 let mut inner = self.inner.borrow_mut();
                 inner.submit_pending();
                 inner.reap_completions();
-                (
-                    inner.shutting_down,
-                    inner.pending_submit && inner.submit_failures < SUBMIT_RETRY_SPIN_LIMIT,
-                )
+                (inner.shutting_down, inner.pending_submit)
             };
 
             if shutting_down {
@@ -407,10 +400,17 @@ impl Driver {
             }
 
             if retry_owed {
-                // No completion can arrive to prompt the retry, so yield and
-                // come straight back rather than blocking on an event. Past the
-                // spin limit we fall through and wait instead, so a persistently
-                // stuck queue does not burn the executor.
+                // Entries are queued but the kernel has not taken them, and no
+                // completion can arrive to prompt a retry. Yield and come
+                // straight back.
+                //
+                // This is a yield loop rather than a timed backoff because the
+                // crate has no timer of its own — acquiring one would mean
+                // depending on a runtime, which is exactly what this crate
+                // avoids. Giving up instead is not an option: the submission
+                // queue still references the callers' buffers, so the driver
+                // must keep trying. Reporting is throttled so a persistently
+                // stuck queue does not flood the observer.
                 futures::pending!();
                 continue;
             }
@@ -824,7 +824,7 @@ mod tests {
     /// Repeated failures must stop the driver spinning, so a stuck queue does
     /// not burn the executor or flood the observer.
     #[test]
-    fn persistent_submission_failure_stops_spinning_and_reporting() {
+    fn persistent_submission_failure_throttles_reporting_but_keeps_retrying() {
         let count = Rc::new(RefCell::new(0_usize));
         let sink = Rc::clone(&count);
 
@@ -848,8 +848,12 @@ mod tests {
 
         let failures = driver.inner.borrow().submit_failures;
         assert!(
-            failures >= SUBMIT_RETRY_SPIN_LIMIT,
-            "expected many failures"
+            failures == 100,
+            "every attempt must actually be retried, saw {failures}"
+        );
+        assert!(
+            driver.inner.borrow().pending_submit,
+            "the entries stay queued while submission keeps failing"
         );
         assert!(
             *count.borrow() < 10,
@@ -860,6 +864,10 @@ mod tests {
         // Let the operation through and settle, so teardown is clean.
         driver.inner.borrow_mut().fail_next_submits = 0;
         driver.inner.borrow_mut().submit_pending();
+        assert!(
+            !driver.inner.borrow().pending_submit,
+            "a successful retry after a long failure streak must still land"
+        );
         loop {
             driver.inner.borrow_mut().reap_completions();
             if driver.inner.borrow().slab.outstanding() == 0 {

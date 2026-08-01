@@ -193,3 +193,55 @@ async fn a_read_keeps_its_file_alive() {
         })
         .await;
 }
+
+/// A buffer stored inline, rather than behind a heap pointer, is the case that
+/// catches a driver taking the buffer's address before moving it into its own
+/// storage. A `Vec` would survive that mistake because its heap allocation does
+/// not move; `[u8; N]` would not.
+#[tokio::test(flavor = "current_thread")]
+async fn inline_array_buffers_reach_the_kernel_correctly() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+
+            let driver_task = tokio::task::spawn_local(async move {
+                driver.drive().await;
+            });
+
+            let expected = {
+                let all = std::fs::read(README_PATH).unwrap();
+                all[..20].to_vec()
+            };
+
+            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let (read, buffer) = handle
+                .read(&file, [0_u8; 64], 20, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+
+            assert_eq!(read, 20);
+            assert_eq!(
+                &buffer[..20],
+                expected.as_slice(),
+                "inline buffer did not receive the file's bytes"
+            );
+
+            // A boxed slice is the third container shape.
+            let boxed: Box<[u8]> = vec![0_u8; 64].into_boxed_slice();
+            let (read, buffer) = handle
+                .read(&file, boxed, 20, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read, 20);
+            assert_eq!(&buffer[..20], expected.as_slice());
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+        })
+        .await;
+}

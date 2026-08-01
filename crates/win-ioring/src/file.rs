@@ -151,28 +151,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The handle must be released exactly once, when the last reference goes.
+    /// The handle must stay open while any operation still references it, and
+    /// its state must be released exactly when the last reference goes.
+    ///
+    /// The release itself is `OwnedHandle`'s job; what this crate is
+    /// responsible for is the reference counting that decides *when*. Probing
+    /// the OS for whether a specific handle value is closed would be racy in a
+    /// multi-threaded test process, because another test can be handed the same
+    /// value moments later.
     #[test]
-    fn handle_is_closed_once_the_last_reference_goes() {
-        use windows::Win32::Foundation::GetHandleInformation;
+    fn handle_lives_exactly_as_long_as_its_references() {
+        use std::rc::Weak;
 
         let (path, std_file) = temp_file("close");
         let file = File::from_std(std_file);
-        let raw = file.as_raw_handle();
         let retained = file.state();
+        let observer: Weak<FileState> = Rc::downgrade(&retained);
 
-        // Still open while a reference remains.
-        let mut flags = 0_u32;
+        assert_eq!(file.reference_count(), 2);
+
+        // The caller drops theirs; the operation's reference keeps it alive.
         drop(file);
         assert!(
-            unsafe { GetHandleInformation(HANDLE(raw.0), &mut flags) }.is_ok(),
-            "handle closed while an operation still referenced it"
+            observer.upgrade().is_some(),
+            "state released while an operation still referenced it"
         );
 
         drop(retained);
         assert!(
-            unsafe { GetHandleInformation(HANDLE(raw.0), &mut flags) }.is_err(),
-            "handle was not closed after the last reference went away"
+            observer.upgrade().is_none(),
+            "state outlived its last reference"
         );
 
         let _ = std::fs::remove_file(&path);
