@@ -312,6 +312,32 @@ impl DriverInner {
     }
 }
 
+/// Yields to the executor and guarantees another poll.
+///
+/// Unlike `futures::pending!()`, which returns `Pending` without waking, this
+/// wakes the current task first. The driver relies on that: when a submission
+/// retry is owed, no completion can arrive to prompt the next poll, so the
+/// driver must arrange its own.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+fn yield_now() -> YieldNow {
+    YieldNow(false)
+}
+
 /// Owns the ring and drives it to completion.
 ///
 /// Spawn [`Driver::drive`] on your executor and issue operations through
@@ -404,14 +430,16 @@ impl Driver {
                 // completion can arrive to prompt a retry. Yield and come
                 // straight back.
                 //
-                // This is a yield loop rather than a timed backoff because the
-                // crate has no timer of its own — acquiring one would mean
-                // depending on a runtime, which is exactly what this crate
-                // avoids. Giving up instead is not an option: the submission
-                // queue still references the callers' buffers, so the driver
-                // must keep trying. Reporting is throttled so a persistently
-                // stuck queue does not flood the observer.
-                futures::pending!();
+                // This is a self-waking yield rather than a timed backoff
+                // because the crate deliberately has no timer — acquiring one
+                // would mean depending on a runtime, which is exactly what this
+                // crate avoids. It must wake itself: a bare `Pending` would
+                // leave the driver parked forever, since no completion can
+                // arrive to poll it again. Giving up is not an option either,
+                // because the submission queue still references the callers'
+                // buffers. Reporting is throttled so a persistently stuck queue
+                // does not flood the observer.
+                yield_now().await;
                 continue;
             }
 
@@ -821,8 +849,74 @@ mod tests {
         assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
     }
 
-    /// Repeated failures must stop the driver spinning, so a stuck queue does
-    /// not burn the executor or flood the observer.
+    /// Drives the real `drive()` loop and asserts it re-arms itself when a
+    /// submission retry is owed.
+    ///
+    /// This is the test that catches a bare `Pending`: without a self-wake the
+    /// executor is never told to poll again, the retry never happens, and the
+    /// callers' buffers are stranded in the submission queue forever.
+    #[test]
+    fn drive_wakes_itself_when_a_submission_retry_is_owed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingWaker(AtomicUsize);
+        impl std::task::Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Keep submission failing so the retry path stays active.
+        driver.inner.borrow_mut().fail_next_submits = 5;
+        let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
+
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        let before = counter.0.load(Ordering::SeqCst);
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        let after = counter.0.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "drive() parked without waking itself, so the retry would never happen"
+        );
+        assert!(
+            driver.inner.borrow().pending_submit,
+            "the retry should still be owed"
+        );
+
+        // Let it through and settle so teardown is clean.
+        driver.inner.borrow_mut().fail_next_submits = 0;
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            if driver.inner.borrow().slab.outstanding() == 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        drop(fut);
+        handle.shutdown();
+    }
+
+    /// Repeated failures must not flood the observer, and the driver must keep
+    /// retrying: the submission queue still references the caller's buffer, so
+    /// abandoning the retry would strand it.
     #[test]
     fn persistent_submission_failure_throttles_reporting_but_keeps_retrying() {
         let count = Rc::new(RefCell::new(0_usize));
