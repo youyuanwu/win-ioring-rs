@@ -118,7 +118,7 @@ impl Driver {
                     // process all completions.
                     let mut inner = self.io_ring.as_inner();
                     let ring = &mut inner.borrow_mut().io_ring;
-                    while let Some(completion) = ring.pop_completion() {
+                    while let Some(completion) = ring.pop_completion().unwrap() {
                         let ctx = unsafe { Box::from_raw(completion.UserData as *mut UserData) };
                         match *ctx {
                             UserData::Read { buffer, tx } => {
@@ -148,7 +148,7 @@ impl Handle {
         mut buffer: Vec<u8>,
         num_of_bytes_to_read: u32,
         offset: u64,
-    ) -> windows::core::Result<ReadFut> {
+    ) -> crate::Result<ReadFut> {
         let mut inner = self.inner.as_ref().borrow_mut();
         let (tx, rx) = futures::channel::oneshot::channel();
 
@@ -163,7 +163,7 @@ impl Handle {
                     .with_num_of_bytes_to_read(num_of_bytes_to_read)
                     .with_offset(offset)
                     .with_user_data(Box::into_raw(user_data) as *mut _ as usize)
-                    .build(),
+                    .build()?,
             )
         }?;
 

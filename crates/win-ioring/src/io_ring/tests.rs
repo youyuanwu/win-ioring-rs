@@ -26,7 +26,8 @@ fn readme_test() {
         .with_num_of_bytes_to_read(20) // buffer needs to be bigger
         .with_offset(0)
         .with_user_data(11)
-        .build();
+        .build()
+        .unwrap();
 
     unsafe { ring.build_read_file(args).unwrap() };
 
@@ -38,7 +39,7 @@ fn readme_test() {
 
     event.wait_sync_infinite().unwrap();
     event.reset().unwrap();
-    while let Some(cp) = ring.pop_completion() {
+    while let Some(cp) = ring.pop_completion().unwrap() {
         cp.ResultCode.unwrap();
         assert_eq!(cp.UserData, 11);
     }
@@ -77,7 +78,8 @@ fn readme_register_test() {
         .with_num_of_bytes_to_read(20) // buffer needs to be bigger
         .with_offset(0)
         .with_user_data(11)
-        .build();
+        .build()
+        .unwrap();
 
     unsafe { ring.build_read_file(op).unwrap() };
 
@@ -90,7 +92,7 @@ fn readme_register_test() {
     event.wait_sync_infinite().unwrap();
     event.reset().unwrap();
 
-    while let Some(cp) = ring.pop_completion() {
+    while let Some(cp) = ring.pop_completion().unwrap() {
         cp.ResultCode.unwrap();
     }
     ring.close().unwrap();
@@ -148,7 +150,8 @@ async fn readme_test_async() {
                     .with_num_of_bytes_to_read(20) // buffer needs to be bigger
                     .with_offset(0)
                     .with_user_data(ctx as usize)
-                    .build();
+                    .build()
+                    .unwrap();
                 unsafe { ring_cp.borrow_mut().build_read_file(op).unwrap() };
                 println!("read built");
                 rx.await.unwrap();
@@ -166,7 +169,7 @@ async fn readme_test_async() {
                 event.wait().await.unwrap();
                 event.reset().unwrap();
 
-                while let Some(cp) = ring_cp2.borrow_mut().pop_completion() {
+                while let Some(cp) = ring_cp2.borrow_mut().pop_completion().unwrap() {
                     cp.ResultCode.unwrap();
                     let ctx = cp.UserData;
                     if ctx == 0 {
@@ -188,4 +191,348 @@ async fn readme_test_async() {
     println!("ring closed");
 
     println!("data read: [{}]", String::from_utf8_lossy(&buffer));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: capabilities, introspection, and the operations added to the raw
+// layer (write, flush, cancel).
+// ---------------------------------------------------------------------------
+
+use crate::error::Error;
+use crate::io_ring::ops::{CancelOp, FlushOp, WriteOp};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLUSH_DEFAULT, FILE_WRITE_FLAGS_NONE, IORING_FEATURE_SET_COMPLETION_EVENT,
+    IORING_OP_CANCEL, IORING_OP_FLUSH, IORING_OP_NOP, IORING_OP_READ, IORING_OP_REGISTER_BUFFERS,
+    IORING_OP_REGISTER_FILES, IORING_OP_WRITE, IORING_VERSION,
+};
+
+/// Every operation code this crate cares about, for support queries.
+const ALL_OPS: &[(&str, windows::Win32::Storage::FileSystem::IORING_OP_CODE)] = &[
+    ("NOP", IORING_OP_NOP),
+    ("READ", IORING_OP_READ),
+    ("REGISTER_FILES", IORING_OP_REGISTER_FILES),
+    ("REGISTER_BUFFERS", IORING_OP_REGISTER_BUFFERS),
+    ("CANCEL", IORING_OP_CANCEL),
+    ("WRITE", IORING_OP_WRITE),
+    ("FLUSH", IORING_OP_FLUSH),
+];
+
+fn temp_path(tag: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "win-ioring-test-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    p
+}
+
+#[test]
+fn capabilities_are_reported() {
+    let caps = IoRing::query_io_ring_capabilities().unwrap();
+    assert!(caps.max_version.0 > 0, "no usable version reported");
+    assert!(caps.max_submission_queue_size > 0);
+    assert!(caps.max_completion_queue_size > 0);
+}
+
+/// A ring must be creatable at the exact version the host advertises as its
+/// ceiling. This also guards against treating any named constant as the
+/// maximum: hosts report versions with no corresponding constant.
+#[test]
+fn ring_can_be_created_at_reported_max_version() {
+    let caps = IoRing::query_io_ring_capabilities().unwrap();
+    let mut ring = IoRing::builder()
+        .with_version(caps.max_version)
+        .build()
+        .unwrap();
+    assert_eq!(ring.info().unwrap().version.0, caps.max_version.0);
+    ring.close().unwrap();
+}
+
+#[test]
+fn requesting_a_version_above_the_ceiling_is_a_distinct_error() {
+    let caps = IoRing::query_io_ring_capabilities().unwrap();
+    let err = IoRing::builder()
+        .with_version(IORING_VERSION(caps.max_version.0 + 1))
+        .build()
+        .err()
+        .unwrap();
+    match err {
+        Error::UnsupportedVersion {
+            requested,
+            max_supported,
+        } => {
+            assert_eq!(requested, caps.max_version.0 + 1);
+            assert_eq!(max_supported, caps.max_version.0);
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
+}
+
+#[test]
+fn requiring_an_absent_feature_is_a_distinct_error() {
+    // Bit 30 is not a feature any host reports, so this must always fail.
+    let bogus = windows::Win32::Storage::FileSystem::IORING_FEATURE_FLAGS(1 << 30);
+    let err = IoRing::builder()
+        .with_required_features(bogus)
+        .build()
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::UnsupportedFeature { .. }));
+}
+
+/// The driver depends on completion-event signalling, so requiring it must
+/// succeed on any host this crate can actually run on.
+#[test]
+fn required_completion_event_feature_is_available() {
+    let mut ring = IoRing::builder()
+        .with_required_features(IORING_FEATURE_SET_COMPLETION_EVENT)
+        .build()
+        .unwrap();
+    ring.close().unwrap();
+}
+
+#[test]
+fn op_support_can_be_queried_without_submitting() {
+    let mut ring = IoRing::builder().build().unwrap();
+    for (name, op) in ALL_OPS {
+        // The query has no error channel; we assert only that it answers.
+        let supported = ring.is_op_supported(*op);
+        println!("op {name} supported = {supported}");
+    }
+    assert!(
+        ring.is_op_supported(IORING_OP_READ),
+        "READ must be supported"
+    );
+    ring.close().unwrap();
+}
+
+/// The platform rounds queue sizes up to a power of two, so the allocated size
+/// is generally larger than the requested one. Anything that needs the real
+/// capacity must read it from `GetIoRingInfo`.
+#[test]
+fn ring_info_reports_allocated_queue_sizes() {
+    let mut ring = IoRing::builder()
+        .with_submission_queue_size(20)
+        .with_completion_queue_size(20)
+        .build()
+        .unwrap();
+    let info = ring.info().unwrap();
+    assert!(
+        info.submission_queue_size >= 20,
+        "allocated submission queue {} smaller than requested",
+        info.submission_queue_size
+    );
+    assert!(info.completion_queue_size >= 20);
+    ring.close().unwrap();
+}
+
+#[test]
+fn close_is_idempotent() {
+    let mut ring = IoRing::builder().build().unwrap();
+    assert!(!ring.is_closed());
+    ring.close().unwrap();
+    assert!(ring.is_closed());
+    // A second close must not attempt to close the underlying ring again.
+    ring.close().unwrap();
+}
+
+/// Writes the given bytes through the ring, then flushes, then reads them back
+/// through the ring. Exercises the write and flush entry points end to end.
+#[test]
+fn write_then_flush_then_read_round_trip() {
+    let path = temp_path("rw");
+    let payload = b"io_ring round trip payload";
+
+    let event = AsyncEvent::new().unwrap();
+    let mut ring = IoRing::builder().build().unwrap();
+    ring.set_io_ring_completion_event(event.handle()).unwrap();
+
+    let write_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let write_handle = crate::file::File::from_std(write_file);
+
+    let mut source = payload.to_vec();
+    let op = WriteOp::builder()
+        .with_raw_handle(write_handle.as_raw_handle())
+        .with_raw_data_address(source.as_mut_ptr() as *mut _)
+        .with_num_of_bytes_to_write(source.len() as u32)
+        .with_offset(0)
+        .with_write_flags(FILE_WRITE_FLAGS_NONE)
+        .with_user_data(1)
+        .build()
+        .unwrap();
+    unsafe { ring.build_write_file(op).unwrap() };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    let cqe = ring.pop_completion().unwrap().expect("write completion");
+    cqe.ResultCode.unwrap();
+    assert_eq!(cqe.UserData, 1);
+    assert_eq!(cqe.Information, source.len());
+
+    let flush = FlushOp::builder()
+        .with_raw_handle(write_handle.as_raw_handle())
+        .with_flush_mode(FILE_FLUSH_DEFAULT)
+        .with_user_data(2)
+        .build()
+        .unwrap();
+    unsafe { ring.build_flush_file(flush).unwrap() };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    let cqe = ring.pop_completion().unwrap().expect("flush completion");
+    cqe.ResultCode.unwrap();
+    assert_eq!(cqe.UserData, 2);
+
+    drop(write_handle);
+
+    let read_file = crate::file::File::from_std(File::open(&path).unwrap());
+    let mut dest = vec![0_u8; payload.len()];
+    let op = ReadOp::builder()
+        .with_raw_handle(read_file.as_raw_handle())
+        .with_raw_data_address(dest.as_mut_ptr() as *mut _)
+        .with_num_of_bytes_to_read(dest.len() as u32)
+        .with_offset(0)
+        .with_user_data(3)
+        .build()
+        .unwrap();
+    unsafe { ring.build_read_file(op).unwrap() };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    let cqe = ring.pop_completion().unwrap().expect("read completion");
+    cqe.ResultCode.unwrap();
+    assert_eq!(cqe.UserData, 3);
+
+    assert_eq!(&dest, payload);
+
+    ring.close().unwrap();
+    drop(read_file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A cancellation request produces its own completion, carrying its own user
+/// data rather than the target's. Whether the cancellation actually beats the
+/// operation is a race, so this asserts only on the correlation mechanics.
+#[test]
+fn cancel_request_completes_with_its_own_user_data() {
+    let path = temp_path("cancel");
+    std::fs::write(&path, b"some bytes to read").unwrap();
+
+    let event = AsyncEvent::new().unwrap();
+    let mut ring = IoRing::builder().build().unwrap();
+    ring.set_io_ring_completion_event(event.handle()).unwrap();
+
+    let file = crate::file::File::from_std(File::open(&path).unwrap());
+    let mut dest = vec![0_u8; 8];
+
+    const TARGET_USER_DATA: usize = 0xAAAA;
+    const CANCEL_USER_DATA: usize = 0xBBBB;
+
+    let read = ReadOp::builder()
+        .with_raw_handle(file.as_raw_handle())
+        .with_raw_data_address(dest.as_mut_ptr() as *mut _)
+        .with_num_of_bytes_to_read(dest.len() as u32)
+        .with_offset(0)
+        .with_user_data(TARGET_USER_DATA)
+        .build()
+        .unwrap();
+    unsafe { ring.build_read_file(read).unwrap() };
+
+    let cancel = CancelOp::builder()
+        .with_raw_handle(file.as_raw_handle())
+        .with_op_to_cancel(TARGET_USER_DATA)
+        .with_user_data(CANCEL_USER_DATA)
+        .build()
+        .unwrap();
+    unsafe { ring.build_cancel_request(cancel).unwrap() };
+
+    ring.submit(2, 5000).unwrap();
+
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        event.wait_sync_infinite().unwrap();
+        event.reset().unwrap();
+        while let Some(cqe) = ring.pop_completion().unwrap() {
+            seen.push(cqe.UserData);
+        }
+    }
+
+    assert!(
+        seen.contains(&TARGET_USER_DATA),
+        "target completion missing: {seen:x?}"
+    );
+    assert!(
+        seen.contains(&CANCEL_USER_DATA),
+        "cancel completion missing: {seen:x?}"
+    );
+
+    ring.close().unwrap();
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The platform has no unregister entry point, and it also rejects a\r
+/// zero-length registration, so a registration cannot be released except by\r
+/// replacing it or closing the ring.
+#[test]
+fn empty_registration_is_rejected_by_the_platform() {
+    let event = AsyncEvent::new().unwrap();
+    let mut ring = IoRing::builder().build().unwrap();
+    ring.set_io_ring_completion_event(event.handle()).unwrap();
+
+    let mut buffer = vec![0_u8; 64];
+    unsafe {
+        ring.build_register_buffers(&[BufferInfo::raw_from_vec(&mut buffer)], 1)
+            .unwrap()
+    };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    ring.pop_completion()
+        .unwrap()
+        .expect("register completion")
+        .ResultCode
+        .unwrap();
+
+    // A zero-length registration is accepted by the builder but fails at
+    // completion time, so there is no "unregister by empty set" mechanism. A
+    // registration is released by replacing it or by closing the ring.
+    unsafe { ring.build_register_buffers(&[], 2).unwrap() };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    let cqe = ring
+        .pop_completion()
+        .unwrap()
+        .expect("empty registration completion");
+    assert_eq!(cqe.UserData, 2);
+    assert_eq!(
+        cqe.ResultCode,
+        windows::Win32::Foundation::E_INVALIDARG,
+        "expected an empty registration to fail at completion"
+    );
+
+    // Replacing a registration with a different non-empty set does work.
+    let mut replacement = vec![0_u8; 32];
+    unsafe {
+        ring.build_register_buffers(&[BufferInfo::raw_from_vec(&mut replacement)], 3)
+            .unwrap()
+    };
+    ring.submit(1, 5000).unwrap();
+    event.wait_sync_infinite().unwrap();
+    event.reset().unwrap();
+    let cqe = ring
+        .pop_completion()
+        .unwrap()
+        .expect("re-register completion");
+    cqe.ResultCode.unwrap();
+    assert_eq!(cqe.UserData, 3);
+
+    ring.close().unwrap();
 }
