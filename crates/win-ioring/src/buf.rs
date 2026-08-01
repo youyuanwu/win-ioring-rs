@@ -18,9 +18,10 @@
 //! moved — `[u8; N]` could never honour that, since its bytes move with the
 //! value. Instead the crate places the buffer in a stable heap allocation
 //! before taking its address, and does not move it again until the operation
-//! reaches terminal completion. The implementor's obligation is narrower: while
-//! the value is not moved, the pointer and extents it reports must remain valid
-//! and unchanged.
+//! reaches terminal completion. The implementor's obligation covers the window
+//! between those two points: while the buffer is in flight, nothing it exposes
+//! may invalidate the pointer or extents the driver observed, and no other
+//! alias may touch the bytes the kernel is using.
 //!
 //! # Transfer counts
 //!
@@ -37,13 +38,33 @@ use crate::error::{Error, Result};
 ///
 /// # Safety
 ///
-/// Implementors must guarantee that, for as long as the value is not moved:
+/// This trait is unsafe to implement because the driver hands the reported
+/// pointer to the kernel and relies on it remaining correct for the whole time
+/// the kernel may touch it. That window — from the moment the crate places the
+/// buffer in its operation storage until the operation reaches terminal
+/// completion — is called the *in-flight window* below.
 ///
-/// - [`IoBuf::buf_ptr`] returns a pointer valid for reads of at least
-///   [`IoBuf::buf_len`] bytes.
-/// - Those bytes are initialized.
-/// - Repeated calls return the same pointer and the same length, unless the
-///   value is mutated through a `&mut` reference in between.
+/// Implementors must guarantee all of the following.
+///
+/// **Validity.** [`IoBuf::buf_ptr`] returns a pointer that is non-null,
+/// suitably aligned for `u8`, and valid for reads of [`IoBuf::buf_len`] bytes.
+/// Those bytes are initialized and lie within a single allocated object, and
+/// `buf_len` never exceeds `isize::MAX`. These requirements hold even when
+/// `buf_len` is zero, because the pointer is still formed into a slice.
+///
+/// **Stability.** For the whole in-flight window the pointer and length must
+/// not change. In particular, calling *any* method of this trait or of
+/// [`IoBufMut`] — including [`IoBufMut::buf_mut_ptr`], which takes `&mut self`
+/// — must not reallocate, shrink, or otherwise invalidate what a previous call
+/// reported. The only method permitted to change the reported length is
+/// [`IoBufMut::set_buf_init`], and the crate calls it only after terminal
+/// completion.
+///
+/// **Exclusivity.** For the whole in-flight window the buffer's bytes must not
+/// be read or written through any other alias. The kernel may be reading or
+/// writing them concurrently, so a container that shares its storage — for
+/// instance one that hands out a second view of the same allocation — must not
+/// permit such access while an operation is outstanding.
 ///
 /// The `'static` bound exists because a buffer outlives the future that
 /// submitted it: the driver retains it until the kernel reports completion,
@@ -57,9 +78,18 @@ pub unsafe trait IoBuf: 'static {
 
     /// Returns the initialized bytes as a slice.
     fn as_io_slice(&self) -> &[u8] {
-        // SAFETY: the trait's contract guarantees `buf_len` initialized bytes
-        // are readable from `buf_ptr`.
-        unsafe { std::slice::from_raw_parts(self.buf_ptr(), self.buf_len()) }
+        let len = self.buf_len();
+        if len == 0 {
+            // Avoid constructing a slice from a pointer at all in the empty
+            // case, so that a zero-length buffer can never trip the validity
+            // requirements of `from_raw_parts`.
+            return &[];
+        }
+        // SAFETY: the trait's validity contract guarantees `buf_ptr` is
+        // non-null, aligned, and valid for reads of `len` initialized bytes
+        // within a single allocation, with `len <= isize::MAX`. Its
+        // exclusivity contract rules out a conflicting alias for this borrow.
+        unsafe { std::slice::from_raw_parts(self.buf_ptr(), len) }
     }
 }
 
@@ -67,14 +97,16 @@ pub unsafe trait IoBuf: 'static {
 ///
 /// # Safety
 ///
-/// In addition to the [`IoBuf`] contract, implementors must guarantee that, for
-/// as long as the value is not moved:
+/// In addition to every obligation of [`IoBuf`], including the stability and
+/// exclusivity rules for the in-flight window, implementors must guarantee:
 ///
-/// - [`IoBufMut::buf_mut_ptr`] returns a pointer valid for writes of at least
-///   [`IoBufMut::buf_capacity`] bytes.
-/// - `buf_capacity` is at least `buf_len`.
-/// - Repeated calls return the same pointer and capacity, unless the value is
-///   mutated through a `&mut` reference in between.
+/// **Validity.** [`IoBufMut::buf_mut_ptr`] returns a pointer that is non-null,
+/// suitably aligned for `u8`, and valid for writes of
+/// [`IoBufMut::buf_capacity`] bytes within a single allocated object, with
+/// `buf_capacity` no greater than `isize::MAX`.
+///
+/// **Consistency.** `buf_capacity` is always at least `buf_len`, and
+/// `buf_mut_ptr` reports the same address as [`IoBuf::buf_ptr`].
 pub unsafe trait IoBufMut: IoBuf {
     /// Returns a mutable pointer to the first byte.
     fn buf_mut_ptr(&mut self) -> *mut u8;
@@ -95,8 +127,11 @@ pub unsafe trait IoBufMut: IoBuf {
     unsafe fn set_buf_init(&mut self, len: usize);
 }
 
-// SAFETY: `Vec<u8>` keeps its bytes in a stable heap allocation. `as_ptr` and
-// `len` are consistent, and `len` bytes are initialized by construction.
+// SAFETY: `Vec<u8>` keeps its bytes in a single stable heap allocation whose
+// address is non-null and aligned, and whose first `len` bytes are initialized.
+// None of the accessors below reallocate, so the pointer and extents stay put
+// for as long as the crate holds the value still. A `Vec` owns its allocation
+// exclusively, so no other alias can reach the bytes.
 unsafe impl IoBuf for Vec<u8> {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -107,8 +142,9 @@ unsafe impl IoBuf for Vec<u8> {
     }
 }
 
-// SAFETY: `capacity` bytes are writable from `as_mut_ptr`, and `capacity` is
-// always at least `len`. `set_len` is the intended way to record initialization.
+// SAFETY: `capacity` bytes are writable from `as_mut_ptr`, which reports the
+// same address as `as_ptr` and never reallocates. Capacity is always at least
+// `len`, and `set_len` is the intended way to record initialization.
 unsafe impl IoBufMut for Vec<u8> {
     fn buf_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -126,8 +162,9 @@ unsafe impl IoBufMut for Vec<u8> {
     }
 }
 
-// SAFETY: a boxed slice owns a stable heap allocation whose bytes are all
-// initialized.
+// SAFETY: a boxed slice owns a single stable heap allocation, non-null and
+// aligned, whose bytes are all initialized. Its length is fixed, so no accessor
+// can change the extents, and ownership is exclusive.
 unsafe impl IoBuf for Box<[u8]> {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -155,8 +192,9 @@ unsafe impl IoBufMut for Box<[u8]> {
     }
 }
 
-// SAFETY: an array's bytes are initialized by construction and are readable for
-// its full length.
+// SAFETY: an array's bytes are initialized by construction, live in a single
+// object, and are readable for its full length. The length is a constant, so no
+// accessor can change the extents.
 unsafe impl<const N: usize> IoBuf for [u8; N] {
     fn buf_ptr(&self) -> *const u8 {
         self.as_ptr()
@@ -379,6 +417,30 @@ mod tests {
             other => panic!("expected UninitializedWriteRange, got {other:?}"),
         }
         check_write_initialized(&v, 3).unwrap();
+    }
+
+    /// A zero-length buffer must produce an empty slice without forming one
+    /// from a pointer, so the validity requirements of `from_raw_parts` can
+    /// never be tripped by an empty container.
+    #[test]
+    fn zero_length_buffers_yield_an_empty_slice() {
+        let v: Vec<u8> = Vec::new();
+        assert_eq!(v.buf_len(), 0);
+        assert!(v.as_io_slice().is_empty());
+
+        let b: Box<[u8]> = Vec::new().into_boxed_slice();
+        assert!(b.as_io_slice().is_empty());
+
+        let a: [u8; 0] = [];
+        assert!(a.as_io_slice().is_empty());
+    }
+
+    /// A write of nothing is legal regardless of how little is initialized.
+    #[test]
+    fn zero_length_transfers_pass_the_bounds_checks() {
+        let v: Vec<u8> = Vec::new();
+        check_write_initialized(&v, 0).unwrap();
+        check_read_capacity(&v, 0).unwrap();
     }
 
     #[test]
