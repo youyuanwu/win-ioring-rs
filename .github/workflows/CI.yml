@@ -11,13 +11,19 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install rust stable
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: 1.88.0
-        components: rustfmt, clippy
+    - name: Read rust version from rust-toolchain.toml
+      id: rust-toolchain
+      shell: pwsh
+      run: |
+        $channel = (Select-String -Path rust-toolchain.toml -Pattern '^\s*channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+        if (-not $channel) { throw "Could not read channel from rust-toolchain.toml" }
+        "toolchain=$channel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-    - uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Install rust ${{ steps.rust-toolchain.outputs.toolchain }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+        components: rustfmt, clippy
 
     - name: Run cargo check
       run: cargo check
@@ -28,19 +34,5 @@ jobs:
     - name: Run cargo clippy
       run: cargo clippy --all-targets -- -D warnings
 
-    # Runner does not have ioring?    
-    # - name: Run cargo test
-    #   run: cargo test --all -- --nocapture
-
-    # - name: Run llvm-cov
-    #   run: cargo llvm-cov --codecov --output-path codecov.json
-
-    # - name: Show cov summary
-    #   run: cargo llvm-cov report --summary-only
-
-    # - name: Upload Report to Codecov
-    #   uses: codecov/codecov-action@v4
-    #   with:
-    #     files: ./codecov.json
-    #     fail_ci_if_error: true
-    #     token: ${{ secrets.CODECOV_TOKEN }} # required
+    - name: Run cargo test
+      run: cargo test --workspace --all-targets --all-features
