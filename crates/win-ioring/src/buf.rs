@@ -85,8 +85,13 @@ use crate::error::{Error, Result};
 ///
 /// The `'static` bound exists because a buffer outlives the future that
 /// submitted it: the driver retains it until the kernel reports completion,
-/// which may be after the future was dropped.
-pub unsafe trait IoBuf: 'static {
+/// which may be after the future was dropped. The [`Unpin`] bound exists
+/// because the crate moves the buffer into its own storage when an operation
+/// starts and moves it back out when the operation ends; a buffer that cannot
+/// be moved at all could never make that round trip. Note that this does not
+/// weaken the stability guarantee: the crate keeps the buffer still for the
+/// whole in-flight window, and only moves it at the boundaries.
+pub unsafe trait IoBuf: 'static + Unpin {
     /// Returns a pointer to the first byte.
     fn buf_ptr(&self) -> *const u8;
 

@@ -558,6 +558,37 @@ impl OpSlab {
         out
     }
 
+    /// Visits every live payload.
+    ///
+    /// Teardown uses this to resolve waiting futures before abandoning their
+    /// buffers, which must happen in that order or those futures hang forever.
+    pub fn for_each_payload(&mut self, mut f: impl FnMut(&mut dyn Any)) {
+        for slot in &mut self.slots {
+            if let SlotState::Occupied {
+                ref mut payload, ..
+            } = slot.state
+            {
+                f(payload.as_mut());
+            }
+        }
+    }
+
+    /// Moves every operation that has been built into the submission queue on
+    /// to [`Lifecycle::Submitted`].
+    ///
+    /// Called once the kernel has accepted the queued entries.
+    pub fn promote_built_to_submitted(&mut self) {
+        for slot in &mut self.slots {
+            if let SlotState::Occupied {
+                ref mut lifecycle, ..
+            } = slot.state
+                && *lifecycle == Lifecycle::Built
+            {
+                *lifecycle = Lifecycle::Submitted;
+            }
+        }
+    }
+
     /// Deliberately leaks every remaining payload and renders the slab unusable.
     ///
     /// Used at teardown when the kernel may still hold pointers into those
