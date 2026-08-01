@@ -1,0 +1,406 @@
+//! Owned buffer contracts for IoRing operations.
+//!
+//! Completion-based I/O hands a raw pointer to the kernel and gets it back
+//! later. The buffer must therefore stay alive, and stay at the same address,
+//! for as long as the kernel might touch it — which can outlive the future the
+//! caller is awaiting. This crate solves that by taking **ownership** of the
+//! buffer for the duration of an operation and returning it to the caller
+//! afterwards, rather than borrowing it.
+//!
+//! [`IoBuf`] describes a buffer an operation can read *from*; [`IoBufMut`]
+//! describes one an operation can write *into*. Both are `unsafe` to implement
+//! because the crate relies on their reported pointer and extents being
+//! truthful and stable.
+//!
+//! # Who guarantees stability
+//!
+//! An implementor does **not** have to promise that its pointer survives being
+//! moved — `[u8; N]` could never honour that, since its bytes move with the
+//! value. Instead the crate places the buffer in a stable heap allocation
+//! before taking its address, and does not move it again until the operation
+//! reaches terminal completion. The implementor's obligation is narrower: while
+//! the value is not moved, the pointer and extents it reports must remain valid
+//! and unchanged.
+//!
+//! # Transfer counts
+//!
+//! Some buffer types track an initialized length separately from their capacity
+//! (`Vec<u8>`), and some are wholly initialized by construction (`[u8; N]`,
+//! `Box<[u8]>`). A read into the latter cannot shrink the buffer to the number
+//! of bytes actually transferred, so the transfer count is always reported by
+//! the operation's result. For length-tracking types the initialized length is
+//! additionally updated to match.
+
+use crate::error::{Error, Result};
+
+/// A buffer an operation can read from.
+///
+/// # Safety
+///
+/// Implementors must guarantee that, for as long as the value is not moved:
+///
+/// - [`IoBuf::buf_ptr`] returns a pointer valid for reads of at least
+///   [`IoBuf::buf_len`] bytes.
+/// - Those bytes are initialized.
+/// - Repeated calls return the same pointer and the same length, unless the
+///   value is mutated through a `&mut` reference in between.
+///
+/// The `'static` bound exists because a buffer outlives the future that
+/// submitted it: the driver retains it until the kernel reports completion,
+/// which may be after the future was dropped.
+pub unsafe trait IoBuf: 'static {
+    /// Returns a pointer to the first byte.
+    fn buf_ptr(&self) -> *const u8;
+
+    /// Returns the number of initialized bytes that may be read.
+    fn buf_len(&self) -> usize;
+
+    /// Returns the initialized bytes as a slice.
+    fn as_io_slice(&self) -> &[u8] {
+        // SAFETY: the trait's contract guarantees `buf_len` initialized bytes
+        // are readable from `buf_ptr`.
+        unsafe { std::slice::from_raw_parts(self.buf_ptr(), self.buf_len()) }
+    }
+}
+
+/// A buffer an operation can write into.
+///
+/// # Safety
+///
+/// In addition to the [`IoBuf`] contract, implementors must guarantee that, for
+/// as long as the value is not moved:
+///
+/// - [`IoBufMut::buf_mut_ptr`] returns a pointer valid for writes of at least
+///   [`IoBufMut::buf_capacity`] bytes.
+/// - `buf_capacity` is at least `buf_len`.
+/// - Repeated calls return the same pointer and capacity, unless the value is
+///   mutated through a `&mut` reference in between.
+pub unsafe trait IoBufMut: IoBuf {
+    /// Returns a mutable pointer to the first byte.
+    fn buf_mut_ptr(&mut self) -> *mut u8;
+
+    /// Returns the total number of bytes that may be written.
+    fn buf_capacity(&self) -> usize;
+
+    /// Records that the first `len` bytes are now initialized.
+    ///
+    /// Types that cannot track an initialized length separately from their
+    /// capacity may ignore this; the authoritative transfer count is always the
+    /// one reported by the operation's result.
+    ///
+    /// # Safety
+    ///
+    /// `len` must not exceed [`IoBufMut::buf_capacity`], and the first `len`
+    /// bytes must genuinely have been initialized.
+    unsafe fn set_buf_init(&mut self, len: usize);
+}
+
+// SAFETY: `Vec<u8>` keeps its bytes in a stable heap allocation. `as_ptr` and
+// `len` are consistent, and `len` bytes are initialized by construction.
+unsafe impl IoBuf for Vec<u8> {
+    fn buf_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn buf_len(&self) -> usize {
+        self.len()
+    }
+}
+
+// SAFETY: `capacity` bytes are writable from `as_mut_ptr`, and `capacity` is
+// always at least `len`. `set_len` is the intended way to record initialization.
+unsafe impl IoBufMut for Vec<u8> {
+    fn buf_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.capacity()
+    }
+
+    unsafe fn set_buf_init(&mut self, len: usize) {
+        debug_assert!(len <= self.capacity());
+        // SAFETY: the caller guarantees `len` bytes are initialized and that
+        // `len` does not exceed the capacity.
+        unsafe { self.set_len(len) };
+    }
+}
+
+// SAFETY: a boxed slice owns a stable heap allocation whose bytes are all
+// initialized.
+unsafe impl IoBuf for Box<[u8]> {
+    fn buf_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn buf_len(&self) -> usize {
+        self.len()
+    }
+}
+
+// SAFETY: every byte of a boxed slice is writable, and its length is fixed, so
+// capacity equals length.
+unsafe impl IoBufMut for Box<[u8]> {
+    fn buf_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.len()
+    }
+
+    unsafe fn set_buf_init(&mut self, _len: usize) {
+        // A boxed slice has a fixed length and is initialized throughout, so
+        // there is no separate initialization watermark to record.
+    }
+}
+
+// SAFETY: an array's bytes are initialized by construction and are readable for
+// its full length.
+unsafe impl<const N: usize> IoBuf for [u8; N] {
+    fn buf_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn buf_len(&self) -> usize {
+        N
+    }
+}
+
+// SAFETY: every byte of the array is writable and its length is fixed.
+unsafe impl<const N: usize> IoBufMut for [u8; N] {
+    fn buf_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        N
+    }
+
+    unsafe fn set_buf_init(&mut self, _len: usize) {
+        // An array has a fixed length and is initialized throughout.
+    }
+}
+
+/// The outcome of an operation together with the buffer it borrowed.
+///
+/// Completion-based I/O takes ownership of the caller's buffer, so it has to
+/// give it back. `BufResult` pairs the operation's result with that buffer, and
+/// does so on both success and failure.
+#[derive(Debug)]
+pub struct BufResult<T, B> {
+    /// The operation's result.
+    pub result: Result<T>,
+    /// The caller's buffer, returned regardless of the result.
+    pub buffer: B,
+}
+
+impl<T, B> BufResult<T, B> {
+    /// Pairs a result with the buffer it used.
+    pub fn new(result: Result<T>, buffer: B) -> Self {
+        Self { result, buffer }
+    }
+
+    /// Splits into the result and the buffer.
+    pub fn into_parts(self) -> (Result<T>, B) {
+        (self.result, self.buffer)
+    }
+
+    /// Returns `true` if the operation succeeded.
+    pub fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// Maps the success value, leaving the buffer untouched.
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> BufResult<U, B> {
+        BufResult {
+            result: self.result.map(f),
+            buffer: self.buffer,
+        }
+    }
+
+    /// Returns the success value and the buffer, panicking on failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation failed.
+    pub fn expect(self, msg: &str) -> (T, B) {
+        match self.result {
+            Ok(v) => (v, self.buffer),
+            Err(e) => panic!("{msg}: {e}"),
+        }
+    }
+
+    /// Returns the success value and the buffer, panicking on failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation failed.
+    pub fn unwrap(self) -> (T, B) {
+        self.expect("operation failed")
+    }
+}
+
+/// Rejects a read that would write past the buffer's capacity.
+///
+/// Exposed so that callers building operations against the raw layer can apply
+/// the same rule the safe layer applies.
+///
+/// # Errors
+///
+/// Returns [`Error::BufferTooSmall`] if `requested` exceeds the capacity.
+pub fn check_read_capacity<B: IoBufMut>(buffer: &B, requested: u64) -> Result<()> {
+    let available = buffer.buf_capacity() as u64;
+    if requested > available {
+        Err(Error::BufferTooSmall {
+            requested,
+            available,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Rejects a write that would read past the buffer's initialized bytes.
+///
+/// Sending uninitialized memory to the kernel is never permitted, so the check
+/// is against the initialized length rather than the capacity. Exposed so that
+/// callers building operations against the raw layer can apply the same rule
+/// the safe layer applies.
+///
+/// # Errors
+///
+/// Returns [`Error::UninitializedWriteRange`] if `requested` exceeds the
+/// initialized length.
+pub fn check_write_initialized<B: IoBuf>(buffer: &B, requested: u64) -> Result<()> {
+    let initialized = buffer.buf_len() as u64;
+    if requested > initialized {
+        Err(Error::UninitializedWriteRange {
+            requested,
+            initialized,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vec_reports_initialized_length_not_capacity() {
+        let mut v: Vec<u8> = Vec::with_capacity(64);
+        v.extend_from_slice(b"abc");
+        assert_eq!(v.buf_len(), 3);
+        assert!(v.buf_capacity() >= 64);
+        assert_eq!(v.as_io_slice(), b"abc");
+    }
+
+    #[test]
+    fn vec_records_transferred_length() {
+        let mut v: Vec<u8> = Vec::with_capacity(16);
+        // Simulate a completion writing 5 bytes into the spare capacity.
+        unsafe {
+            std::ptr::write_bytes(v.buf_mut_ptr(), b'x', 5);
+            v.set_buf_init(5);
+        }
+        assert_eq!(v.buf_len(), 5);
+        assert_eq!(v.as_io_slice(), b"xxxxx");
+    }
+
+    #[test]
+    fn boxed_slice_is_fully_initialized() {
+        let mut b: Box<[u8]> = vec![7_u8; 8].into_boxed_slice();
+        assert_eq!(b.buf_len(), 8);
+        assert_eq!(b.buf_capacity(), 8);
+        // Fixed-length buffers cannot shrink to the transferred count; the
+        // count is carried by the operation result instead.
+        unsafe { b.set_buf_init(3) };
+        assert_eq!(b.buf_len(), 8);
+    }
+
+    #[test]
+    fn array_is_fully_initialized() {
+        let mut a = [0_u8; 4];
+        assert_eq!(a.buf_len(), 4);
+        assert_eq!(a.buf_capacity(), 4);
+        unsafe { a.set_buf_init(1) };
+        assert_eq!(a.buf_len(), 4);
+    }
+
+    /// All three standard container types must work with no caller-written
+    /// adapter, through both contracts where applicable.
+    #[test]
+    fn standard_containers_satisfy_the_contracts() {
+        fn read_target<B: IoBufMut>(mut b: B) -> usize {
+            let _ = b.buf_mut_ptr();
+            b.buf_capacity()
+        }
+        fn write_source<B: IoBuf>(b: B) -> usize {
+            let _ = b.buf_ptr();
+            b.buf_len()
+        }
+
+        assert!(read_target(vec![0_u8; 4]) >= 4);
+        assert_eq!(read_target(vec![0_u8; 4].into_boxed_slice()), 4);
+        assert_eq!(read_target([0_u8; 4]), 4);
+
+        assert_eq!(write_source(vec![1_u8, 2, 3]), 3);
+        assert_eq!(write_source(vec![1_u8; 3].into_boxed_slice()), 3);
+        assert_eq!(write_source([1_u8; 3]), 3);
+    }
+
+    #[test]
+    fn read_over_capacity_is_rejected() {
+        let v = vec![0_u8; 4];
+        let err = check_read_capacity(&v, (v.capacity() + 1) as u64)
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::BufferTooSmall { .. }));
+        check_read_capacity(&v, 4).unwrap();
+    }
+
+    /// A write must never source bytes the caller has not initialized, even
+    /// when those bytes are within the allocation's capacity.
+    #[test]
+    fn write_past_initialized_bytes_is_rejected() {
+        let mut v: Vec<u8> = Vec::with_capacity(64);
+        v.extend_from_slice(b"abc");
+        let err = check_write_initialized(&v, 4).err().unwrap();
+        match err {
+            Error::UninitializedWriteRange {
+                requested,
+                initialized,
+            } => {
+                assert_eq!(requested, 4);
+                assert_eq!(initialized, 3);
+            }
+            other => panic!("expected UninitializedWriteRange, got {other:?}"),
+        }
+        check_write_initialized(&v, 3).unwrap();
+    }
+
+    #[test]
+    fn buf_result_returns_the_buffer_on_success_and_failure() {
+        let ok: BufResult<usize, Vec<u8>> = BufResult::new(Ok(3), vec![1, 2, 3]);
+        assert!(ok.is_ok());
+        let (r, b) = ok.into_parts();
+        assert_eq!(r.unwrap(), 3);
+        assert_eq!(b, vec![1, 2, 3]);
+
+        let err: BufResult<usize, Vec<u8>> = BufResult::new(Err(Error::QueueFull), vec![9]);
+        assert!(!err.is_ok());
+        let (r, b) = err.into_parts();
+        assert!(matches!(r.unwrap_err(), Error::QueueFull));
+        assert_eq!(b, vec![9], "buffer must come back even on failure");
+    }
+
+    #[test]
+    fn buf_result_map_preserves_the_buffer() {
+        let r: BufResult<usize, Vec<u8>> = BufResult::new(Ok(2), vec![4, 5]);
+        let mapped = r.map(|n| n * 10);
+        assert_eq!(mapped.result.unwrap(), 20);
+        assert_eq!(mapped.buffer, vec![4, 5]);
+    }
+}
