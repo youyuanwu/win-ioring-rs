@@ -173,6 +173,10 @@ enum SlotState {
     /// outstanding. The payload is gone; only the accounting remains, so the
     /// slot index cannot be reused until those cancels report.
     Tombstone { pending_cancels: u32 },
+    /// The slot has exhausted its generation counter and is permanently
+    /// withdrawn from use, so that no stale token can ever alias a future
+    /// occupant.
+    Retired,
 }
 
 struct Slot {
@@ -226,7 +230,7 @@ impl OpSlab {
         self.slots
             .iter()
             .filter(|s| match &s.state {
-                SlotState::Vacant { .. } => false,
+                SlotState::Vacant { .. } | SlotState::Retired => false,
                 SlotState::Occupied { .. } => true,
                 SlotState::Tombstone { pending_cancels } => *pending_cancels > 0,
             })
@@ -377,21 +381,26 @@ impl OpSlab {
     /// Records that a cancellation request has been issued against a slot.
     ///
     /// Returns the token to give that cancellation request as its own user
-    /// data, or `None` if the slot is not tracking anything.
+    /// data, or `None` if there is nothing to cancel — because the token is
+    /// unknown, is not an operation token, or names an operation that has
+    /// already completed. Cancelling a finished operation is a no-op rather
+    /// than an error.
     pub fn register_cancel(&mut self, token: Token) -> Option<Token> {
+        if token.kind() != TokenKind::Operation {
+            return None;
+        }
         let slot = self.slot_for_mut(token)?;
         match slot.state {
             SlotState::Occupied {
                 ref mut pending_cancels,
                 ..
-            }
-            | SlotState::Tombstone {
-                ref mut pending_cancels,
             } => {
                 *pending_cancels += 1;
                 Some(token.to_cancel())
             }
-            SlotState::Vacant { .. } => None,
+            // The operation is already over. There is nothing left to cancel,
+            // and incrementing the tombstone would withhold its index forever.
+            SlotState::Tombstone { .. } | SlotState::Vacant { .. } | SlotState::Retired => None,
         }
     }
 
@@ -403,9 +412,14 @@ impl OpSlab {
     /// reuse until those cancellations report; otherwise the slot is freed
     /// immediately.
     ///
-    /// Returns `None` for a token the slab is not tracking, which is how a
-    /// stale or unrecognised completion is safely ignored.
+    /// Returns `None` for a token the slab is not tracking, and for a token
+    /// that is not an operation token — a cancellation's completion must never
+    /// release the operation's buffer. This is how a stale or unrecognised
+    /// completion is safely ignored.
     pub fn complete(&mut self, token: Token) -> Option<Box<dyn Any>> {
+        if token.kind() != TokenKind::Operation {
+            return None;
+        }
         let index = token.index();
         let generation = token.generation();
         let slot = self.slots.get_mut(index)?;
@@ -437,10 +451,18 @@ impl OpSlab {
 
     /// Handles a cancellation request's own completion.
     ///
-    /// Returns `true` if the slot was accounted for. When the last outstanding
-    /// cancellation against a tombstoned slot reports, the slot is finally
-    /// freed for reuse.
+    /// Returns `true` if the completion was accounted for. When the last
+    /// outstanding cancellation against a tombstoned slot reports, the slot is
+    /// finally freed for reuse.
+    ///
+    /// Returns `false` for a token that is not a cancellation token, for one
+    /// the slab is not tracking, and for a slot that was not expecting a
+    /// cancellation completion. Silently absorbing an unexpected completion
+    /// could reclaim a slot while a real cancellation was still in flight.
     pub fn complete_cancel(&mut self, token: Token) -> bool {
+        if token.kind() != TokenKind::Cancel {
+            return false;
+        }
         let index = token.index();
         let generation = token.generation();
         let Some(slot) = self.slots.get_mut(index) else {
@@ -454,31 +476,45 @@ impl OpSlab {
                 ref mut pending_cancels,
                 ..
             } => {
-                *pending_cancels = pending_cancels.saturating_sub(1);
+                if *pending_cancels == 0 {
+                    return false;
+                }
+                *pending_cancels -= 1;
                 true
             }
             SlotState::Tombstone {
                 ref mut pending_cancels,
             } => {
-                *pending_cancels = pending_cancels.saturating_sub(1);
+                if *pending_cancels == 0 {
+                    return false;
+                }
+                *pending_cancels -= 1;
                 if *pending_cancels == 0 {
                     self.free_slot(index);
                 }
                 true
             }
-            SlotState::Vacant { .. } => false,
+            SlotState::Vacant { .. } | SlotState::Retired => false,
         }
     }
 
     /// Frees a slot and bumps its generation so outstanding tokens for it
     /// become stale.
+    ///
+    /// A slot whose generation counter is exhausted is **retired** instead of
+    /// being recycled. Wrapping the counter would let a stale token match a
+    /// future occupant and complete somebody else's operation, so the index is
+    /// permanently withdrawn. That costs one slot after
+    /// `2^GENERATION_BITS` reuses of it — 32768 on a 32-bit target, and around
+    /// 1.4 x 10^14 on a 64-bit one.
     fn free_slot(&mut self, index: usize) {
         let free_head = self.free_head;
         let slot = &mut self.slots[index];
-        // Wrapping is deliberate. After 2^GENERATION_BITS reuses of one slot a
-        // stale token could alias again; that is 32768 reuses on a 32-bit
-        // target and 2^47 on a 64-bit one.
-        slot.generation = slot.generation.wrapping_add(1) & GENERATION_MASK;
+        if slot.generation >= GENERATION_MASK {
+            slot.state = SlotState::Retired;
+            return;
+        }
+        slot.generation += 1;
         slot.state = SlotState::Vacant {
             next_free: free_head,
         };
@@ -507,24 +543,25 @@ impl OpSlab {
         out
     }
 
-    /// Deliberately leaks every remaining payload.
+    /// Deliberately leaks every remaining payload and renders the slab unusable.
     ///
     /// Used at teardown when the kernel may still hold pointers into those
     /// buffers and quiescence could not be established. Leaking is the correct
     /// trade against a use-after-free.
+    ///
+    /// This is a **terminal** operation: the slab is emptied entirely and must
+    /// not be used afterwards. Returning the leaked slots to the free list
+    /// would be wrong, since the kernel may still write into them.
     pub fn leak(&mut self) -> usize {
         let mut leaked = 0;
-        for index in 0..self.slots.len() {
-            let state = std::mem::replace(
-                &mut self.slots[index].state,
-                SlotState::Vacant { next_free: None },
-            );
-            if let SlotState::Occupied { payload, .. } = state {
+        for slot in self.slots.drain(..) {
+            if let SlotState::Occupied { payload, .. } = slot.state {
                 std::mem::forget(payload);
-                self.occupied -= 1;
                 leaked += 1;
             }
         }
+        self.free_head = None;
+        self.occupied = 0;
         leaked
     }
 }
@@ -532,6 +569,20 @@ impl OpSlab {
 impl Default for OpSlab {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl OpSlab {
+    /// Forces a slot's generation counter, so that exhaustion can be exercised
+    /// without performing 2^47 reuse cycles.
+    fn force_generation(&mut self, index: usize, generation: usize) {
+        self.slots[index].generation = generation & GENERATION_MASK;
+    }
+
+    /// Returns `true` if the slot has been permanently withdrawn from use.
+    fn is_retired(&self, index: usize) -> bool {
+        matches!(self.slots[index].state, SlotState::Retired)
     }
 }
 
@@ -544,11 +595,10 @@ mod tests {
     }
 
     fn payload_addr(slab: &mut OpSlab, token: Token) -> *const u8 {
-        slab.payload_mut(token)
-            .unwrap()
-            .downcast_ref::<Vec<u32>>()
-            .unwrap()
-            .as_ptr() as *const u8
+        // Take the address of the payload itself, not of an allocation it
+        // happens to own. A `Vec`'s heap buffer would stay put even if the
+        // `Vec` value moved, so measuring that would prove nothing.
+        slab.payload_mut(token).unwrap() as *const dyn Any as *const u8
     }
 
     /// The whole design rests on a payload's address being independent of the
@@ -774,6 +824,93 @@ mod tests {
         assert_eq!(reused.index(), op.index());
     }
 
+    /// The kind bit exists precisely so a cancellation's completion can never be
+    /// mistaken for its target's. Mixing them up would release the caller's
+    /// buffer while the kernel still owned it.
+    #[test]
+    fn completions_reject_the_wrong_token_kind() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(1)).unwrap();
+        let cancel = slab.register_cancel(op).unwrap();
+
+        // A cancellation's completion must not release the operation's payload.
+        assert!(slab.complete(cancel).is_none());
+        assert_eq!(slab.lookup(op), Lookup::Live);
+
+        // An operation's completion must not be counted as a cancellation.
+        assert!(!slab.complete_cancel(op));
+
+        // The correctly-kinded calls still work.
+        assert!(slab.complete(op).is_some());
+        assert!(slab.complete_cancel(cancel));
+        assert_eq!(slab.outstanding(), 0);
+    }
+
+    /// An unexpected cancellation completion must not be absorbed, or it could
+    /// reclaim a slot while a genuine cancellation was still in flight.
+    #[test]
+    fn cancel_completion_without_a_pending_cancel_is_rejected() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(1)).unwrap();
+        let spurious = op.to_cancel();
+
+        assert!(
+            !slab.complete_cancel(spurious),
+            "a cancel completion nobody asked for must not be accounted"
+        );
+        assert_eq!(slab.lookup(op), Lookup::Live);
+
+        // One real cancel, then two completions: only the first is accepted.
+        let cancel = slab.register_cancel(op).unwrap();
+        assert!(slab.complete_cancel(cancel));
+        assert!(!slab.complete_cancel(cancel));
+    }
+
+    /// Cancelling an operation that has already completed is a no-op, not an
+    /// error, and must not withhold the slot index forever.
+    #[test]
+    fn cancelling_a_finished_operation_is_a_no_op() {
+        let mut slab = OpSlab::new();
+        let op = slab.insert(payload(1)).unwrap();
+        let cancel = slab.register_cancel(op).unwrap();
+        slab.complete(op).unwrap();
+        assert_eq!(slab.lookup(op), Lookup::Tombstoned);
+
+        // Registering another cancel against the tombstone must be refused.
+        assert!(slab.register_cancel(op).is_none());
+
+        // So the single outstanding cancel still releases the slot.
+        assert!(slab.complete_cancel(cancel));
+        assert_eq!(slab.lookup(op), Lookup::Unknown);
+        assert_eq!(slab.insert(payload(2)).unwrap().index(), op.index());
+    }
+
+    /// Wrapping the generation counter would let a stale token match a future
+    /// occupant, so an exhausted slot is retired instead.
+    #[test]
+    fn exhausted_generations_retire_the_slot_instead_of_wrapping() {
+        let mut slab = OpSlab::new();
+        let first = slab.insert(payload(1)).unwrap();
+        assert_eq!(first.index(), 0);
+
+        // Jump the counter to its last usable value.
+        slab.force_generation(0, GENERATION_MASK);
+        let stale = Token::new(TokenKind::Operation, 0, GENERATION_MASK);
+
+        slab.complete(stale).unwrap();
+        assert!(
+            slab.is_retired(0),
+            "an exhausted slot must be withdrawn, not recycled"
+        );
+
+        // The next insert must not reuse the retired index, so the stale token
+        // cannot alias the new occupant.
+        let next = slab.insert(payload(2)).unwrap();
+        assert_ne!(next.index(), 0);
+        assert!(slab.complete(stale).is_none());
+        assert_eq!(slab.lookup(next), Lookup::Live);
+    }
+
     #[test]
     fn generation_wraps_without_panicking() {
         let mut slab = OpSlab::new();
@@ -838,8 +975,32 @@ mod tests {
         let leaked = slab.leak();
         assert_eq!(leaked, 3);
         assert_eq!(slab.occupied(), 0);
+        assert_eq!(slab.outstanding(), 0);
         // The clones were forgotten rather than dropped, which is exactly what
         // teardown needs when the kernel may still reach the buffers.
         assert_eq!(Rc::strong_count(&witness), 4);
+    }
+
+    /// `leak` is terminal. It must leave no half-built free list behind that a
+    /// later insert could walk into.
+    #[test]
+    fn leak_empties_the_slab_rather_than_corrupting_the_free_list() {
+        let mut slab = OpSlab::new();
+        let a = slab.insert(payload(1)).unwrap();
+        let b = slab.insert(payload(2)).unwrap();
+        // Free one slot so the free list is non-empty before leaking.
+        slab.complete(a).unwrap();
+
+        slab.leak();
+        assert_eq!(slab.occupied(), 0);
+        assert_eq!(slab.outstanding(), 0);
+        assert_eq!(slab.lookup(a), Lookup::Unknown);
+        assert_eq!(slab.lookup(b), Lookup::Unknown);
+
+        // Inserting again must produce a coherent slot rather than following a
+        // dangling free-list index.
+        let fresh = slab.insert(payload(3)).unwrap();
+        assert_eq!(slab.lookup(fresh), Lookup::Live);
+        assert_eq!(slab.occupied(), 1);
     }
 }
