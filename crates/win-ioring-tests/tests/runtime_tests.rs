@@ -7,7 +7,7 @@ async fn tokio_readme_test() {
     local
         .run_until(async {
             let io_ring = IoRing::builder().build().unwrap();
-            let driver = win_ioring::runtime::Driver::new(io_ring);
+            let driver = win_ioring::runtime::Driver::new(io_ring).unwrap();
             let mut h_ring = driver.handle();
 
             let driver = tokio::task::spawn_local(async move {
@@ -39,7 +39,7 @@ fn rt_readme_test() {
     let handle = rt.handle();
     rt.block_on(async move {
         let io_ring = IoRing::builder().build().unwrap();
-        let driver = win_ioring::runtime::Driver::new(io_ring);
+        let driver = win_ioring::runtime::Driver::new(io_ring).unwrap();
         let mut h_ring = driver.handle();
 
         // OS needs to call the waker from the other thread.

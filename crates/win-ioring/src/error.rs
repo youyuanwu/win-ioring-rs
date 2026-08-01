@@ -135,16 +135,43 @@ impl Error {
         }
     }
 
+    /// Classifies a platform `HRESULT` into a crate error.
+    ///
+    /// The IoRing API set defines its own `HRESULT` facility, so most failure
+    /// modes are distinguishable without guessing. Codes with no specific
+    /// meaning to this crate are preserved verbatim in [`Error::Os`].
+    pub(crate) fn from_hresult(hr: windows::core::HRESULT) -> Self {
+        use windows::Win32::Foundation::{
+            IORING_E_REQUIRED_FLAG_NOT_SUPPORTED, IORING_E_SUBMISSION_QUEUE_FULL,
+            IORING_E_VERSION_NOT_SUPPORTED,
+        };
+        match hr {
+            h if h == IORING_E_SUBMISSION_QUEUE_FULL => Error::QueueFull,
+            h if h == IORING_E_VERSION_NOT_SUPPORTED => Error::UnsupportedVersion {
+                requested: 0,
+                max_supported: 0,
+            },
+            h if h == IORING_E_REQUIRED_FLAG_NOT_SUPPORTED => Error::UnsupportedFeature {
+                required: 0,
+                available: 0,
+            },
+            other => Error::Os(windows::core::Error::from(other)),
+        }
+    }
+
     /// Classifies a platform error produced while creating a ring.
     ///
-    /// Ring creation failures are the point at which an otherwise-loadable host
-    /// reveals that it cannot provide a usable ring, so they are mapped to
-    /// [`Error::Unsupported`] rather than surfaced as a raw `HRESULT`.
+    /// `E_NOTIMPL` is the signal that a host which can load this crate's
+    /// imports nonetheless cannot provide a ring. Argument errors such as
+    /// `E_INVALIDARG` are deliberately *not* folded into
+    /// [`Error::Unsupported`], because they usually indicate a bad queue size
+    /// rather than a platform limitation.
     pub(crate) fn from_create_failure(err: windows::core::Error) -> Self {
-        use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
-        match err.code() {
-            code if code == E_NOTIMPL || code == E_INVALIDARG => Error::Unsupported,
-            _ => Error::Os(err),
+        use windows::Win32::Foundation::E_NOTIMPL;
+        if err.code() == E_NOTIMPL {
+            Error::Unsupported
+        } else {
+            Error::from_hresult(err.code())
         }
     }
 
@@ -154,6 +181,12 @@ impl Error {
             requested: requested.0,
             max_supported: max.0,
         }
+    }
+}
+
+impl From<windows::core::HRESULT> for Error {
+    fn from(value: windows::core::HRESULT) -> Self {
+        Error::from_hresult(value)
     }
 }
 
@@ -242,7 +275,7 @@ impl std::error::Error for Error {
 
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
-        Error::Os(value)
+        Error::from_hresult(value.code())
     }
 }
 

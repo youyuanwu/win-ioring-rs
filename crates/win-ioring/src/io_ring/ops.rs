@@ -485,6 +485,39 @@ impl CancelOpBuilder {
     }
 }
 
+/// A buffer registration.
+///
+/// Registration replaces any previous buffer registration on the ring. The
+/// platform provides no unregister entry point, and a zero-length registration
+/// fails at completion time, so a registration is released only by replacing it
+/// or by closing the ring.
+pub struct RegisterBuffersOp<'a> {
+    pub(crate) buffers: &'a [crate::io_ring::BufferInfo],
+    pub(crate) userdata: usize,
+}
+
+impl<'a> RegisterBuffersOp<'a> {
+    /// Describes a registration of the given buffers.
+    pub fn new(buffers: &'a [crate::io_ring::BufferInfo], userdata: usize) -> Self {
+        Self { buffers, userdata }
+    }
+}
+
+/// A file handle registration.
+///
+/// Registration replaces any previous handle registration on the ring. See
+/// [`RegisterBuffersOp`] for why registrations cannot be released directly.
+pub struct RegisterFilesOp<'a> {
+    pub(crate) handles: &'a [HANDLE],
+    pub(crate) userdata: usize,
+}
+
+impl<'a> RegisterFilesOp<'a> {
+    /// Describes a registration of the given handles.
+    pub fn new(handles: &'a [HANDLE], userdata: usize) -> Self {
+        Self { handles, userdata }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

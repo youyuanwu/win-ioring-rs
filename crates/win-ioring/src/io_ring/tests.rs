@@ -459,17 +459,40 @@ fn cancel_request_completes_with_its_own_user_data() {
         event.wait_sync_infinite().unwrap();
         event.reset().unwrap();
         while let Some(cqe) = ring.pop_completion().unwrap() {
-            seen.push(cqe.UserData);
+            seen.push((cqe.UserData, cqe.ResultCode));
         }
     }
 
+    let target = seen
+        .iter()
+        .find(|(ud, _)| *ud == TARGET_USER_DATA)
+        .expect("target completion missing");
+    let cancel_cqe = seen
+        .iter()
+        .find(|(ud, _)| *ud == CANCEL_USER_DATA)
+        .expect("cancel completion missing");
+
+    // Whether the cancellation wins the race is not deterministic, so the
+    // target may have succeeded or been aborted. Both are acceptable; what must
+    // hold is that the two completions are distinguishable and that neither
+    // reports an unexpected failure mode.
+    let target_ok = target.1.is_ok();
+    let target_aborted = target.1 == windows::Win32::Foundation::E_ABORT;
     assert!(
-        seen.contains(&TARGET_USER_DATA),
-        "target completion missing: {seen:x?}"
+        target_ok || target_aborted,
+        "target completed with an unexpected code: {:?}",
+        target.1
     );
+
+    // The cancellation request itself either found its target or reported that
+    // there was nothing left to cancel; it must not fail in any other way.
+    let cancel_ok = cancel_cqe.1.is_ok();
+    let not_found =
+        cancel_cqe.1 == windows::core::HRESULT::from(windows::Win32::Foundation::ERROR_NOT_FOUND);
     assert!(
-        seen.contains(&CANCEL_USER_DATA),
-        "cancel completion missing: {seen:x?}"
+        cancel_ok || not_found,
+        "cancel completed with an unexpected code: {:?}",
+        cancel_cqe.1
     );
 
     ring.close().unwrap();
@@ -535,4 +558,121 @@ fn empty_registration_is_rejected_by_the_platform() {
     assert_eq!(cqe.UserData, 3);
 
     ring.close().unwrap();
+}
+
+/// SC-002: every IoRing entry point the platform bindings expose has a wrapper
+/// in this layer. This is a compile-time enumeration: if a wrapper is removed
+/// or renamed, this fails to build.
+#[test]
+fn all_fourteen_entry_points_have_wrappers() {
+    #[allow(unused_imports)]
+    use crate::io_ring::ops::{
+        CancelOp, FlushOp, ReadOp, RegisterBuffersOp, RegisterFilesOp, WriteOp,
+    };
+
+    // Associated-function pointers, one per platform entry point.
+    let _create: fn(IORING_VERSION, u32, u32) -> crate::Result<IoRing> = IoRing::create;
+    let _close: fn(&mut IoRing) -> crate::Result<()> = IoRing::close;
+    let _submit: fn(&mut IoRing, usize, usize) -> crate::Result<u32> = IoRing::submit;
+    let _pop: fn(
+        &mut IoRing,
+    ) -> crate::Result<Option<windows::Win32::Storage::FileSystem::IORING_CQE>> =
+        IoRing::pop_completion;
+    let _caps: fn() -> crate::Result<crate::io_ring::Capabilities> =
+        IoRing::query_io_ring_capabilities;
+    let _info: fn(&IoRing) -> crate::Result<crate::io_ring::RingInfo> = IoRing::info;
+    let _is_supported: fn(&IoRing, windows::Win32::Storage::FileSystem::IORING_OP_CODE) -> bool =
+        IoRing::is_op_supported;
+    let _set_event: fn(&mut IoRing, windows::Win32::Foundation::HANDLE) -> crate::Result<()> =
+        IoRing::set_io_ring_completion_event;
+    let _read: unsafe fn(&mut IoRing, ReadOp) -> crate::Result<()> = IoRing::build_read_file;
+    let _write: unsafe fn(&mut IoRing, WriteOp) -> crate::Result<()> = IoRing::build_write_file;
+    let _flush: unsafe fn(&mut IoRing, FlushOp) -> crate::Result<()> = IoRing::build_flush_file;
+    let _cancel: unsafe fn(&mut IoRing, CancelOp) -> crate::Result<()> =
+        IoRing::build_cancel_request;
+    let _reg_bufs: unsafe fn(&mut IoRing, &[BufferInfo], usize) -> crate::Result<()> =
+        IoRing::build_register_buffers;
+    let _reg_files: unsafe fn(
+        &mut IoRing,
+        &[windows::Win32::Foundation::HANDLE],
+        usize,
+    ) -> crate::Result<()> = IoRing::build_register_file_handles;
+}
+
+/// A full submission queue must surface as the dedicated `QueueFull` variant,
+/// not as an opaque platform error. The real capacity comes from
+/// `GetIoRingInfo`, because the platform rounds the requested size up.
+#[test]
+fn full_submission_queue_reports_queue_full() {
+    let mut ring = IoRing::builder()
+        .with_submission_queue_size(2)
+        .with_completion_queue_size(2)
+        .build()
+        .unwrap();
+    let capacity = ring.info().unwrap().submission_queue_size;
+
+    let file = crate::file::File::from_std(File::open(README_PATH).unwrap());
+    let mut buffer = vec![0_u8; 16];
+
+    let mut queue_full = None;
+    for i in 0..(capacity + 4) {
+        let op = ReadOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_raw_data_address(buffer.as_mut_ptr() as *mut _)
+            .with_num_of_bytes_to_read(8)
+            .with_offset(0)
+            .with_user_data(i as usize)
+            .build()
+            .unwrap();
+        if let Err(e) = unsafe { ring.build_read_file(op) } {
+            queue_full = Some((i, e));
+            break;
+        }
+    }
+
+    let (filled_at, err) = queue_full.expect("submission queue never reported full");
+    assert!(
+        matches!(err, Error::QueueFull),
+        "expected QueueFull, got {err:?}"
+    );
+    assert_eq!(
+        filled_at, capacity,
+        "queue reported full at a different depth than GetIoRingInfo advertised"
+    );
+
+    // Drain what was queued so the ring can close cleanly.
+    let _ = ring.submit(0, 0);
+    ring.close().unwrap();
+}
+
+/// An operation the host does not support must produce the dedicated
+/// `UnsupportedOp` variant rather than a raw platform error.
+#[test]
+fn unsupported_op_is_a_distinct_error() {
+    let mut ring = IoRing::builder().build().unwrap();
+
+    // A code the platform does not define. `ensure_op_supported` must classify
+    // it rather than surfacing an opaque failure.
+    let bogus = windows::Win32::Storage::FileSystem::IORING_OP_CODE(0x7FFF_FFFF);
+    let err = ring.ensure_op_supported(bogus).err().unwrap();
+    assert!(matches!(err, Error::UnsupportedOp { op: 0x7FFF_FFFF }));
+
+    // A supported op must pass the same check.
+    ring.ensure_op_supported(IORING_OP_READ).unwrap();
+
+    ring.close().unwrap();
+}
+
+/// Ring creation with an absurd queue size is an argument error, not a claim
+/// that the host lacks IoRing support.
+#[test]
+fn bad_queue_size_is_not_reported_as_unsupported() {
+    let caps = IoRing::query_io_ring_capabilities().unwrap();
+    let err = IoRing::create(caps.max_version, u32::MAX, u32::MAX)
+        .err()
+        .expect("an absurd queue size should fail");
+    assert!(
+        !matches!(err, Error::Unsupported),
+        "argument failure must not be reported as an unsupported host: {err:?}"
+    );
 }

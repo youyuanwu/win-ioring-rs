@@ -73,15 +73,13 @@ enum UserData {
 }
 
 impl Driver {
-    pub fn new(mut io_ring: IoRing) -> Self {
-        let event = crate::sys::AsyncEvent::new().expect("Failed to create AsyncEvent");
-        io_ring
-            .set_io_ring_completion_event(event.handle())
-            .expect("Failed to set completion event");
+    pub fn new(mut io_ring: IoRing) -> crate::Result<Self> {
+        let event = crate::sys::AsyncEvent::new()?;
+        io_ring.set_io_ring_completion_event(event.handle())?;
 
-        let submit_notify = Rc::new(AsyncEvent::new_manual_reset().unwrap());
-        let shutdown_notify = Rc::new(AsyncEvent::new_manual_reset().unwrap());
-        Self {
+        let submit_notify = Rc::new(AsyncEvent::new_manual_reset()?);
+        let shutdown_notify = Rc::new(AsyncEvent::new_manual_reset()?);
+        Ok(Self {
             io_ring: Handle {
                 inner: Rc::new(RefCell::new(HandleInner {
                     io_ring,
@@ -92,7 +90,7 @@ impl Driver {
             event,
             submit_notify_rx: submit_notify,
             shutdown_notify_rx: shutdown_notify,
-        }
+        })
     }
 
     pub fn handle(&self) -> Handle {

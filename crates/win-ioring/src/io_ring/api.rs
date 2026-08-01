@@ -63,12 +63,26 @@ pub struct IoRing {
 }
 
 /// Builder for [`IoRing`].
-#[derive(Default)]
+///
+/// By default the builder requires [`IORING_FEATURE_SET_COMPLETION_EVENT`],
+/// because this crate's driver depends on completion-event signalling. Call
+/// [`IoRingBuilder::with_required_features`] to override that.
 pub struct IoRingBuilder {
     submission_queue_size: Option<u32>,
     completion_queue_size: Option<u32>,
     version: Option<IORING_VERSION>,
-    required_features: Option<IORING_FEATURE_FLAGS>,
+    required_features: IORING_FEATURE_FLAGS,
+}
+
+impl Default for IoRingBuilder {
+    fn default() -> Self {
+        Self {
+            submission_queue_size: None,
+            completion_queue_size: None,
+            version: None,
+            required_features: IORING_FEATURE_SET_COMPLETION_EVENT,
+        }
+    }
 }
 
 impl IoRingBuilder {
@@ -103,12 +117,14 @@ impl IoRingBuilder {
         self
     }
 
-    /// Requires the host to report the given feature flags.
+    /// Sets the feature flags the host must report.
     ///
-    /// Building fails with [`Error::UnsupportedFeature`] if any required bit is
-    /// missing.
+    /// This replaces the default requirement of
+    /// [`IORING_FEATURE_SET_COMPLETION_EVENT`]. Pass
+    /// [`IORING_FEATURE_FLAGS_NONE`] to require nothing. Building fails with
+    /// [`Error::UnsupportedFeature`] if any required bit is missing.
     pub fn with_required_features(mut self, features: IORING_FEATURE_FLAGS) -> Self {
-        self.required_features = Some(features);
+        self.required_features = features;
         self
     }
 
@@ -126,11 +142,9 @@ impl IoRingBuilder {
 
         let caps = IoRing::query_io_ring_capabilities()?;
 
-        if let Some(required) = self.required_features
-            && !caps.supports_features(required)
-        {
+        if !caps.supports_features(self.required_features) {
             return Err(Error::UnsupportedFeature {
-                required: required.0,
+                required: self.required_features.0,
                 available: caps.feature_flags.0,
             });
         }
@@ -149,6 +163,10 @@ impl IoRingBuilder {
 }
 
 /// Describes a registered buffer's address and length.
+///
+/// The representation is transparent because slices of this type are handed to
+/// the platform as slices of the underlying structure.
+#[repr(transparent)]
 pub struct BufferInfo(IORING_BUFFER_INFO);
 
 impl BufferInfo {
@@ -247,6 +265,19 @@ impl IoRing {
         unsafe { IsIoRingOpSupported(self.ring, op) }.as_bool()
     }
 
+    /// Returns an error unless this ring supports the given operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedOp`] if the host does not support `op`.
+    pub fn ensure_op_supported(&self, op: IORING_OP_CODE) -> Result<()> {
+        if self.is_op_supported(op) {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedOp { op: op.0 })
+        }
+    }
+
     /// Sets the event the kernel signals when completions become available.
     pub fn set_io_ring_completion_event(&mut self, handle: HANDLE) -> Result<()> {
         unsafe { SetIoRingCompletionEvent(self.ring, handle) }.map_err(Error::from)
@@ -331,6 +362,36 @@ impl IoRing {
     ///
     /// # Safety
     /// The handles must remain valid until the registration is released.
+    pub unsafe fn build_register_files(
+        &mut self,
+        op: super::ops::RegisterFilesOp<'_>,
+    ) -> Result<()> {
+        unsafe { self.build_register_file_handles(op.handles, op.userdata) }
+    }
+
+    /// Builds a buffer registration into the submission queue.
+    ///
+    /// See [`IoRing::build_register_files`] for why registrations cannot be
+    /// released directly.
+    ///
+    /// # Safety
+    /// buffers must be valid until the registration referencing them is released.
+    pub unsafe fn build_register_buffers_op(
+        &mut self,
+        op: super::ops::RegisterBuffersOp<'_>,
+    ) -> Result<()> {
+        unsafe { self.build_register_buffers(op.buffers, op.userdata) }
+    }
+
+    /// Builds a file handle registration into the submission queue.
+    ///
+    /// The platform exposes no unregister entry point, and an empty slice is
+    /// not a substitute: it is accepted here but fails at completion time with
+    /// E_INVALIDARG. A registration is released by registering a different
+    /// non-empty set, or by closing the ring.
+    ///
+    /// # Safety
+    /// The handles must remain valid until the registration is released.
     pub unsafe fn build_register_file_handles(
         &mut self,
         handles: &[HANDLE],
@@ -402,13 +463,15 @@ impl IoRing {
     /// Closes the ring.
     ///
     /// Closing an already-closed ring is a no-op, so this may be called
-    /// defensively without risking a double close.
+    /// defensively without risking a double close. If the platform reports a
+    /// failure the ring is left open, so the call may be retried.
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
+        unsafe { CloseIoRing(self.ring) }.map_err(Error::from)?;
         self.closed = true;
-        unsafe { CloseIoRing(self.ring) }.map_err(Error::from)
+        Ok(())
     }
 
     /// Returns `true` if [`IoRing::close`] has already been called.
