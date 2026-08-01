@@ -59,11 +59,15 @@ use crate::error::{Error, Result};
 /// `buf_len` is zero.
 ///
 /// **Coherence.** This obligation applies at all times, not only in flight.
-/// The type must not use interior mutability to alter its storage, pointer or
-/// extents: given any shared borrow, [`IoBuf::buf_ptr`] and [`IoBuf::buf_len`]
-/// must describe the same buffer, so that reading one and then the other
-/// cannot observe a torn view. Storage may change only through a `&mut`
-/// borrow, and only outside the in-flight window.
+/// The type must not use interior mutability with respect to the buffer at
+/// all: neither its storage, pointer, extents, **nor the buffer's bytes** may
+/// be modified through a shared reference. Given any shared borrow,
+/// [`IoBuf::buf_ptr`] and [`IoBuf::buf_len`] must describe the same buffer, so
+/// that reading one and then the other cannot observe a torn view, and the
+/// bytes must not change for as long as a slice obtained from
+/// [`IoBuf::as_io_slice`] is alive. A `Cell`- or `Mutex`-backed byte store is
+/// therefore not a valid implementation. Everything about the buffer may change
+/// only through a `&mut` borrow, and only outside the in-flight window.
 ///
 /// **Stability.** For the whole in-flight window the pointer and length must
 /// not change. In particular, calling *any* method of this trait or of
@@ -102,8 +106,9 @@ pub unsafe trait IoBuf: 'static {
         // aligned, and valid for reads of `len` initialized bytes within a
         // single allocation, with `len <= isize::MAX`. The coherence contract
         // guarantees the length read above still describes the pointer read
-        // here, since no interior mutability may intervene on a shared borrow.
-        // Exclusivity rules out a conflicting alias for this borrow.
+        // here, and that the bytes cannot be mutated through a shared reference
+        // while the returned slice is alive, since interior mutability of the
+        // buffer is forbidden outright.
         unsafe { std::slice::from_raw_parts(self.buf_ptr(), len) }
     }
 }
