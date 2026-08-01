@@ -295,15 +295,25 @@ fn required_completion_event_feature_is_available() {
 #[test]
 fn op_support_can_be_queried_without_submitting() {
     let mut ring = IoRing::builder().build().unwrap();
+
+    // Every operation this crate builds on must be supported, otherwise the
+    // safe layer cannot function on this host at all.
     for (name, op) in ALL_OPS {
-        // The query has no error channel; we assert only that it answers.
         let supported = ring.is_op_supported(*op);
-        println!("op {name} supported = {supported}");
+        if *op == IORING_OP_NOP {
+            // NOP has no Build* entry point in the bindings, so the crate never
+            // issues it; its support is informational only.
+            println!("op {name} supported = {supported} (informational)");
+            continue;
+        }
+        assert!(
+            supported,
+            "op {name} is required by this crate but is unsupported on this host"
+        );
+        ring.ensure_op_supported(*op)
+            .unwrap_or_else(|e| panic!("op {name} failed the support check: {e}"));
     }
-    assert!(
-        ring.is_op_supported(IORING_OP_READ),
-        "READ must be supported"
-    );
+
     ring.close().unwrap();
 }
 
@@ -604,17 +614,20 @@ fn all_fourteen_entry_points_have_wrappers() {
 /// `GetIoRingInfo`, because the platform rounds the requested size up.
 #[test]
 fn full_submission_queue_reports_queue_full() {
+    let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder()
         .with_submission_queue_size(2)
         .with_completion_queue_size(2)
         .build()
         .unwrap();
+    ring.set_io_ring_completion_event(event.handle()).unwrap();
     let capacity = ring.info().unwrap().submission_queue_size;
 
     let file = crate::file::File::from_std(File::open(README_PATH).unwrap());
     let mut buffer = vec![0_u8; 16];
 
     let mut queue_full = None;
+    let mut queued = 0_u32;
     for i in 0..(capacity + 4) {
         let op = ReadOp::builder()
             .with_raw_handle(file.as_raw_handle())
@@ -624,9 +637,12 @@ fn full_submission_queue_reports_queue_full() {
             .with_user_data(i as usize)
             .build()
             .unwrap();
-        if let Err(e) = unsafe { ring.build_read_file(op) } {
-            queue_full = Some((i, e));
-            break;
+        match unsafe { ring.build_read_file(op) } {
+            Ok(()) => queued += 1,
+            Err(e) => {
+                queue_full = Some((i, e));
+                break;
+            }
         }
     }
 
@@ -640,9 +656,22 @@ fn full_submission_queue_reports_queue_full() {
         "queue reported full at a different depth than GetIoRingInfo advertised"
     );
 
-    // Drain what was queued so the ring can close cleanly.
-    let _ = ring.submit(0, 0);
+    // Every queued entry references `buffer` and `file`, and closing the ring
+    // does not withdraw them. Drain all completions before anything is dropped.
+    let mut completed = 0_u32;
+    while completed < queued {
+        ring.submit(0, 0).unwrap();
+        event.wait_sync_infinite().unwrap();
+        event.reset().unwrap();
+        while let Some(cqe) = ring.pop_completion().unwrap() {
+            let _ = cqe.ResultCode;
+            completed += 1;
+        }
+    }
+
     ring.close().unwrap();
+    drop(buffer);
+    drop(file);
 }
 
 /// An operation the host does not support must produce the dedicated

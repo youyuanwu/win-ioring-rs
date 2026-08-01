@@ -137,25 +137,19 @@ impl Error {
 
     /// Classifies a platform `HRESULT` into a crate error.
     ///
-    /// The IoRing API set defines its own `HRESULT` facility, so most failure
-    /// modes are distinguishable without guessing. Codes with no specific
-    /// meaning to this crate are preserved verbatim in [`Error::Os`].
+    /// Only codes whose meaning is fully determined by the code itself are
+    /// reclassified. Version and feature failures are deliberately *not*
+    /// mapped here: their variants carry context — what was requested versus
+    /// what the host offers — that a bare `HRESULT` cannot supply, and
+    /// fabricating zeroed context would be worse than reporting the platform
+    /// error verbatim. Those variants are produced at the call sites that know
+    /// the context, such as [`IoRingBuilder::build`](crate::io_ring::IoRingBuilder::build).
     pub(crate) fn from_hresult(hr: windows::core::HRESULT) -> Self {
-        use windows::Win32::Foundation::{
-            IORING_E_REQUIRED_FLAG_NOT_SUPPORTED, IORING_E_SUBMISSION_QUEUE_FULL,
-            IORING_E_VERSION_NOT_SUPPORTED,
-        };
-        match hr {
-            h if h == IORING_E_SUBMISSION_QUEUE_FULL => Error::QueueFull,
-            h if h == IORING_E_VERSION_NOT_SUPPORTED => Error::UnsupportedVersion {
-                requested: 0,
-                max_supported: 0,
-            },
-            h if h == IORING_E_REQUIRED_FLAG_NOT_SUPPORTED => Error::UnsupportedFeature {
-                required: 0,
-                available: 0,
-            },
-            other => Error::Os(windows::core::Error::from(other)),
+        use windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL;
+        if hr == IORING_E_SUBMISSION_QUEUE_FULL {
+            Error::QueueFull
+        } else {
+            Error::Os(windows::core::Error::from(hr))
         }
     }
 

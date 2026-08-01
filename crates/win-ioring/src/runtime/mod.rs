@@ -74,11 +74,23 @@ enum UserData {
 
 impl Driver {
     pub fn new(mut io_ring: IoRing) -> crate::Result<Self> {
-        let event = crate::sys::AsyncEvent::new()?;
-        io_ring.set_io_ring_completion_event(event.handle())?;
+        // Each fallible step must close the ring on the way out, otherwise the
+        // ring is leaked: only a successfully constructed HandleInner closes it.
+        let mut build = || -> crate::Result<(AsyncEvent, Rc<AsyncEvent>, Rc<AsyncEvent>)> {
+            let event = crate::sys::AsyncEvent::new()?;
+            io_ring.set_io_ring_completion_event(event.handle())?;
+            let submit_notify = Rc::new(AsyncEvent::new_manual_reset()?);
+            let shutdown_notify = Rc::new(AsyncEvent::new_manual_reset()?);
+            Ok((event, submit_notify, shutdown_notify))
+        };
+        let (event, submit_notify, shutdown_notify) = match build() {
+            Ok(parts) => parts,
+            Err(e) => {
+                let _ = io_ring.close();
+                return Err(e);
+            }
+        };
 
-        let submit_notify = Rc::new(AsyncEvent::new_manual_reset()?);
-        let shutdown_notify = Rc::new(AsyncEvent::new_manual_reset()?);
         Ok(Self {
             io_ring: Handle {
                 inner: Rc::new(RefCell::new(HandleInner {
