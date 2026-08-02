@@ -1065,6 +1065,168 @@ async fn registered_writes_are_bounded_by_the_initialization_watermark() {
         .await;
 }
 
+/// SC-017: the failure path returns the caller's buffers.
+///
+/// Note that the platform is more permissive here than expected: a zero-extent
+/// descriptor is accepted, unlike a zero-*count* registration, which is refused
+/// at completion. Only the pre-build failures are reachable through the public
+/// API, so those are what this asserts; the completion-time path returns
+/// resources through the same channel and is covered by the driver's own tests.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_registration_returns_the_buffers() {
+    use win_ioring::runtime::Registered;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            // A zero-extent buffer is registrable; the platform only objects to
+            // a registration with no buffers at all.
+            let buffers: Vec<Vec<u8>> = vec![Vec::with_capacity(0)];
+            assert!(handle.register_buffers(buffers).await.is_ok());
+
+            handle.shutdown();
+
+            // Registering against a shut-down driver fails, and the buffers must
+            // come back rather than being swallowed.
+            let buffers = vec![vec![1_u8; 8], vec![2_u8; 8]];
+            match handle.register_buffers(buffers).await {
+                Registered::Failed(_, returned) => {
+                    assert_eq!(returned.len(), 2, "both buffers must come back");
+                    assert_eq!(returned[0], vec![1_u8; 8], "contents must be intact");
+                    assert_eq!(returned[1], vec![2_u8; 8]);
+                }
+                Registered::Ok => panic!("registering after shutdown should fail"),
+            }
+
+            driver_task.await.unwrap();
+        })
+        .await;
+}
+
+/// SC-017: superseding a registration leaves an operation issued against the
+/// old one able to complete normally, and the superseded buffers stay alive
+/// rather than coming back to the caller.
+#[tokio::test(flavor = "current_thread")]
+async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
+    use win_ioring::runtime::FileTarget;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("regsupersede");
+            std::fs::write(temp.path(), b"0123456789").unwrap();
+            let input = win_ioring::file::File::open(temp.path()).unwrap();
+
+            let first: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
+            assert!(handle.register_buffers(first).await.is_ok());
+
+            // Issue a read against the first registration and, without awaiting
+            // it, register a second set. Both futures are driven together, so
+            // the read is outstanding while the supersession lands.
+            let read = handle.read_into_registered(FileTarget::Owned(&input), 0, 0, 10, 0);
+            let second: Vec<Vec<u8>> = vec![Vec::with_capacity(128)];
+            let register = handle.register_buffers(second);
+            let (read, register) = tokio::join!(read, register);
+
+            assert_eq!(read.unwrap(), 10, "the in-flight read must complete");
+            assert!(register.is_ok());
+
+            // The new registration is the one now in force: its larger extent is
+            // addressable, which the superseded 64-byte buffer would refuse.
+            let read = handle
+                .read_into_registered(FileTarget::Owned(&input), 0, 100, 10, 0)
+                .await;
+            assert!(read.is_ok(), "got {read:?}");
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(input);
+        })
+        .await;
+}
+
+/// SC-017a: the watermark tracks a contiguous initialized prefix.
+///
+/// A read landing past the watermark leaves genuinely uninitialized bytes
+/// before it, so it must not raise the mark; and a short read raises the mark by
+/// what was transferred, not by what was asked for.
+#[tokio::test(flavor = "current_thread")]
+async fn the_watermark_only_covers_a_contiguous_initialized_prefix() {
+    use win_ioring::runtime::FileTarget;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("regprefix");
+            std::fs::write(temp.path(), b"0123456789").unwrap();
+            let out_temp = TempFile::new("regprefix-out");
+            let input = win_ioring::file::File::open(temp.path()).unwrap();
+            let out = win_ioring::file::File::create(out_temp.path()).unwrap();
+
+            let buffers: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
+            assert!(handle.register_buffers(buffers).await.is_ok());
+
+            // A read into offset 32 leaves bytes 0..32 uninitialized, so the
+            // watermark must stay at zero and every write must still be refused.
+            let read = handle
+                .read_into_registered(FileTarget::Owned(&input), 0, 32, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(read, 10);
+            let err = handle
+                .write_from_registered(FileTarget::Owned(&out), 0, 0, 1, 0)
+                .await
+                .expect_err("a gap before the read must keep the watermark at zero");
+            assert!(
+                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
+                "got {err:?}"
+            );
+
+            // A short read raises the watermark by what was transferred, not by
+            // the 40 bytes requested: the file only holds 10.
+            let read = handle
+                .read_into_registered(FileTarget::Owned(&input), 0, 0, 40, 0)
+                .await
+                .unwrap();
+            assert_eq!(read, 10, "reading past the end is a short read");
+            assert!(
+                handle
+                    .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
+                    .await
+                    .is_ok()
+            );
+            let err = handle
+                .write_from_registered(FileTarget::Owned(&out), 0, 0, 11, 0)
+                .await
+                .expect_err("the watermark must track the transfer, not the request");
+            assert!(
+                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
+                "got {err:?}"
+            );
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(input);
+            drop(out);
+        })
+        .await;
+}
+
 /// An out-of-range registered index must be rejected before anything is
 /// submitted.
 #[tokio::test(flavor = "current_thread")]
