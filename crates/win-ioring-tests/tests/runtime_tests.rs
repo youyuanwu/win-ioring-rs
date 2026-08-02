@@ -1311,7 +1311,12 @@ async fn registered_file_handles_can_target_operations() {
             std::fs::write(temp.path(), b"registered!").unwrap();
 
             let file = win_ioring::file::File::open(temp.path()).unwrap();
-            assert!(handle.register_files(vec![file.clone()]).await.is_ok());
+            assert!(
+                handle
+                    .register_files(std::slice::from_ref(&file))
+                    .await
+                    .is_ok()
+            );
             assert!(handle.register_buffers(vec![vec![0_u8; 64]]).await.is_ok());
 
             // Drop the caller's own reference; the registration keeps it open.

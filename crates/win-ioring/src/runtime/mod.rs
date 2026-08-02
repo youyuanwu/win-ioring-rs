@@ -754,6 +754,12 @@ impl DriverInner {
             let _ = self.ring.close();
             drop(self.slab.drain());
             self.cancel_holds.clear();
+            // The ring is closed and nothing is outstanding, so the kernel can
+            // no longer reach any registered resource: these are safe to free.
+            self.buffer_registration = None;
+            self.retired_buffer_registrations.clear();
+            self.file_registration = None;
+            self.retired_file_registrations.clear();
             return wakers;
         }
 
@@ -778,6 +784,13 @@ impl DriverInner {
         for (_, file) in self.cancel_holds.drain(..) {
             std::mem::forget(file);
         }
+        // Registered resources are reachable by the kernel for as long as the
+        // ring lives, and this ring could not be quiesced, so they must be
+        // abandoned too rather than freed with the driver.
+        std::mem::forget(self.buffer_registration.take());
+        std::mem::forget(std::mem::take(&mut self.retired_buffer_registrations));
+        std::mem::forget(self.file_registration.take());
+        std::mem::forget(std::mem::take(&mut self.retired_file_registrations));
 
         wakers
     }
@@ -1495,26 +1508,23 @@ impl Handle {
 
     /// Registers file handles with the ring.
     ///
-    /// The same ownership rules apply as for [`Handle::register_buffers`]: a
-    /// successful registration is retained until the ring closes, even once
-    /// superseded. Unlike buffers, the caller keeps its [`File`] values, since
-    /// the driver only needs its own reference to each handle.
-    pub async fn register_files(&self, files: Vec<File>) -> Registered<File> {
-        let (token, slot) = match self.start_register_files(&files) {
-            Ok(started) => started,
-            Err(e) => return Registered::Failed(e, files),
-        };
+    /// The registration lasts for the life of the ring, as it does for
+    /// [`Handle::register_buffers`]: it cannot be withdrawn, and registering
+    /// again supersedes it without releasing the old handles.
+    ///
+    /// Unlike buffers, this borrows rather than consumes. The driver keeps its
+    /// own reference to each handle, so the caller may go on using its
+    /// [`File`] values, or drop them, without invalidating the registration.
+    pub async fn register_files(&self, files: &[File]) -> Result<()> {
+        let (token, slot) = self.start_register_files(files)?;
         let _ = self.wake.signal();
 
-        match (RegistrationFuture {
+        // Nothing was taken from the caller, so there is nothing to give back.
+        (RegistrationFuture {
             inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
         })
         .await
-        {
-            Ok(()) => Registered::Ok,
-            // The caller's files were never given away, only cloned.
-            Err((e, _)) => Registered::Failed(e, files),
-        }
+        .map_err(|(e, _)| e)
     }
 
     /// Parks handle references in the driver and builds the registration.
@@ -2477,6 +2487,100 @@ mod tests {
             Poll::Ready(o) => assert!(matches!(o.err(), Some(Error::ShuttingDown))),
             Poll::Pending => panic!("a post-teardown submission should fail immediately"),
         }
+    }
+
+    /// SC-017: an unquiet teardown must abandon registered resources rather
+    /// than free them, since the kernel may still reach them.
+    ///
+    /// Freeing them here would be a use-after-free, so the test asserts through
+    /// a drop counter that nothing was dropped.
+    #[test]
+    fn an_unquiet_teardown_abandons_registered_buffers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        /// A registrable buffer that records its own destruction.
+        struct CountingBuf(Vec<u8>);
+
+        impl Drop for CountingBuf {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // SAFETY: the pointer and lengths come straight from the inner `Vec`,
+        // which is never reallocated because nothing here grows it, and the
+        // buffer has no interior mutability.
+        unsafe impl crate::buf::IoBuf for CountingBuf {
+            fn buf_ptr(&self) -> *const u8 {
+                self.0.as_ptr()
+            }
+            fn buf_len(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        // SAFETY: as above, and `set_buf_init` only ever reports bytes the
+        // kernel actually wrote into the `Vec`'s capacity.
+        unsafe impl crate::buf::IoBufMut for CountingBuf {
+            fn buf_mut_ptr(&mut self) -> *mut u8 {
+                self.0.as_mut_ptr()
+            }
+            fn buf_capacity(&self) -> usize {
+                self.0.capacity()
+            }
+            unsafe fn set_buf_init(&mut self, len: usize) {
+                // SAFETY: the caller guarantees `len` bytes are initialized.
+                unsafe { self.0.set_len(len) }
+            }
+        }
+
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        let mut fut = Box::pin(handle.register_buffers(vec![CountingBuf(vec![0_u8; 32])]));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Let the registration land so the driver adopts it.
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            driver.inner.borrow().buffer_registration.is_some(),
+            "the registration must have been adopted"
+        );
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+        // Strand an operation — built but never submitted — so quiescence
+        // cannot be established, then tear down without draining.
+        let stranded = handle.read(&readme(), vec![0_u8; 64], 20, 0);
+        assert_eq!(driver.inner.borrow().slab.outstanding(), 1);
+        driver.inner.borrow_mut().force_unquiet_teardown = true;
+        let wakers = driver.inner.borrow_mut().teardown();
+        for w in wakers {
+            w.wake();
+        }
+        drop(stranded);
+
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            0,
+            "an unquiet teardown must not free a buffer the kernel may reach"
+        );
     }
 
     /// Drives the real `drive()` loop and asserts it re-arms itself when a
