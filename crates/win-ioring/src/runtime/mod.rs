@@ -1065,11 +1065,21 @@ impl Driver {
         };
 
         // SAFETY: `completion_event` becomes a field of the `Driver` built
-        // below, whose `Drop` impl runs `teardown` — closing the ring — before
-        // any field is dropped, so the ring can no longer signal the event by
-        // the time its handle closes. Nothing fallible remains between here and
-        // that `Driver`, so there is no path on which the event is dropped
-        // first.
+        // below, and the ring is always closed before that handle is. Three
+        // things uphold that, and all three are load-bearing:
+        //
+        // - `Drop for Driver` drains and then calls `close_and_release`, which
+        //   closes the ring. It runs to completion before any `Driver` field —
+        //   `completion_event` among them — is dropped.
+        // - that loop is fenced by `AbortOnUnwind`, because a panic escaping it
+        //   would start dropping those fields with the ring still open, and
+        //   `Drop for Driver` would not run again to fix it.
+        // - `close_and_release` aborts rather than returning if the ring cannot
+        //   be closed, and `Drop for DriverInner` aborts if it is ever reached
+        //   with the ring still open.
+        //
+        // Nothing fallible remains between here and that `Driver`, so there is
+        // no path on which the event is dropped first.
         if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_event.handle()) } {
             let _ = ring.close();
             return Err(e);
@@ -4010,6 +4020,325 @@ mod tests {
         assert_eq!(&buffer[..4], b"kept");
 
         handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// SC-026: a drain that waits and times out is making normal progress, not
+    /// failing.
+    ///
+    /// `submit` reports a wait timeout as an error, which is a trap: feeding it
+    /// to the submission-failure count would make an ordinary slow shutdown look
+    /// like a stuck queue, and the drain would eventually conclude the kernel
+    /// held nothing and abandon queue entries that are still live. The pipe read
+    /// here never completes, so every wait times out.
+    #[test]
+    fn a_wait_timeout_during_the_drain_is_not_a_failure() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+
+        let mut fut = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Graceful, so nothing cancels the read and every wait must time out.
+        handle.shutdown();
+
+        // More rounds than it takes for repeated submission failures to be
+        // treated as unsubmittable residue.
+        for _ in 0..=RESIDUE_ATTEMPTS {
+            let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+            drop(wakers);
+            assert_eq!(
+                outcome,
+                StepOutcome::Progressing,
+                "a timed-out wait must never be mistaken for an unsubmittable queue"
+            );
+        }
+        assert_eq!(
+            driver.inner.borrow().submit_failures,
+            0,
+            "a wait timeout must not count as a submission failure"
+        );
+
+        handle.shutdown_now();
+        drop(driver);
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+    }
+
+    /// SC-005c and SC-008a: when only queue entries the kernel has repeatedly
+    /// refused remain, the drain stops waiting for reports that can never come,
+    /// closes the ring, and still resolves the futures with their buffers.
+    ///
+    /// This is the one case where abandoning a queue entry is sound, and only
+    /// because the entry was never accepted and the ring is closed first. The
+    /// error must be the named teardown one: an operation the driver ended
+    /// itself did not fail at I/O, and telling the caller it did would be a lie.
+    #[test]
+    fn entries_the_kernel_never_accepted_are_abandoned_only_after_the_ring_closes() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // More refusals than it takes to declare the queue unsubmittable.
+        driver.inner.borrow_mut().fail_next_submits = RESIDUE_ATTEMPTS * 4;
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 128], 64, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().slab.built().len(),
+            1,
+            "the entry must be queued but unaccepted for this test to mean anything"
+        );
+
+        handle.shutdown_now();
+        drop(driver);
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => {
+                let (outcome, buffer) = result.into_parts();
+                assert!(
+                    matches!(outcome, Err(Error::AbandonedAtShutdown)),
+                    "an operation the driver ended itself must say so: {outcome:?}"
+                );
+                assert_eq!(
+                    buffer.capacity(),
+                    128,
+                    "the caller's own buffer must come back"
+                );
+            }
+            Poll::Pending => panic!("an unsubmittable entry left its future pending"),
+        }
+    }
+
+    /// SC-002: a completed shutdown closes the file handles operations held, not
+    /// merely the ring.
+    ///
+    /// Proved by reopening with sharing denied, which the platform refuses while
+    /// any handle to the file is still open. The caller's own handle is dropped
+    /// first, so the driver's clone is the only thing that could keep it alive.
+    #[test]
+    fn a_completed_shutdown_closes_the_files_its_operations_held() {
+        let path = std::env::temp_dir().join(format!(
+            "win-ioring-shutdown-{}-{:p}.tmp",
+            std::process::id(),
+            &0_u8 as *const u8
+        ));
+        std::fs::write(&path, b"some bytes to read").unwrap();
+
+        let exclusively_openable = |path: &std::path::Path| {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .is_ok()
+        };
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = File::open(&path).unwrap();
+
+        let fut = handle.read(&file, vec![0_u8; 8], 8, 0);
+        // Leave the driver holding the only reference.
+        drop(file);
+        drop(fut);
+        assert!(
+            !exclusively_openable(&path),
+            "the driver must still be holding the file for this test to mean anything"
+        );
+
+        handle.shutdown_now();
+        drop(driver);
+
+        assert!(
+            exclusively_openable(&path),
+            "a completed shutdown must have closed the file the operation held"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SC-011b: a registration in flight at an immediate shutdown is drained to
+    /// its natural completion.
+    ///
+    /// It cannot be cancelled — a registration names no file, and a cancellation
+    /// must name the file its target named — so the only correct handling is to
+    /// wait for it, which is what makes it worth pinning down separately.
+    #[test]
+    fn a_registration_in_flight_at_an_immediate_shutdown_completes_naturally() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        let mut fut = Box::pin(handle.register_buffers(vec![vec![7_u8; 16]]));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the registration must reach the platform before the shutdown"
+        );
+        driver.inner.borrow_mut().submit_pending();
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "the kernel must hold the registration when the shutdown begins"
+        );
+
+        handle.shutdown_now();
+        assert_eq!(
+            driver.inner.borrow().cancel_attempts,
+            0,
+            "a registration names no file, so nothing can be cancelled for it"
+        );
+
+        let mut outcome = StepOutcome::Progressing;
+        for _ in 0..32 {
+            let (wakers, step) = driver.inner.borrow_mut().drain_step();
+            for waker in wakers {
+                waker.wake();
+            }
+            outcome = step;
+            if step != StepOutcome::Progressing {
+                break;
+            }
+        }
+        assert_eq!(outcome, StepOutcome::Quiescent);
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Registered::Ok) => {}
+            Poll::Ready(Registered::Failed(e, _)) => {
+                panic!("the registration must complete naturally, not fail: {e:?}")
+            }
+            Poll::Pending => panic!("the registration was left pending by the drain"),
+        }
+
+        drop(driver);
+    }
+
+    /// SC-023: a shutdown with nothing outstanding must not wait on the kernel.
+    ///
+    /// The drain's wait has a fixed timeout, so a shutdown that issued one
+    /// needlessly would stall for it — the difference between an instant
+    /// shutdown and a visibly sluggish one.
+    #[test]
+    fn a_shutdown_with_nothing_outstanding_does_not_wait() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        assert_eq!(driver.inner.borrow().slab.outstanding(), 0);
+        handle.shutdown();
+
+        let started = std::time::Instant::now();
+        let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+        drop(wakers);
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome, StepOutcome::Quiescent);
+        assert!(
+            elapsed < std::time::Duration::from_millis(DRAIN_TIMEOUT_MS as u64),
+            "an empty drain waited {elapsed:?}, so it must have issued a wait it did not need"
+        );
+
+        drop(driver);
+    }
+
+    /// SC-025: a drain that will not converge is unbounded by design, so it must
+    /// say so — otherwise a stalled shutdown is indistinguishable from a hang.
+    ///
+    /// Throttled for the same reason submission failures are: a long shutdown
+    /// must not bury the observer. Reaping is withheld for more rounds than the
+    /// reporting threshold, so the drain genuinely cannot converge while the
+    /// reports are being counted.
+    #[test]
+    fn a_drain_that_will_not_converge_reports_itself_but_is_throttled() {
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&reports);
+
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::with_error_observer(
+            ring,
+            Some(Box::new(move |e: &Error| {
+                sink.borrow_mut().push(format!("{e}"));
+            })),
+        )
+        .unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+        driver.inner.borrow_mut().submit_pending();
+        drop(fut);
+
+        // Long enough that the drain cannot converge before the throttle has had
+        // to make a decision more than once.
+        let rounds = SLOW_DRAIN_INTERVAL * 3;
+        driver.inner.borrow_mut().withhold_reaps = rounds;
+        drop(driver);
+
+        let reports = reports.borrow();
+        let stalls: Vec<_> = reports
+            .iter()
+            .filter(|r| r.contains("outstanding"))
+            .collect();
+        assert!(
+            !stalls.is_empty(),
+            "a drain that will not converge must report itself, saw {reports:?}"
+        );
+        assert!(
+            stalls.len() <= (rounds / SLOW_DRAIN_INTERVAL) as usize,
+            "reports must be throttled to one per interval, not emitted every pass: {} for {rounds} rounds",
+            stalls.len()
+        );
+        assert!(
+            stalls[0].contains('1'),
+            "the report must name the outstanding count: {}",
+            stalls[0]
+        );
+    }
+
+    /// SC-020a: a drain abandoned by dropping the driver's future must be
+    /// resumable, not leave the driver wedged.
+    ///
+    /// This is why re-entry is guarded on teardown having *finished* rather than
+    /// merely having started. Guarding on the latter would make the second call
+    /// return immediately, leaving the ring open and everything in it stranded.
+    #[test]
+    fn a_drain_abandoned_by_dropping_the_driver_future_can_be_resumed() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 128], 64, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        handle.shutdown_now();
+
+        // Poll the driver far enough to enter teardown, then abandon it.
+        let mut drive = Box::pin(driver.drive());
+        driver.inner.borrow_mut().withhold_reaps = 64;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            driver.inner.borrow().teardown_started,
+            "teardown must have begun for abandoning it to mean anything"
+        );
+        assert!(
+            !driver.inner.borrow().torn_down,
+            "teardown must be unfinished for abandoning it to mean anything"
+        );
+        drop(drive);
+
+        // A fresh call resumes rather than returning as though it were done.
+        driver.inner.borrow_mut().withhold_reaps = 0;
+        futures::executor::block_on(driver.drive());
+        assert!(
+            driver.inner.borrow().torn_down,
+            "a resumed drain must finish teardown"
+        );
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+
         drop(driver);
     }
 
