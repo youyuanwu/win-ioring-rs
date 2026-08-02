@@ -1101,6 +1101,54 @@ mod tests {
         assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
     }
 
+    /// Dropping a future whose operation the kernel already has must cancel it
+    /// immediately, rather than deferring like the built case.
+    ///
+    /// This lives here rather than in an integration test because only from
+    /// inside the crate can the operation be observed to have actually reached
+    /// `Submitted` before the drop; `Handle::outstanding` counts built
+    /// operations too, so it cannot distinguish the two paths.
+    #[test]
+    fn dropping_a_submitted_operation_cancels_it_immediately() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+        let token = fut.operation_id().expect("read was built").0;
+
+        // Hand it to the kernel, so the drop below takes the submitted path.
+        driver.inner.borrow_mut().submit_pending();
+        assert_eq!(
+            driver.inner.borrow().slab.state(token).map(|s| s.0),
+            Some(Lifecycle::Submitted),
+            "the operation must be submitted for this test to mean anything"
+        );
+        assert!(
+            driver.inner.borrow().cancel_holds.is_empty(),
+            "nothing should be cancelled yet"
+        );
+
+        drop(fut);
+
+        {
+            let inner = driver.inner.borrow();
+            // A cancellation was issued straight away, and it holds the file
+            // open independently of the target's own payload.
+            assert!(
+                !inner.cancel_holds.is_empty(),
+                "dropping a submitted operation must cancel it immediately"
+            );
+            assert!(
+                inner.slab.detached_submitted_uncancelled().is_empty(),
+                "the operation should no longer be a deferred candidate"
+            );
+        }
+
+        drain(&driver);
+        handle.shutdown();
+    }
+
     /// Dropping a future before its operation reaches the kernel leaves nothing
     /// to cancel at the time. The cancellation must therefore be deferred until
     /// submission promotes the operation, or an abandoned read would run to
