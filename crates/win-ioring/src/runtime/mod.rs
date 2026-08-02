@@ -865,7 +865,12 @@ impl Driver {
         // else owns it yet.
         let mut build = || -> Result<(AsyncEvent, Rc<AsyncEvent>)> {
             let completion_event = AsyncEvent::new_manual_reset()?;
-            ring.set_io_ring_completion_event(completion_event.handle())?;
+            // SAFETY: `completion_event` becomes a field of the `Driver`, whose
+            // `Drop` impl runs `teardown` — closing the ring — before any field
+            // is dropped, so the ring can no longer signal the event by the time
+            // its handle closes. On the failure paths below the ring is closed
+            // explicitly before the event goes out of scope.
+            unsafe { ring.set_io_ring_completion_event(completion_event.handle())? };
             let wake = Rc::new(AsyncEvent::new_manual_reset()?);
             Ok((completion_event, wake))
         };

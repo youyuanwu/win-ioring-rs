@@ -289,9 +289,16 @@ impl IoRing {
     }
 
     /// Sets the event the kernel signals when completions become available.
-    pub fn set_io_ring_completion_event(&mut self, handle: HANDLE) -> Result<()> {
-        // SAFETY: `self.ring` is open, and the caller guarantees `handle` stays
-        // valid for as long as the ring may signal it.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must remain a valid, open event handle for as long as this ring
+    /// might signal it, which is until the ring is closed or the completion
+    /// event is replaced. Closing it earlier leaves the kernel signalling a
+    /// handle that may since have been reused for something else.
+    pub unsafe fn set_io_ring_completion_event(&mut self, handle: HANDLE) -> Result<()> {
+        // SAFETY: `self.ring` is open, and the caller guarantees `handle`
+        // outlives the ring's use of it.
         unsafe { SetIoRingCompletionEvent(self.ring, handle) }.map_err(Error::from)
     }
 

@@ -9,7 +9,9 @@ const SAMPLE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/s
 fn readme_test() {
     let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder().build().unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
 
     println!("ring created");
 
@@ -55,7 +57,9 @@ fn readme_test() {
 fn readme_register_test() {
     let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder().build().unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
     println!("ring created");
 
     // open file from std
@@ -106,9 +110,13 @@ fn readme_register_test() {
 async fn readme_test_async() {
     let event = AsyncEvent::new().unwrap();
     let ring = Rc::new(RefCell::new(IoRing::builder().build().unwrap()));
-    ring.borrow_mut()
-        .set_io_ring_completion_event(event.handle())
-        .unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it and
+    // outlives the ring's use of it.
+    unsafe {
+        ring.borrow_mut()
+            .set_io_ring_completion_event(event.handle())
+            .unwrap();
+    }
 
     println!("ring created");
 
@@ -356,7 +364,9 @@ fn write_then_flush_then_read_round_trip() {
 
     let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder().build().unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
 
     let write_file = std::fs::OpenOptions::new()
         .create(true)
@@ -436,7 +446,9 @@ fn cancel_request_completes_with_its_own_user_data() {
 
     let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder().build().unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
 
     let file = crate::file::File::from_std(File::open(&path).unwrap());
     let mut dest = vec![0_u8; 8];
@@ -517,7 +529,9 @@ fn cancel_request_completes_with_its_own_user_data() {
 fn empty_registration_is_rejected_by_the_platform() {
     let event = AsyncEvent::new().unwrap();
     let mut ring = IoRing::builder().build().unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
 
     let mut buffer = vec![0_u8; 64];
     unsafe {
@@ -593,8 +607,10 @@ fn all_fourteen_entry_points_have_wrappers() {
     let _info: fn(&IoRing) -> crate::Result<crate::io_ring::RingInfo> = IoRing::info;
     let _is_supported: fn(&IoRing, windows::Win32::Storage::FileSystem::IORING_OP_CODE) -> bool =
         IoRing::is_op_supported;
-    let _set_event: fn(&mut IoRing, windows::Win32::Foundation::HANDLE) -> crate::Result<()> =
-        IoRing::set_io_ring_completion_event;
+    let _set_event: unsafe fn(
+        &mut IoRing,
+        windows::Win32::Foundation::HANDLE,
+    ) -> crate::Result<()> = IoRing::set_io_ring_completion_event;
     let _read: unsafe fn(&mut IoRing, ReadOp) -> crate::Result<()> = IoRing::build_read_file;
     let _write: unsafe fn(&mut IoRing, WriteOp) -> crate::Result<()> = IoRing::build_write_file;
     let _flush: unsafe fn(&mut IoRing, FlushOp) -> crate::Result<()> = IoRing::build_flush_file;
@@ -620,7 +636,9 @@ fn full_submission_queue_reports_queue_full() {
         .with_completion_queue_size(2)
         .build()
         .unwrap();
-    ring.set_io_ring_completion_event(event.handle()).unwrap();
+    // SAFETY: `event` is declared before `ring`, so it is dropped after it
+    // and outlives the ring's use of it.
+    unsafe { ring.set_io_ring_completion_event(event.handle()) }.unwrap();
     let capacity = ring.info().unwrap().submission_queue_size;
 
     let file = crate::file::File::from_std(File::open(SAMPLE_PATH).unwrap());
