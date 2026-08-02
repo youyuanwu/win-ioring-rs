@@ -38,12 +38,17 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::task::{Context, Poll, Waker};
 
-use crate::buf::{BufResult, IoBufMut, check_read_capacity};
+use crate::buf::{BufResult, IoBuf, IoBufMut, check_read_capacity, check_write_initialized};
 use crate::error::{Error, Result};
 use crate::file::{File, FileState};
 use crate::io_ring::IoRing;
 use crate::io_ring::ops::{ReadOp, SqeFlags};
 use crate::sys::AsyncEvent;
+
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLUSH_DEFAULT, FILE_FLUSH_MODE, FILE_WRITE_FLAGS, FILE_WRITE_FLAGS_NONE, IORING_OP_FLUSH,
+    IORING_OP_WRITE,
+};
 
 pub mod slab;
 
@@ -117,13 +122,19 @@ pub type ErrorObserver = Box<dyn Fn(&Error)>;
 /// The number of bytes an operation transferred.
 type Transferred = u32;
 
+/// A completed operation's result, plus the buffer if it carried one.
+///
+/// Flush carries no caller buffer, which is why the buffer is optional rather
+/// than something every completion must produce.
+type CompletedOp = (Result<Transferred>, Option<Box<dyn Any>>);
+
 /// Where a completed operation's result is left for its future to collect.
 ///
 /// Shared between the driver-owned payload and the future, so the future can be
 /// resolved without the driver knowing its concrete buffer type.
 struct ResultSlot {
-    /// The result and the buffer, once the operation has completed.
-    completed: Option<(Result<Transferred>, Box<dyn Any>)>,
+    /// The result and, for operations that carry one, the buffer.
+    completed: Option<CompletedOp>,
     /// Set at teardown when the buffer had to be abandoned.
     retained: bool,
     waker: Option<Waker>,
@@ -409,7 +420,8 @@ impl DriverInner {
                 continue;
             };
 
-            let buffer = payload.buffer.take().expect("payload lost its buffer");
+            // A flush carries no buffer, so this is legitimately absent.
+            let buffer = payload.buffer.take();
             let mut slot = payload.slot.borrow_mut();
             slot.completed = Some((result, buffer));
             if let Some(waker) = slot.waker.take() {
@@ -830,6 +842,191 @@ impl Handle {
 
     /// Requests cancellation of a previously submitted operation.
     ///
+    /// Writes `buffer` to `file` at `offset`.
+    ///
+    /// The buffer is moved into the driver for the duration of the operation and
+    /// returned when it completes, whether it succeeded or failed. Dropping the
+    /// returned future is safe.
+    ///
+    /// The write is bounded by the buffer's *initialized* length, not its
+    /// capacity, so uninitialized memory is never handed to the kernel.
+    pub fn write<B: IoBuf>(&self, file: &File, buffer: B, len: u32, offset: u64) -> WriteFuture<B> {
+        self.write_with_flags(file, buffer, len, offset, FILE_WRITE_FLAGS_NONE)
+    }
+
+    /// Writes `buffer` to `file` at `offset` with explicit platform write flags.
+    ///
+    /// Use this for write-through and similar behaviour; [`Handle::write`] is
+    /// the same thing with no flags set.
+    pub fn write_with_flags<B: IoBuf>(
+        &self,
+        file: &File,
+        buffer: B,
+        len: u32,
+        offset: u64,
+        flags: FILE_WRITE_FLAGS,
+    ) -> WriteFuture<B> {
+        match self.try_write(file, buffer, len, offset, flags) {
+            Ok(fut) => fut,
+            Err((error, buffer)) => WriteFuture::failed(error, buffer),
+        }
+    }
+
+    fn try_write<B: IoBuf>(
+        &self,
+        file: &File,
+        buffer: B,
+        len: u32,
+        offset: u64,
+        flags: FILE_WRITE_FLAGS,
+    ) -> std::result::Result<WriteFuture<B>, (Error, B)> {
+        {
+            let inner = self.strong.borrow();
+            if inner.shutting_down {
+                return Err((Error::ShuttingDown, buffer));
+            }
+            if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_WRITE) {
+                return Err((e, buffer));
+            }
+        }
+        // Bound the write by what the caller has actually initialized. Capacity
+        // would not do: the tail of a `Vec`'s allocation is uninitialized, and
+        // sending it to the kernel would leak whatever happened to be there.
+        if let Err(e) = check_write_initialized(&buffer, len as u64) {
+            return Err((e, buffer));
+        }
+
+        let slot = Rc::new(RefCell::new(ResultSlot::new()));
+        let mut inner = self.strong.borrow_mut();
+
+        let payload = Box::new(OpPayload {
+            buffer: None,
+            file: file.state(),
+            slot: Rc::clone(&slot),
+        });
+        let token = match inner.slab.insert(payload) {
+            Ok(token) => token,
+            Err(_) => return Err((Error::QueueFull, buffer)),
+        };
+
+        // Box first, then take the address: a buffer stored inline moves when
+        // the value moves, so taking the pointer beforehand would give the
+        // kernel a stale one.
+        let boxed: Box<B> = Box::new(buffer);
+        let data_ptr = boxed.buf_ptr();
+        {
+            let payload = inner
+                .slab
+                .payload_mut(token)
+                .and_then(|p| p.downcast_mut::<OpPayload>())
+                .expect("just inserted");
+            payload.buffer = Some(boxed as Box<dyn Any>);
+        }
+
+        let op = crate::io_ring::ops::WriteOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_raw_data_address(data_ptr as *mut _)
+            .with_num_of_bytes_to_write(len)
+            .with_offset(offset)
+            .with_write_flags(flags)
+            .with_user_data(token.as_user_data())
+            .with_sqe_flags(SqeFlags::NONE)
+            .build();
+
+        let op = match op {
+            Ok(op) => op,
+            Err(e) => return Err((e, recover_buffer(&mut inner, token))),
+        };
+
+        // SAFETY: the payload lives in the slab until this operation's own
+        // completion is dequeued, and the slab never moves a boxed payload, so
+        // `data_ptr` stays valid for as long as the kernel may read it. The
+        // file's handle is kept open by the `Rc<FileState>` in the payload.
+        if let Err(e) = unsafe { inner.ring.build_write_file(op) } {
+            return Err((e, recover_buffer(&mut inner, token)));
+        }
+
+        inner.slab.set_lifecycle(token, Lifecycle::Built);
+        inner.pending_submit = true;
+        drop(inner);
+
+        let _ = self.wake.signal();
+
+        Ok(WriteFuture {
+            inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
+            _buffer: PhantomData,
+        })
+    }
+
+    /// Flushes `file`, using the platform's default flush mode.
+    pub fn flush(&self, file: &File) -> FlushFuture {
+        self.flush_with_mode(file, FILE_FLUSH_DEFAULT)
+    }
+
+    /// Flushes `file` with an explicit flush mode.
+    pub fn flush_with_mode(&self, file: &File, mode: FILE_FLUSH_MODE) -> FlushFuture {
+        match self.try_flush(file, mode) {
+            Ok(fut) => fut,
+            Err(e) => FlushFuture {
+                state: FlushState::Failed(Some(e)),
+            },
+        }
+    }
+
+    fn try_flush(&self, file: &File, mode: FILE_FLUSH_MODE) -> Result<FlushFuture> {
+        {
+            let inner = self.strong.borrow();
+            if inner.shutting_down {
+                return Err(Error::ShuttingDown);
+            }
+            inner.ring.ensure_op_supported(IORING_OP_FLUSH)?;
+        }
+
+        let slot = Rc::new(RefCell::new(ResultSlot::new()));
+        let mut inner = self.strong.borrow_mut();
+
+        // A flush carries no caller buffer, but still needs the file kept open
+        // for as long as the kernel is working on it.
+        let payload = Box::new(OpPayload {
+            buffer: None,
+            file: file.state(),
+            slot: Rc::clone(&slot),
+        });
+        let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
+
+        let op = crate::io_ring::ops::FlushOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_flush_mode(mode)
+            .with_user_data(token.as_user_data())
+            .with_sqe_flags(SqeFlags::NONE)
+            .build();
+
+        let op = match op {
+            Ok(op) => op,
+            Err(e) => {
+                drop(inner.slab.complete(token));
+                return Err(e);
+            }
+        };
+
+        // SAFETY: the file's handle is kept open by the `Rc<FileState>` held in
+        // the payload, which lives until this operation's completion.
+        if let Err(e) = unsafe { inner.ring.build_flush_file(op) } {
+            drop(inner.slab.complete(token));
+            return Err(e);
+        }
+
+        inner.slab.set_lifecycle(token, Lifecycle::Built);
+        inner.pending_submit = true;
+        drop(inner);
+
+        let _ = self.wake.signal();
+
+        Ok(FlushFuture {
+            state: FlushState::Waiting(OpFuture::pending(token, slot, Weak::clone(&self.inner))),
+        })
+    }
+
     /// Cancellation is best-effort: it may fail, or arrive too late, and neither
     /// is an error. The caller keeps the original future and still observes that
     /// operation's terminal result, which is the only thing that releases the
@@ -844,7 +1041,7 @@ impl Handle {
 ///
 /// Only correct before the operation has been built into the submission queue,
 /// because after that the entry references the buffer and cannot be withdrawn.
-fn recover_buffer<B: IoBufMut>(inner: &mut DriverInner, token: Token) -> B {
+fn recover_buffer<B: 'static>(inner: &mut DriverInner, token: Token) -> B {
     let payload = inner
         .slab
         .complete(token)
@@ -855,27 +1052,145 @@ fn recover_buffer<B: IoBufMut>(inner: &mut DriverInner, token: Token) -> B {
     *buffer.downcast::<B>().expect("buffer type mismatch")
 }
 
-/// A read in progress.
+/// The shared machinery behind every operation future.
 ///
-/// Holds only a token, a shared result slot, and a weak reference to the driver.
-/// The buffer itself lives in the driver, which is what makes dropping this
-/// future safe.
-pub struct ReadFuture<B> {
-    state: ReadState<B>,
+/// Holds only a token, a shared result slot, and a **weak** reference to the
+/// driver. The buffer itself lives in the driver, which is what makes dropping
+/// an operation future safe. The reference is weak so that a future cannot keep
+/// the driver alive; failing to upgrade it is precisely the signal that the
+/// driver is gone and the future must resolve rather than wait forever.
+struct OpFuture {
+    token: Token,
+    slot: Rc<RefCell<ResultSlot>>,
+    driver: Weak<RefCell<DriverInner>>,
+    /// Set once the operation has resolved, so `Drop` knows there is nothing
+    /// left to detach or cancel.
+    finished: bool,
 }
 
-enum ReadState<B> {
-    /// Rejected before anything was submitted; the buffer never left.
-    Failed(Option<(Error, B)>),
-    /// Submitted and awaiting completion.
-    Waiting {
+/// How an operation ended.
+enum Resolution {
+    /// The kernel reported a terminal result, along with the buffer if the
+    /// operation carried one.
+    Completed(Result<Transferred>, Option<Box<dyn Any>>),
+    /// The buffer could not be recovered, so it was abandoned.
+    Retained(Error),
+}
+
+impl OpFuture {
+    fn pending(
         token: Token,
         slot: Rc<RefCell<ResultSlot>>,
         driver: Weak<RefCell<DriverInner>>,
-        /// Records the buffer type without affecting auto traits. The future
-        /// holds no self-references, so it is always `Unpin`.
-        _buffer: PhantomData<fn() -> B>,
-    },
+    ) -> Self {
+        Self {
+            token,
+            slot,
+            driver,
+            finished: false,
+        }
+    }
+
+    fn poll_resolution(&mut self, cx: &mut Context<'_>) -> Poll<Resolution> {
+        let mut slot = self.slot.borrow_mut();
+
+        if let Some((result, buffer)) = slot.completed.take() {
+            drop(slot);
+            self.finished = true;
+            return Poll::Ready(Resolution::Completed(result, buffer));
+        }
+
+        if slot.retained {
+            drop(slot);
+            self.finished = true;
+            return Poll::Ready(Resolution::Retained(Error::BufferRetained));
+        }
+
+        if self.driver.upgrade().is_none() {
+            drop(slot);
+            self.finished = true;
+            return Poll::Ready(Resolution::Retained(Error::DriverGone));
+        }
+
+        slot.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn operation_id(&self) -> OperationId {
+        OperationId(self.token)
+    }
+}
+
+impl Drop for OpFuture {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Reaching the driver is exactly why this holds a weak reference:
+        // without it there would be no way to record the detachment.
+        let Some(inner) = self.driver.upgrade() else {
+            return;
+        };
+        let Ok(mut inner) = inner.try_borrow_mut() else {
+            return;
+        };
+
+        // Detaching leaves the operation running. Its buffer is released only
+        // when its own completion is dequeued, never here. What varies is
+        // whether anything can be done about it.
+        match inner.slab.detach(self.token) {
+            Some(Lifecycle::Described) => {
+                // Nothing was ever built, so no queue entry references the
+                // buffer and it can be released immediately.
+                drop(inner.slab.complete(self.token));
+            }
+            Some(Lifecycle::Built) => {
+                // A submission queue entry references the buffer and cannot be
+                // withdrawn, and the kernel has not seen the operation yet, so
+                // there is nothing for the platform to cancel. The slab records
+                // this slot as detached, and the driver cancels it once
+                // submission promotes it.
+            }
+            Some(Lifecycle::Submitted) => {
+                // Best-effort: ask the platform to give up early. Failure here
+                // is not an error and changes nothing about the buffer's
+                // lifetime. This returns without waiting on the kernel.
+                inner.request_cancel(self.token);
+            }
+            None => {}
+        }
+    }
+}
+
+/// Turns a resolution into an outcome, recovering the caller's buffer.
+fn into_outcome<B: 'static>(resolution: Resolution) -> Outcome<Transferred, B> {
+    match resolution {
+        Resolution::Completed(result, buffer) => {
+            let buffer = buffer.expect("a buffer-carrying operation lost its buffer");
+            let buffer = *buffer.downcast::<B>().expect("buffer type mismatch");
+            Outcome::Completed(BufResult::new(result, buffer))
+        }
+        Resolution::Retained(e) => Outcome::Retained(e),
+    }
+}
+
+/// A read in progress.
+pub struct ReadFuture<B> {
+    state: BufOpState<B>,
+}
+
+/// A write in progress.
+pub struct WriteFuture<B> {
+    inner: OpFuture,
+    /// Records the buffer type without affecting auto traits.
+    _buffer: PhantomData<fn() -> B>,
+}
+
+enum BufOpState<B> {
+    /// Rejected before anything was submitted; the buffer never left.
+    Failed(Option<(Error, B)>),
+    /// Submitted and awaiting completion.
+    Waiting(OpFuture),
     /// Already resolved.
     Done,
 }
@@ -883,7 +1198,7 @@ enum ReadState<B> {
 impl<B: IoBufMut> ReadFuture<B> {
     fn failed(error: Error, buffer: B) -> Self {
         Self {
-            state: ReadState::Failed(Some((error, buffer))),
+            state: BufOpState::Failed(Some((error, buffer))),
         }
     }
 
@@ -893,12 +1208,7 @@ impl<B: IoBufMut> ReadFuture<B> {
         driver: Weak<RefCell<DriverInner>>,
     ) -> Self {
         Self {
-            state: ReadState::Waiting {
-                token,
-                slot,
-                driver,
-                _buffer: PhantomData,
-            },
+            state: BufOpState::Waiting(OpFuture::pending(token, slot, driver)),
         }
     }
 
@@ -906,7 +1216,7 @@ impl<B: IoBufMut> ReadFuture<B> {
     /// submitted.
     pub fn operation_id(&self) -> Option<OperationId> {
         match &self.state {
-            ReadState::Waiting { token, .. } => Some(OperationId(*token)),
+            BufOpState::Waiting(op) => Some(op.operation_id()),
             _ => None,
         }
     }
@@ -918,84 +1228,124 @@ impl<B: IoBufMut> Future for ReadFuture<B> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         match &mut this.state {
-            ReadState::Failed(taken) => {
+            BufOpState::Failed(taken) => {
                 let (error, buffer) = taken.take().expect("polled after completion");
-                this.state = ReadState::Done;
+                this.state = BufOpState::Done;
                 Poll::Ready(Outcome::Completed(BufResult::new(Err(error), buffer)))
             }
-            ReadState::Done => panic!("read future polled after completion"),
-            ReadState::Waiting { slot, driver, .. } => {
-                let mut borrowed = slot.borrow_mut();
-                if let Some((result, buffer)) = borrowed.completed.take() {
-                    drop(borrowed);
-                    this.state = ReadState::Done;
-                    let mut buffer = *buffer.downcast::<B>().expect("buffer type mismatch");
-                    if let Ok(transferred) = &result {
+            BufOpState::Done => panic!("read future polled after completion"),
+            BufOpState::Waiting(op) => match op.poll_resolution(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(resolution) => {
+                    let mut outcome = into_outcome::<B>(resolution);
+                    if let Outcome::Completed(result) = &mut outcome
+                        && let Ok(transferred) = &result.result
+                    {
                         // SAFETY: the kernel reported writing this many bytes
                         // into the buffer, so they are initialized, and the
-                        // count came from a transfer bounded by the capacity
-                        // checked before submission.
-                        unsafe { buffer.set_buf_init(*transferred as usize) };
+                        // count is bounded by the capacity checked before
+                        // submission.
+                        unsafe { result.buffer.set_buf_init(*transferred as usize) };
                     }
-                    return Poll::Ready(Outcome::Completed(BufResult::new(result, buffer)));
+                    this.state = BufOpState::Done;
+                    Poll::Ready(outcome)
                 }
-
-                if borrowed.retained {
-                    drop(borrowed);
-                    this.state = ReadState::Done;
-                    return Poll::Ready(Outcome::Retained(Error::BufferRetained));
-                }
-
-                if driver.upgrade().is_none() {
-                    drop(borrowed);
-                    this.state = ReadState::Done;
-                    return Poll::Ready(Outcome::Retained(Error::DriverGone));
-                }
-
-                borrowed.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+            },
         }
     }
 }
 
-impl<B> Drop for ReadFuture<B> {
-    fn drop(&mut self) {
-        let ReadState::Waiting { token, driver, .. } = &self.state else {
-            return;
-        };
-        // Reaching the driver is exactly why the future holds a weak reference:
-        // without it there would be no way to record the detachment.
-        let Some(inner) = driver.upgrade() else {
-            return;
-        };
-        let Ok(mut inner) = inner.try_borrow_mut() else {
-            return;
-        };
+impl<B: IoBuf> WriteFuture<B> {
+    fn failed(error: Error, buffer: B) -> Self {
+        // A rejected write never reaches the driver, so it needs no token. The
+        // shared machinery is only for operations that did.
+        Self {
+            inner: OpFuture {
+                token: Token::from_user_data(0),
+                slot: Rc::new(RefCell::new(ResultSlot {
+                    completed: Some((Err(error), Some(Box::new(buffer)))),
+                    retained: false,
+                    waker: None,
+                })),
+                driver: Weak::new(),
+                finished: true,
+            },
+            _buffer: PhantomData,
+        }
+    }
 
-        // Detaching leaves the operation running. Its buffer is released only
-        // when its own completion is dequeued, never here. What varies is
-        // whether anything can be done about it.
-        match inner.slab.detach(*token) {
-            Some(Lifecycle::Described) => {
-                // Nothing was ever built, so no queue entry references the
-                // buffer and it can be released immediately.
-                drop(inner.slab.complete(*token));
+    /// Returns the identifier for cancelling this operation, if it was
+    /// submitted.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        if self.inner.finished {
+            None
+        } else {
+            Some(self.inner.operation_id())
+        }
+    }
+}
+
+impl<B: IoBuf> Future for WriteFuture<B> {
+    type Output = Outcome<Transferred, B>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        // A rejected write has its result waiting in the slot already, so this
+        // takes the same path as a real completion.
+        match this.inner.poll_resolution(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(resolution) => Poll::Ready(into_outcome::<B>(resolution)),
+        }
+    }
+}
+
+/// A flush in progress.
+///
+/// Flush carries no caller buffer, so it resolves to a plain result rather than
+/// an [`Outcome`].
+pub struct FlushFuture {
+    state: FlushState,
+}
+
+enum FlushState {
+    Failed(Option<Error>),
+    Waiting(OpFuture),
+    Done,
+}
+
+impl FlushFuture {
+    /// Returns the identifier for cancelling this operation, if it was
+    /// submitted.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        match &self.state {
+            FlushState::Waiting(op) => Some(op.operation_id()),
+            _ => None,
+        }
+    }
+}
+
+impl Future for FlushFuture {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        match &mut this.state {
+            FlushState::Failed(taken) => {
+                let error = taken.take().expect("polled after completion");
+                this.state = FlushState::Done;
+                Poll::Ready(Err(error))
             }
-            Some(Lifecycle::Built) => {
-                // A submission queue entry references the buffer and cannot be
-                // withdrawn, and the kernel has not seen the operation yet, so
-                // there is nothing for the platform to cancel. The slab records
-                // this slot as detached-but-submitted-later, and the driver
-                // cancels it once submission promotes it.
-            }
-            Some(Lifecycle::Submitted) => {
-                // Best-effort: ask the platform to give up early. Failure here
-                // is not an error and changes nothing about the buffer's
-                // lifetime. This returns without waiting on the kernel.
-                inner.request_cancel(*token);
-            }
-            None => {}
+            FlushState::Done => panic!("flush future polled after completion"),
+            FlushState::Waiting(op) => match op.poll_resolution(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(resolution) => {
+                    this.state = FlushState::Done;
+                    Poll::Ready(match resolution {
+                        Resolution::Completed(result, _) => result.map(|_| ()),
+                        Resolution::Retained(e) => Err(e),
+                    })
+                }
+            },
         }
     }
 }

@@ -500,3 +500,270 @@ async fn dropping_the_driver_resolves_surviving_futures() {
         })
         .await;
 }
+
+fn temp_path(tag: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "win-ioring-rt-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    p
+}
+
+/// Write, flush, then read back through the safe API.
+#[tokio::test(flavor = "current_thread")]
+async fn write_flush_read_round_trip() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("roundtrip");
+            let payload = b"safe layer round trip".to_vec();
+            let expected = payload.clone();
+
+            let out = win_ioring::file::File::create(&path).unwrap();
+            let (written, buffer) = handle
+                .write(&out, payload, expected.len() as u32, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written as usize, expected.len());
+            assert_eq!(buffer, expected, "the buffer came back unchanged");
+
+            handle.flush(&out).await.unwrap();
+            drop(out);
+
+            let input = win_ioring::file::File::open(&path).unwrap();
+            let (read, buffer) = handle
+                .read(&input, vec![0_u8; 64], expected.len() as u32, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read as usize, expected.len());
+            assert_eq!(buffer, expected);
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(input);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// A write must never source bytes the caller has not initialized, even when
+/// they are within the allocation's capacity.
+#[tokio::test(flavor = "current_thread")]
+async fn writes_past_initialized_bytes_are_rejected() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("uninit");
+            let out = win_ioring::file::File::create(&path).unwrap();
+
+            // Plenty of capacity, but only three initialized bytes.
+            let mut buffer: Vec<u8> = Vec::with_capacity(64);
+            buffer.extend_from_slice(b"abc");
+
+            let outcome = handle.write(&out, buffer, 32, 0).await;
+            let result = outcome.expect_completed();
+            let (err, buffer) = result.into_parts();
+            match err.unwrap_err() {
+                win_ioring::Error::UninitializedWriteRange {
+                    requested,
+                    initialized,
+                } => {
+                    assert_eq!(requested, 32);
+                    assert_eq!(initialized, 3);
+                }
+                other => panic!("expected UninitializedWriteRange, got {other:?}"),
+            }
+            assert_eq!(buffer, b"abc", "the caller's buffer came back");
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// The platform's write flags must reach the kernel, and its verdict must come
+/// back cleanly with the caller's buffer.
+///
+/// Write-through is rejected outright for a file opened for cached I/O, which
+/// is what `File::create` gives you. That makes it a good test of the flag
+/// actually being plumbed through: if the flag were dropped on the floor the
+/// write would simply succeed.
+#[tokio::test(flavor = "current_thread")]
+async fn write_flags_reach_the_platform() {
+    use windows::Win32::Storage::FileSystem::FILE_WRITE_FLAGS_WRITE_THROUGH;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("writethrough");
+            let out = win_ioring::file::File::create(&path).unwrap();
+            let payload = b"durable".to_vec();
+
+            // Same write, with and without the flag.
+            let (written, payload) = handle
+                .write(&out, payload, 7, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written, 7, "the unflagged write should succeed");
+
+            let outcome = handle
+                .write_with_flags(&out, payload, 7, 0, FILE_WRITE_FLAGS_WRITE_THROUGH)
+                .await;
+            let result = outcome.expect_completed();
+            let (err, buffer) = result.into_parts();
+            let err = err.expect_err("write-through on cached I/O should be refused");
+            assert!(
+                matches!(err, win_ioring::Error::Os(_)),
+                "expected the platform's own error, got {err:?}"
+            );
+            assert_eq!(
+                buffer, b"durable",
+                "the buffer must come back even when the operation fails"
+            );
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// Every flush mode the platform defines must be selectable.
+#[tokio::test(flavor = "current_thread")]
+async fn flush_modes_are_selectable() {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLUSH_DATA, FILE_FLUSH_DEFAULT, FILE_FLUSH_MIN_METADATA, FILE_FLUSH_NO_SYNC,
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("flushmodes");
+            let out = win_ioring::file::File::create(&path).unwrap();
+            let payload = b"flushed".to_vec();
+            handle
+                .write(&out, payload.clone(), payload.len() as u32, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+
+            for mode in [
+                FILE_FLUSH_DEFAULT,
+                FILE_FLUSH_DATA,
+                FILE_FLUSH_MIN_METADATA,
+                FILE_FLUSH_NO_SYNC,
+            ] {
+                handle
+                    .flush_with_mode(&out, mode)
+                    .await
+                    .unwrap_or_else(|e| panic!("flush mode {mode:?} failed: {e}"));
+            }
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// Write and flush must both refuse to start once the driver is shutting down,
+/// and a write must still hand its buffer back when it does.
+#[tokio::test(flavor = "current_thread")]
+async fn write_and_flush_after_shutdown_error() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("shutdown");
+            let out = win_ioring::file::File::create(&path).unwrap();
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+
+            let outcome = handle.write(&out, b"data".to_vec(), 4, 0).await;
+            let result = outcome.expect_completed();
+            let (err, buffer) = result.into_parts();
+            assert!(matches!(err.unwrap_err(), win_ioring::Error::ShuttingDown));
+            assert_eq!(buffer, b"data", "the buffer came back");
+
+            let err = handle.flush(&out).await.unwrap_err();
+            assert!(matches!(err, win_ioring::Error::ShuttingDown));
+
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// Dropping a write in flight must be as safe as dropping a read.
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_writes_in_flight_is_safe() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let path = temp_path("dropwrite");
+            let out = win_ioring::file::File::create(&path).unwrap();
+
+            for i in 0..100 {
+                let fut = handle.write(&out, vec![b'x'; 64], 64, i * 64);
+                tokio::task::yield_now().await;
+                drop(fut);
+            }
+
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+
+            // The ring still works.
+            let (written, _) = handle
+                .write(&out, b"final".to_vec(), 5, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written, 5);
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(out);
+            let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
