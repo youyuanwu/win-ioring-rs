@@ -589,6 +589,28 @@ impl OpSlab {
         }
     }
 
+    /// Returns the tokens of submitted operations whose future has gone away
+    /// and which have never been cancelled.
+    ///
+    /// These are operations that were dropped before reaching the kernel, so
+    /// there was nothing to cancel at the time. Now that they are submitted,
+    /// cancelling them is worthwhile: nobody is waiting for the result.
+    pub fn detached_submitted_uncancelled(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Submitted,
+                    observer: Observer::Detached,
+                    cancel: CancelState::NeverRequested,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Deliberately leaks every remaining payload and renders the slab unusable.
     ///
     /// Used at teardown when the kernel may still hold pointers into those

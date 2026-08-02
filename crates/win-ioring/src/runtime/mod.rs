@@ -189,6 +189,12 @@ struct DriverInner {
     /// the retry path cannot be exercised without injecting one.
     #[cfg(test)]
     fail_next_submits: u32,
+    /// Test seam: skip the quiescence drain at teardown.
+    ///
+    /// A ring that refuses to settle cannot be produced on demand, so the
+    /// retain-and-leak path needs injecting too.
+    #[cfg(test)]
+    force_unquiet_teardown: bool,
 }
 
 impl DriverInner {
@@ -227,6 +233,10 @@ impl DriverInner {
                 self.pending_submit = false;
                 self.submit_failures = 0;
                 self.slab.promote_built_to_submitted();
+                // An operation whose future was dropped before it reached the
+                // kernel had nothing to cancel at the time. Now that it is
+                // submitted, cancel it: nobody is waiting for the result.
+                self.cancel_abandoned();
             }
             Err(e) => {
                 self.note_submit_failure(e);
@@ -243,6 +253,18 @@ impl DriverInner {
         // persistently stuck queue does not drown the observer.
         if self.submit_failures == 1 || self.submit_failures.is_multiple_of(64) {
             self.report(error);
+        }
+    }
+
+    /// Cancels operations whose future was dropped before they reached the
+    /// kernel.
+    ///
+    /// Dropping a future can only ask the platform to cancel an operation the
+    /// kernel already has. One dropped while still queued therefore gets its
+    /// cancellation deferred to here, once submission has promoted it.
+    fn cancel_abandoned(&mut self) {
+        for token in self.slab.detached_submitted_uncancelled() {
+            self.request_cancel(token);
         }
     }
 
@@ -384,7 +406,16 @@ impl DriverInner {
         // cannot hang; if the ring will not settle within it, quiescence is
         // deemed unestablished and the leak path below runs.
         let mut wakers = self.reap_completions();
-        for _ in 0..DRAIN_ROUNDS {
+        #[cfg(test)]
+        let drain_rounds = if self.force_unquiet_teardown {
+            0
+        } else {
+            DRAIN_ROUNDS
+        };
+        #[cfg(not(test))]
+        let drain_rounds = DRAIN_ROUNDS;
+
+        for _ in 0..drain_rounds {
             if self.slab.outstanding() == 0 {
                 break;
             }
@@ -521,6 +552,8 @@ impl Driver {
                 submit_failures: 0,
                 #[cfg(test)]
                 fail_next_submits: 0,
+                #[cfg(test)]
+                force_unquiet_teardown: false,
             })),
             on_error: observer,
             completion_event,
@@ -921,9 +954,9 @@ impl<B> Drop for ReadFuture<B> {
             Some(Lifecycle::Built) => {
                 // A submission queue entry references the buffer and cannot be
                 // withdrawn, and the kernel has not seen the operation yet, so
-                // there is nothing to cancel. Retain and let it run. Once a
-                // retry promotes it to submitted, it is cancellable, but by
-                // then nobody is waiting so there is nothing to gain.
+                // there is nothing for the platform to cancel. The slab records
+                // this slot as detached-but-submitted-later, and the driver
+                // cancels it once submission promotes it.
             }
             Some(Lifecycle::Submitted) => {
                 // Best-effort: ask the platform to give up early. Failure here
@@ -966,6 +999,28 @@ mod tests {
 
     fn readme() -> File {
         File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap()
+    }
+
+    /// Runs the driver by hand until nothing is outstanding.
+    ///
+    /// Submits as well as reaps, because a tombstoned slot clears only once its
+    /// cancellation has been submitted and has reported.
+    fn drain(driver: &Driver) {
+        for _ in 0..10_000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if driver.inner.borrow().slab.outstanding() == 0 {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("ring did not settle");
     }
 
     /// A submission failure must not resolve the operation's future, because
@@ -1044,6 +1099,98 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
+    }
+
+    /// Dropping a future before its operation reaches the kernel leaves nothing
+    /// to cancel at the time. The cancellation must therefore be deferred until
+    /// submission promotes the operation, or an abandoned read would run to
+    /// completion unnecessarily.
+    #[test]
+    fn cancellation_is_deferred_until_a_built_operation_is_submitted() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Built but deliberately not submitted yet.
+        let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+        let token = fut.operation_id().expect("read was built").0;
+        assert_eq!(
+            driver.inner.borrow().slab.state(token).map(|s| s.0),
+            Some(Lifecycle::Built)
+        );
+
+        drop(fut);
+
+        {
+            let inner = driver.inner.borrow();
+            // Detached, still built, and not yet cancellable.
+            assert_eq!(
+                inner.slab.state(token),
+                Some((Lifecycle::Built, slab::Observer::Detached))
+            );
+            assert_eq!(
+                inner.slab.detached_submitted_uncancelled().len(),
+                0,
+                "a built operation is not yet a cancellation candidate"
+            );
+        }
+
+        // Submitting promotes it, and the driver must cancel it at that point.
+        driver.inner.borrow_mut().submit_pending();
+        {
+            let inner = driver.inner.borrow();
+            assert!(
+                inner.slab.detached_submitted_uncancelled().is_empty(),
+                "the abandoned operation should have been cancelled on promotion"
+            );
+            assert!(
+                !inner.cancel_holds.is_empty(),
+                "a deferred cancellation should hold the file open"
+            );
+        }
+
+        // Settle so teardown is clean.
+        drain(&driver);
+        handle.shutdown();
+    }
+
+    /// FR-020b / SC-030: when the ring will not settle, waiting futures must be
+    /// told their buffer was retained rather than being left pending forever.
+    #[test]
+    fn unquiet_teardown_reports_retained_buffers() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let mut fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+
+        // Register a waker so the future is genuinely waiting.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+
+        // Force the drain to be skipped, so quiescence cannot be established.
+        driver.inner.borrow_mut().force_unquiet_teardown = true;
+        let wakers = driver.inner.borrow_mut().teardown();
+        for w in wakers {
+            w.wake();
+        }
+
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Outcome::Retained(e)) => {
+                assert!(matches!(e, Error::BufferRetained));
+            }
+            Poll::Ready(other) => panic!("expected Retained, got {other:?}"),
+            Poll::Pending => panic!("a future was left pending after teardown"),
+        }
+
+        // FR-032: nothing may be submitted after teardown.
+        let outcome = handle.read(&file, vec![0_u8; 64], 20, 0);
+        let mut outcome = outcome;
+        match Pin::new(&mut outcome).poll(&mut cx) {
+            Poll::Ready(o) => assert!(matches!(o.err(), Some(Error::ShuttingDown))),
+            Poll::Pending => panic!("a post-teardown submission should fail immediately"),
+        }
     }
 
     /// Drives the real `drive()` loop and asserts it re-arms itself when a

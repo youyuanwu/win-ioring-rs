@@ -263,17 +263,27 @@ async fn dropping_in_flight_reads_repeatedly_is_safe() {
 
             let file = win_ioring::file::File::open(README_PATH).unwrap();
 
+            let mut dropped_while_outstanding = 0;
             for _ in 0..200 {
                 let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
                 // Give the operation a chance to actually reach the kernel, so
                 // the drop exercises the submitted-and-cancellable path rather
                 // than only the trivial one.
                 tokio::task::yield_now().await;
+                if handle.outstanding() > 0 {
+                    dropped_while_outstanding += 1;
+                }
                 drop(fut);
             }
 
+            assert!(
+                dropped_while_outstanding > 0,
+                "no read was still outstanding when dropped across 200 attempts, \
+                 so the submitted-and-cancellable drop path was never exercised"
+            );
+
             // Let everything settle, then confirm the ring still works.
-            for _ in 0..50 {
+            for _ in 0..200 {
                 tokio::task::yield_now().await;
             }
             let (read, _) = handle
@@ -306,6 +316,13 @@ async fn dropping_an_in_flight_read_does_not_block() {
 
             let file = win_ioring::file::File::open(README_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+            // Yield once so the operation has a chance to reach the kernel.
+            // Whether it is still outstanding by the time we drop is genuinely
+            // racy — a small local read can complete immediately — so this
+            // asserts the property that holds either way: neither the built nor
+            // the submitted drop path may wait on the kernel. The
+            // repeatedly-dropped test above covers the submitted path
+            // specifically, and asserts it was exercised.
             tokio::task::yield_now().await;
 
             let start = std::time::Instant::now();
@@ -423,16 +440,32 @@ async fn shutdown_with_work_in_flight_settles() {
             handle.shutdown();
             driver_task.await.unwrap();
 
-            // Every future must resolve one way or another; none may hang.
+            // Every future must reach a terminal state; none may hang. The
+            // buffer comes back unless the kernel could still reach it, which
+            // is the one documented exception.
+            let mut completed = 0;
+            let mut retained = 0;
             for fut in futures {
-                let outcome = fut.await;
-                // Either it completed normally, or its buffer was retained
-                // because the kernel could still reach it. Both are terminal.
-                assert!(
-                    outcome.is_ok() || outcome.err().is_some(),
-                    "a future neither completed nor reported"
-                );
+                match fut.await {
+                    win_ioring::runtime::Outcome::Completed(result) => {
+                        let (_, buffer) = result.into_parts();
+                        assert_eq!(buffer.capacity(), 128, "the buffer came back");
+                        completed += 1;
+                    }
+                    win_ioring::runtime::Outcome::Retained(e) => {
+                        assert!(matches!(e, win_ioring::Error::BufferRetained));
+                        retained += 1;
+                    }
+                }
             }
+            assert_eq!(completed + retained, 8, "every future must resolve");
+
+            // FR-032: nothing may be submitted once the driver is gone.
+            let outcome = handle.read(&file, vec![0_u8; 64], 20, 0).await;
+            assert!(matches!(
+                outcome.err(),
+                Some(win_ioring::Error::ShuttingDown)
+            ));
         })
         .await;
 }
