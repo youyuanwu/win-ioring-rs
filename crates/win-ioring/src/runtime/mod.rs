@@ -143,8 +143,9 @@ impl ResultSlot {
 struct OpPayload {
     /// The caller's buffer, type-erased so the slab need not know about it.
     buffer: Option<Box<dyn Any>>,
-    /// Keeps the target file's handle open for as long as the kernel may use it.
-    _file: Rc<FileState>,
+    /// Keeps the target file's handle open for as long as the kernel may use it,
+    /// and lets a cancellation name the same file the operation named.
+    file: Rc<FileState>,
     /// Shared with the future awaiting this operation.
     slot: Rc<RefCell<ResultSlot>>,
 }
@@ -153,6 +154,17 @@ struct OpPayload {
 struct DriverInner {
     ring: IoRing,
     slab: OpSlab,
+    /// Resources a cancellation request needs kept alive.
+    ///
+    /// A cancellation names the file its target named, and completes
+    /// independently — possibly *after* the target. The target's payload, and
+    /// with it the target's own file reference, is released when the target
+    /// completes, so the cancellation needs its own hold or the handle could
+    /// close while the kernel is still working on the cancellation.
+    cancel_holds: Vec<(Token, Rc<FileState>)>,
+    /// Signalled to nudge the driver; held here so a dropped future can reach
+    /// it to prompt submission of the cancellation it just queued.
+    wake: Rc<AsyncEvent>,
     /// Set when entries are queued but not yet accepted by the kernel.
     ///
     /// While set, a retry is owed and no completion can arrive to prompt it, so
@@ -234,6 +246,72 @@ impl DriverInner {
         }
     }
 
+    /// Asks the platform to cancel a submitted operation.
+    ///
+    /// Best-effort by nature: the request may fail to build, may lose the race
+    /// with the operation it targets, or may be refused outright. None of that
+    /// is an error, and none of it changes the fact that the target's buffer is
+    /// released only by the target's own completion.
+    ///
+    /// Cancelling twice, or cancelling something already finished, is a no-op.
+    fn request_cancel(&mut self, token: Token) {
+        if self.shutting_down || self.torn_down {
+            return;
+        }
+        // Only submitted operations can be cancelled. A described one has
+        // nothing in the queue, and a built one has not reached the kernel, so
+        // there is nothing for the platform to find.
+        if self.slab.state(token).map(|(lifecycle, _)| lifecycle) != Some(Lifecycle::Submitted) {
+            return;
+        }
+
+        // The cancellation must name the same file the target named.
+        let Some(file) = self
+            .slab
+            .payload_mut(token)
+            .and_then(|p| p.downcast_mut::<OpPayload>())
+            .map(|p| Rc::clone(&p.file))
+        else {
+            return;
+        };
+
+        // Refused if a cancellation has ever been issued for this operation,
+        // which is what makes a repeat request a no-op.
+        let Some(cancel_token) = self.slab.register_cancel(token) else {
+            return;
+        };
+
+        let op = crate::io_ring::ops::CancelOp::builder()
+            .with_raw_handle(file.raw_handle())
+            .with_op_to_cancel(token.as_user_data())
+            .with_user_data(cancel_token.as_user_data())
+            .build();
+        let Ok(op) = op else {
+            // Nothing was queued, so retire the bookkeeping we just took.
+            self.slab.complete_cancel(cancel_token);
+            return;
+        };
+
+        // Hold the file open until the cancellation's own completion arrives.
+        // Do this before building, so the hold is in place no matter what.
+        self.cancel_holds.push((cancel_token, file));
+
+        // SAFETY: the file handle is kept open by the hold just pushed, which
+        // is released only when this cancellation's own completion is dequeued.
+        if unsafe { self.ring.build_cancel_request(op) }.is_err() {
+            // Failing to enqueue a cancellation is explicitly not an error: the
+            // target simply runs to completion. Undo the bookkeeping so the
+            // target's slot is not left waiting for a completion that will
+            // never arrive.
+            self.cancel_holds.retain(|(t, _)| *t != cancel_token);
+            self.slab.complete_cancel(cancel_token);
+            return;
+        }
+
+        self.pending_submit = true;
+        let _ = self.wake.signal();
+    }
+
     /// Drains the completion queue.
     ///
     /// Returns the wakers of any futures that were resolved, **without** waking
@@ -258,8 +336,10 @@ impl DriverInner {
 
             if token.kind() == TokenKind::Cancel {
                 // A cancellation's completion never releases the target's
-                // buffer; it only retires the cancellation's own bookkeeping.
+                // buffer; it only retires the cancellation's own bookkeeping
+                // and releases the file hold that kept the handle open for it.
                 self.slab.complete_cancel(token);
+                self.cancel_holds.retain(|(t, _)| *t != token);
                 continue;
             }
 
@@ -298,12 +378,29 @@ impl DriverInner {
         self.torn_down = true;
         self.shutting_down = true;
 
-        // One last sweep: anything already finished can be delivered normally.
+        // Try to reach quiescence before deciding anything. Each round hands
+        // any queued entries to the kernel and then waits, briefly, for the
+        // outstanding operations to report. The wait is bounded so shutdown
+        // cannot hang; if the ring will not settle within it, quiescence is
+        // deemed unestablished and the leak path below runs.
         let mut wakers = self.reap_completions();
+        for _ in 0..DRAIN_ROUNDS {
+            if self.slab.outstanding() == 0 {
+                break;
+            }
+            self.submit_pending();
+            let waiting = self.slab.outstanding();
+            // Submitting with a wait count blocks until that many completions
+            // are available or the timeout expires, which is how the driver
+            // waits without a timer of its own.
+            let _ = self.ring.submit(waiting, DRAIN_TIMEOUT_MS);
+            wakers.extend(self.reap_completions());
+        }
 
         if self.slab.outstanding() == 0 {
             let _ = self.ring.close();
             drop(self.slab.drain());
+            self.cancel_holds.clear();
             return wakers;
         }
 
@@ -323,10 +420,21 @@ impl DriverInner {
 
         let _ = self.ring.close();
         self.slab.leak();
+        // The handles these hold may still be reachable by the kernel, so they
+        // are abandoned along with the buffers rather than closed.
+        for (_, file) in self.cancel_holds.drain(..) {
+            std::mem::forget(file);
+        }
 
         wakers
     }
 }
+
+/// How many rounds of draining to attempt before declaring the ring unquiet.
+const DRAIN_ROUNDS: u32 = 4;
+
+/// How long each drain round waits for outstanding operations to report.
+const DRAIN_TIMEOUT_MS: usize = 250;
 
 /// Yields to the executor and guarantees another poll.
 ///
@@ -404,6 +512,8 @@ impl Driver {
             inner: Rc::new(RefCell::new(DriverInner {
                 ring,
                 slab: OpSlab::new(),
+                cancel_holds: Vec::new(),
+                wake: Rc::clone(&wake),
                 pending_submit: false,
                 shutting_down: false,
                 torn_down: false,
@@ -597,7 +707,7 @@ impl Handle {
         // after that placement.
         let payload = Box::new(OpPayload {
             buffer: None,
-            _file: file.state(),
+            file: file.state(),
             slot: Rc::clone(&slot),
         });
         let token = match inner.slab.insert(payload) {
@@ -658,14 +768,12 @@ impl Handle {
     ///
     /// Cancellation is best-effort: it may fail, or arrive too late, and neither
     /// is an error. The caller keeps the original future and still observes that
-    /// operation's terminal result.
-    ///
-    // Deliberately not implemented in this phase. Registering a cancellation
-    // without also submitting the platform request would tombstone the target
-    // slot awaiting a completion that could never arrive, permanently
-    // withholding its index. Cancellation lands whole in the next phase.
-    #[allow(dead_code)]
-    fn cancel_placeholder(&self, _id: OperationId) {}
+    /// operation's terminal result, which is the only thing that releases the
+    /// buffer. Cancelling twice, or cancelling an operation that has already
+    /// finished, is a no-op.
+    pub fn cancel(&self, id: OperationId) {
+        self.strong.borrow_mut().request_cancel(id.0);
+    }
 }
 
 /// Takes a buffer back out of a slot whose operation never reached the kernel.
@@ -802,12 +910,28 @@ impl<B> Drop for ReadFuture<B> {
         };
 
         // Detaching leaves the operation running. Its buffer is released only
-        // when its own completion is dequeued, never here.
-        if let Some(Lifecycle::Described) = inner.slab.detach(*token) {
-            // Nothing was ever built, so no queue entry references the buffer
-            // and it can be released now. Built or submitted operations must
-            // keep theirs; cancelling those arrives in the next phase.
-            drop(inner.slab.complete(*token));
+        // when its own completion is dequeued, never here. What varies is
+        // whether anything can be done about it.
+        match inner.slab.detach(*token) {
+            Some(Lifecycle::Described) => {
+                // Nothing was ever built, so no queue entry references the
+                // buffer and it can be released immediately.
+                drop(inner.slab.complete(*token));
+            }
+            Some(Lifecycle::Built) => {
+                // A submission queue entry references the buffer and cannot be
+                // withdrawn, and the kernel has not seen the operation yet, so
+                // there is nothing to cancel. Retain and let it run. Once a
+                // retry promotes it to submitted, it is cancellable, but by
+                // then nobody is waiting so there is nothing to gain.
+            }
+            Some(Lifecycle::Submitted) => {
+                // Best-effort: ask the platform to give up early. Failure here
+                // is not an error and changes nothing about the buffer's
+                // lifetime. This returns without waiting on the kernel.
+                inner.request_cancel(*token);
+            }
+            None => {}
         }
     }
 }
@@ -903,7 +1027,14 @@ mod tests {
 
         // Drain the completion so nothing is left in flight.
         loop {
-            let wakers = driver.inner.borrow_mut().reap_completions();
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                // Submit as well as reap: dropping a future queues a
+                // cancellation, and a tombstoned slot clears only once that
+                // cancellation has been submitted and has reported.
+                inner.submit_pending();
+                inner.reap_completions()
+            };
             for waker in wakers {
                 waker.wake();
             }
@@ -1034,7 +1165,14 @@ mod tests {
             "a successful retry after a long failure streak must still land"
         );
         loop {
-            let wakers = driver.inner.borrow_mut().reap_completions();
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                // Submit as well as reap: dropping a future queues a
+                // cancellation, and a tombstoned slot clears only once that
+                // cancellation has been submitted and has reported.
+                inner.submit_pending();
+                inner.reap_completions()
+            };
             for waker in wakers {
                 waker.wake();
             }
@@ -1093,7 +1231,14 @@ mod tests {
 
         // Only the completion releases it.
         loop {
-            let wakers = driver.inner.borrow_mut().reap_completions();
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                // Submit as well as reap: dropping a future queues a
+                // cancellation, and a tombstoned slot clears only once that
+                // cancellation has been submitted and has reported.
+                inner.submit_pending();
+                inner.reap_completions()
+            };
             for waker in wakers {
                 waker.wake();
             }
