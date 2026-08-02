@@ -87,6 +87,11 @@ async fn dropping_reads_in_flight_is_safe() {
                 tokio::task::yield_now().await;
             }
 
+            // Wait for the ring to drain before asking for room: with the whole
+            // workspace's tests running at once the driver can be starved long
+            // enough that the submission queue is still full here.
+            win_ioring_tests::settle(&handle).await;
+
             // The ring still works afterwards.
             let (read, _) = handle
                 .read(&file, vec![0_u8; 64], 20, 0)
@@ -276,9 +281,7 @@ async fn dropping_in_flight_reads_repeatedly_is_safe() {
             }
 
             // Let everything settle, then confirm the ring still works.
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
+            win_ioring_tests::settle(&handle).await;
             let (read, _) = handle
                 .read(&file, vec![0_u8; 64], 20, 0)
                 .await
@@ -746,9 +749,7 @@ async fn dropping_writes_in_flight_is_safe() {
                 drop(fut);
             }
 
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
+            win_ioring_tests::settle(&handle).await;
 
             // The ring still works.
             let (written, _) = handle
@@ -831,6 +832,58 @@ async fn read_transfer_accounting_covers_partial_and_empty() {
             handle.shutdown();
             driver_task.await.unwrap();
             drop(file);
+        })
+        .await;
+}
+
+/// FR-036: a genuinely zero-length buffer must be submitted normally and
+/// complete with a zero transfer, not rejected locally.
+///
+/// This is distinct from asking for zero bytes into a buffer that has capacity:
+/// here the buffer has no allocation at all, so `buf_mut_ptr` may hand the
+/// kernel a dangling-but-aligned pointer, which the platform must accept.
+#[tokio::test(flavor = "current_thread")]
+async fn zero_length_buffers_are_submitted_not_rejected() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("zerolen");
+            std::fs::write(temp.path(), b"0123456789").unwrap();
+            let file = win_ioring::file::File::open(temp.path()).unwrap();
+
+            // An empty `Vec` has no allocation whatsoever.
+            let empty: Vec<u8> = Vec::new();
+            assert_eq!(empty.capacity(), 0);
+
+            let read = handle.read(&file, empty, 0, 0);
+            assert!(
+                read.operation_id().is_some(),
+                "a zero-length read must reach the kernel, not be rejected locally"
+            );
+            let (transferred, buffer) = read.await.expect_completed().unwrap();
+            assert_eq!(transferred, 0);
+            assert_eq!(buffer.len(), 0);
+
+            // The same on the write path, against a separate destination.
+            let out_temp = TempFile::new("zerolen-out");
+            let out = win_ioring::file::File::create(out_temp.path()).unwrap();
+            let write = handle.write(&out, Vec::new(), 0, 0);
+            assert!(
+                write.operation_id().is_some(),
+                "a zero-length write must reach the kernel too"
+            );
+            let (transferred, _) = write.await.expect_completed().unwrap();
+            assert_eq!(transferred, 0);
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(file);
+            drop(out);
         })
         .await;
 }

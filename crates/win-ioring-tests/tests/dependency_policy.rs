@@ -36,10 +36,20 @@ const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../win-ioring/Cargo
 /// `[dev-dependencies]` is deliberately excluded: those exist only for the
 /// crate's own tests, which is why Tokio may appear there. Everything else
 /// counts, including build and target-specific dependencies.
+///
+/// Both the key and any `package` rename are collected, because
+/// `not_tokio = { package = "tokio" }` is a dependency on Tokio however it is
+/// spelled at the use site.
 fn dependency_names(manifest: &Table) -> Vec<String> {
     fn extend(names: &mut Vec<String>, table: Option<&Value>) {
-        if let Some(Value::Table(t)) = table {
-            names.extend(t.keys().cloned());
+        let Some(Value::Table(t)) = table else {
+            return;
+        };
+        for (key, spec) in t {
+            names.push(key.clone());
+            if let Some(Value::String(renamed)) = spec.get("package") {
+                names.push(renamed.clone());
+            }
         }
     }
 
@@ -56,6 +66,7 @@ fn dependency_names(manifest: &Table) -> Vec<String> {
     }
 
     names.sort();
+    names.dedup();
     names
 }
 
@@ -108,19 +119,21 @@ fn dev_dependencies_are_excluded() {
 /// The collector must see every form Cargo accepts.
 ///
 /// Without this, the policy test could quietly stop working the day someone
-/// writes a dependency as its own table or scopes it to a target — which is
-/// exactly how the first version of this test could have been bypassed.
+/// writes a dependency as its own table, scopes it to a target, or renames it —
+/// which is exactly how earlier versions of this test could have been bypassed.
 #[test]
-fn the_collector_sees_table_and_target_dependency_forms() {
+fn the_collector_sees_every_dependency_form() {
     let manifest: Table = r#"
 [dependencies]
 plain = "1"
+renamed = { package = "the-real-name", version = "1" }
 
 [dependencies.as-its-own-table]
 version = "1"
 
 [target.'cfg(windows)'.dependencies]
 target-specific = "1"
+target-renamed = { package = "the-real-target-name", version = "1" }
 
 [build-dependencies]
 at-build-time = "1"
@@ -137,7 +150,11 @@ only-for-tests = "1"
             "as-its-own-table",
             "at-build-time",
             "plain",
-            "target-specific"
+            "renamed",
+            "target-renamed",
+            "target-specific",
+            "the-real-name",
+            "the-real-target-name",
         ],
         "the collector missed a dependency form, or picked up a dev-dependency"
     );
