@@ -35,10 +35,11 @@ established before equivalence means anything.
 
 ### Compile-fail doc-tests
 
-Five `compile_fail` snippets in `crates/win-ioring/src/lib.rs` assert that
+Six `compile_fail` snippets in `crates/win-ioring/src/lib.rs` assert that
 `Driver`, `Handle` and operation futures fail a `Send` bound; that a second
-sequential operation cannot start while the first future is alive; and that the
-buffer contracts cannot be implemented safely.
+sequential operation cannot start while the first future is alive; that the
+buffer contracts cannot be implemented safely; and that a registered buffer's
+handle cannot be named while an operation holds it.
 
 Each is paired with an otherwise-identical snippet that **does** compile, so a
 snippet failing for an incidental reason would show up.
@@ -46,8 +47,9 @@ snippet failing for an incidental reason would show up.
 Each was verified to fail for its *intended* reason by temporarily removing the
 marker and reading the compiler output: `E0277 cannot be sent between threads
 safely`, `E0499 cannot borrow as mutable more than once` (with "first borrow
-later used here", confirming NLL does not end the borrow early), and `E0200
-requires an unsafe impl declaration`. Repeat that check if you change a snippet.
+later used here", confirming NLL does not end the borrow early), `E0200 requires
+an unsafe impl declaration`, and `E0382 borrow of moved value`. Repeat that check
+if you change a snippet.
 
 ### Dependency policy
 
@@ -94,6 +96,28 @@ reaches has no reproducible natural failure mode:
 that withheld reaping or refused cancellations *unconditionally* produces a test
 that hangs forever rather than one that fails — a CI timeout instead of an
 assertion. Give every such seam a budget the test outlives.
+
+### Proving that two things did the same work
+
+`crates/win-ioring-bench` compares I/O backends, and a comparison is only worth
+quoting if the things compared did identical work. Two properties carry it, and
+the split between them is the interesting part:
+
+- the **issue trace** — every operation, in the order it was issued — is compared
+  exactly. Issue order is the scenario's own and is deterministic.
+- the **delivery digest** — a fold over what each operation put into
+  application-visible memory — is folded *commutatively*, because completion
+  order is legitimately nondeterministic above one operation in flight and must
+  not enter the comparison.
+
+Getting that split wrong in either direction breaks the benchmark: comparing
+completion order makes it flaky, and not comparing delivered bytes lets a backend
+report transfers whose data never reached anywhere readable.
+
+Two tests deliberately weaken a backend — one issuing fewer operations, one
+reporting transfers with nothing readable behind them — and both must be
+*rejected* rather than reported. Without those, every other check is an
+assumption.
 
 ### Proving that memory is *not* freed
 

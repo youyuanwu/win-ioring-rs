@@ -929,7 +929,7 @@ async fn registering_buffers_takes_ownership_and_returns_them_on_failure() {
             let empty: Vec<Vec<u8>> = Vec::new();
             match handle.register_buffers(empty).await {
                 Registered::Failed(_, returned) => assert!(returned.is_empty()),
-                Registered::Ok => panic!("an empty registration should be refused"),
+                Registered::Ok(_) => panic!("an empty registration should be refused"),
             }
 
             let buffers = vec![vec![0_u8; 128], vec![0_u8; 128]];
@@ -943,9 +943,9 @@ async fn registering_buffers_takes_ownership_and_returns_them_on_failure() {
 
 /// SC-017a: reads may fill a registered buffer's whole extent, but writes are
 /// bounded by how much of it is initialized, and a completed read raises that
-/// watermark.
+/// prefix.
 #[tokio::test(flavor = "current_thread")]
-async fn registered_writes_are_bounded_by_the_initialization_watermark() {
+async fn registered_writes_are_bounded_by_the_initialized_prefix() {
     use win_ioring::runtime::FileTarget;
 
     let local = tokio::task::LocalSet::new();
@@ -962,47 +962,55 @@ async fn registered_writes_are_bounded_by_the_initialization_watermark() {
 
             // Registered with capacity 64 but nothing initialized.
             let buffer: Vec<u8> = Vec::with_capacity(64);
-            assert!(handle.register_buffers(vec![buffer]).await.is_ok());
+            let collection = handle.register_buffers(vec![buffer]).await.unwrap();
 
             let input = win_ioring::file::File::open(temp.path()).unwrap();
             // A separate destination: `File::create` truncates, which would
             // empty the source if they were the same file.
             let out = win_ioring::file::File::create(out_temp.path()).unwrap();
 
-            // Writing before anything is initialized must be refused.
-            let err = handle
-                .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
+            let handle_buf = collection.check_out(0).unwrap();
+
+            // Writing before anything is initialized must be refused, and the
+            // buffer must come straight back.
+            let (result, handle_buf) = handle
+                .write_registered(FileTarget::Owned(&out), handle_buf, 0, 10, 0)
                 .await
-                .expect_err("writing uninitialized registered bytes must be refused");
+                .into_parts();
+            let err = result.expect_err("writing uninitialized registered bytes must be refused");
             assert!(
                 matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
                 "got {err:?}"
             );
 
-            // Reading may target the whole extent, and raises the watermark.
-            let read = handle
-                .read_into_registered(FileTarget::Owned(&input), 0, 0, 10, 0)
+            // Reading may target the whole extent, and extends the prefix.
+            let (result, handle_buf) = handle
+                .read_registered(FileTarget::Owned(&input), handle_buf, 0, 10, 0)
                 .await
-                .unwrap();
-            assert_eq!(read, 10);
+                .into_parts();
+            assert_eq!(result.unwrap(), 10);
+            // The bytes are readable through the handle — the point of the
+            // whole design.
+            assert_eq!(&handle_buf[..], b"0123456789");
 
-            // Now the same write is within the watermark.
-            let written = handle
-                .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
+            // Now the same write is within the initialized prefix.
+            let (result, handle_buf) = handle
+                .write_registered(FileTarget::Owned(&out), handle_buf, 0, 10, 0)
                 .await
-                .unwrap();
-            assert_eq!(written, 10);
+                .into_parts();
+            assert_eq!(result.unwrap(), 10);
 
-            // Beyond the watermark is still refused.
-            let err = handle
-                .write_from_registered(FileTarget::Owned(&out), 0, 0, 40, 0)
+            // Beyond the prefix is still refused.
+            let (result, handle_buf) = handle
+                .write_registered(FileTarget::Owned(&out), handle_buf, 0, 40, 0)
                 .await
-                .expect_err("writing past the watermark must be refused");
+                .into_parts();
             assert!(matches!(
-                err,
+                result.expect_err("writing past the prefix must be refused"),
                 win_ioring::Error::RegisteredRangeOutOfBounds { .. }
             ));
 
+            drop(handle_buf);
             handle.shutdown();
             driver_task.await.unwrap();
             drop(input);
@@ -1046,7 +1054,7 @@ async fn a_failed_registration_returns_the_buffers() {
                     assert_eq!(returned[0], vec![1_u8; 8], "contents must be intact");
                     assert_eq!(returned[1], vec![2_u8; 8]);
                 }
-                Registered::Ok => panic!("registering after shutdown should fail"),
+                Registered::Ok(_) => panic!("registering after shutdown should fail"),
             }
 
             driver_task.await.unwrap();
@@ -1054,15 +1062,18 @@ async fn a_failed_registration_returns_the_buffers() {
         .await;
 }
 
-/// SC-017: superseding a registration leaves an operation issued against the
-/// old one able to complete normally, and the superseded buffers stay alive
-/// until the ring is closed rather than coming back to the caller.
+/// SC-017 and SC-007c: superseding a registration leaves the superseded buffers
+/// alive until the ring is closed, rather than returning them to the caller.
 ///
 /// The liveness half needs a drop counter. Asserting only that neither call
 /// returned an error would pass whether the superseded buffer was still alive
 /// or had been freed under the kernel.
+///
+/// Superseding *while an operation is in flight* is a separate matter: a handle
+/// held by an in-flight operation now blocks re-registration outright, and that
+/// refusal is tested where the guard lives.
 #[tokio::test(flavor = "current_thread")]
-async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
+async fn a_superseded_registration_stays_alive_until_the_ring_closes() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use win_ioring::runtime::FileTarget;
@@ -1082,19 +1093,21 @@ async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
 
             let drops = Arc::new(AtomicUsize::new(0));
             let first = vec![CountingBuf::new(64, &drops)];
-            assert!(handle.register_buffers(first).await.is_ok());
+            let first_collection = handle.register_buffers(first).await.unwrap();
             assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-            // Issue a read against the first registration and, without awaiting
-            // it, register a second set. Both futures are driven together, so
-            // the read is outstanding while the supersession lands.
-            let read = handle.read_into_registered(FileTarget::Owned(&input), 0, 0, 10, 0);
-            let second: Vec<Vec<u8>> = vec![Vec::with_capacity(128)];
-            let register = handle.register_buffers(second);
-            let (read, register) = tokio::join!(read, register);
+            // Use the first registration, then return its handle so nothing is
+            // checked out when the second registration is requested.
+            let buffer = first_collection.check_out(0).unwrap();
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Owned(&input), buffer, 0, 10, 0)
+                .await
+                .into_parts();
+            assert_eq!(result.unwrap(), 10);
+            drop(buffer);
 
-            assert_eq!(read.unwrap(), 10, "the in-flight read must complete");
-            assert!(register.is_ok());
+            let second: Vec<Vec<u8>> = vec![Vec::with_capacity(128)];
+            let second_collection = handle.register_buffers(second).await.unwrap();
 
             // The superseded buffer must still be alive: the platform offers no
             // way to withdraw a registration, so it may still hold pointers.
@@ -1106,20 +1119,33 @@ async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
 
             // The new registration is the one now in force: its larger extent is
             // addressable, which the superseded 64-byte buffer would refuse.
-            let read = handle
-                .read_into_registered(FileTarget::Owned(&input), 0, 100, 10, 0)
-                .await;
-            assert!(read.is_ok(), "got {read:?}");
+            let buffer = second_collection.check_out(0).unwrap();
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Owned(&input), buffer, 100, 10, 0)
+                .await
+                .into_parts();
+            assert!(result.is_ok(), "got {result:?}");
             assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(buffer);
 
             handle.shutdown();
             driver_task.await.unwrap();
 
-            // Closing the ring is what finally releases it.
+            // The collection is still held, and a collection keeps its buffers
+            // alive on its own — that is what lets a handle outlive the driver.
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "a held collection must keep its buffers alive past ring close"
+            );
+
+            // Releasing the last reference is what finally frees it.
+            drop(first_collection);
+            drop(second_collection);
             assert_eq!(
                 drops.load(Ordering::SeqCst),
                 1,
-                "the superseded buffer must be released once the ring is closed"
+                "the superseded buffer must be released once nothing holds it"
             );
             drop(input);
         })
@@ -1150,46 +1176,53 @@ async fn the_watermark_only_covers_a_contiguous_initialized_prefix() {
             let out = win_ioring::file::File::create(out_temp.path()).unwrap();
 
             let buffers: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
-            assert!(handle.register_buffers(buffers).await.is_ok());
+            let collection = handle.register_buffers(buffers).await.unwrap();
+            let buffer = collection.check_out(0).unwrap();
 
             // A read into offset 32 leaves bytes 0..32 uninitialized, so the
-            // watermark must stay at zero and every write must still be refused.
-            let read = handle
-                .read_into_registered(FileTarget::Owned(&input), 0, 32, 10, 0)
+            // prefix must stay at zero and every write must still be refused.
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Owned(&input), buffer, 32, 10, 0)
                 .await
-                .unwrap();
-            assert_eq!(read, 10);
-            let err = handle
-                .write_from_registered(FileTarget::Owned(&out), 0, 0, 1, 0)
+                .into_parts();
+            assert_eq!(result.unwrap(), 10);
+            let (result, buffer) = handle
+                .write_registered(FileTarget::Owned(&out), buffer, 0, 1, 0)
                 .await
-                .expect_err("a gap before the read must keep the watermark at zero");
+                .into_parts();
             assert!(
-                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
-                "got {err:?}"
+                matches!(
+                    result.expect_err("a gap before the read must keep the prefix at zero"),
+                    win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                ),
+                "a gap before the read must keep the prefix at zero"
             );
 
-            // A short read raises the watermark by what was transferred, not by
+            // A short read extends the prefix by what was transferred, not by
             // the 40 bytes requested: the file only holds 10.
-            let read = handle
-                .read_into_registered(FileTarget::Owned(&input), 0, 0, 40, 0)
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Owned(&input), buffer, 0, 40, 0)
                 .await
-                .unwrap();
-            assert_eq!(read, 10, "reading past the end is a short read");
-            assert!(
-                handle
-                    .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
-                    .await
-                    .is_ok()
-            );
-            let err = handle
-                .write_from_registered(FileTarget::Owned(&out), 0, 0, 11, 0)
+                .into_parts();
+            assert_eq!(result.unwrap(), 10, "reading past the end is a short read");
+            let (result, buffer) = handle
+                .write_registered(FileTarget::Owned(&out), buffer, 0, 10, 0)
                 .await
-                .expect_err("the watermark must track the transfer, not the request");
+                .into_parts();
+            assert!(result.is_ok());
+            let (result, buffer) = handle
+                .write_registered(FileTarget::Owned(&out), buffer, 0, 11, 0)
+                .await
+                .into_parts();
             assert!(
-                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
-                "got {err:?}"
+                matches!(
+                    result.expect_err("the prefix must track the transfer, not the request"),
+                    win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                ),
+                "the prefix must track the transfer, not the request"
             );
 
+            drop(buffer);
             handle.shutdown();
             driver_task.await.unwrap();
             drop(input);
@@ -1200,6 +1233,11 @@ async fn the_watermark_only_covers_a_contiguous_initialized_prefix() {
 
 /// An out-of-range registered index must be rejected before anything is
 /// submitted.
+///
+/// Where the rejection happens moved with the redesign: naming a buffer that
+/// does not exist is now caught when a handle is checked out, before an
+/// operation exists at all. Naming a *range* outside one that does exist is
+/// still caught by the operation.
 #[tokio::test(flavor = "current_thread")]
 async fn out_of_range_registered_indices_are_rejected() {
     use win_ioring::runtime::FileTarget;
@@ -1216,48 +1254,39 @@ async fn out_of_range_registered_indices_are_rejected() {
             std::fs::write(temp.path(), b"data").unwrap();
             let file = win_ioring::file::File::open(temp.path()).unwrap();
 
-            // Nothing registered at all yet.
-            let err = handle
-                .read_into_registered(FileTarget::Owned(&file), 0, 0, 4, 0)
-                .await
-                .expect_err("no registration exists");
-            assert!(matches!(
-                err,
-                win_ioring::Error::InvalidRegisteredIndex { index: 0 }
-            ));
+            let collection = handle.register_buffers(vec![vec![0_u8; 32]]).await.unwrap();
 
-            assert!(handle.register_buffers(vec![vec![0_u8; 32]]).await.is_ok());
-
-            // Index past the end of the registration.
-            let err = handle
-                .read_into_registered(FileTarget::Owned(&file), 5, 0, 4, 0)
-                .await
-                .expect_err("index five does not exist");
+            // Index past the end of the registration, refused at checkout.
             assert!(matches!(
-                err,
+                collection
+                    .check_out(5)
+                    .expect_err("index five does not exist"),
                 win_ioring::Error::InvalidRegisteredIndex { index: 5 }
             ));
 
-            // Offset plus length past the registered extent.
-            let err = handle
-                .read_into_registered(FileTarget::Owned(&file), 0, 30, 8, 0)
+            // Offset plus length past the registered extent, refused by the
+            // operation, with the handle handed straight back.
+            let buffer = collection.check_out(0).unwrap();
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Owned(&file), buffer, 30, 8, 0)
                 .await
-                .expect_err("range exceeds the registered extent");
+                .into_parts();
             assert!(matches!(
-                err,
+                result.expect_err("range exceeds the registered extent"),
                 win_ioring::Error::RegisteredRangeOutOfBounds { .. }
             ));
 
             // A registered file index with no file registration.
-            let err = handle
-                .read_into_registered(FileTarget::Registered { index: 0 }, 0, 0, 4, 0)
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Registered { index: 0 }, buffer, 0, 4, 0)
                 .await
-                .expect_err("no file registration exists");
+                .into_parts();
             assert!(matches!(
-                err,
+                result.expect_err("no file registration exists"),
                 win_ioring::Error::InvalidRegisteredIndex { index: 0 }
             ));
 
+            drop(buffer);
             handle.shutdown();
             driver_task.await.unwrap();
             drop(file);
@@ -1288,17 +1317,23 @@ async fn registered_file_handles_can_target_operations() {
                     .await
                     .is_ok()
             );
-            assert!(handle.register_buffers(vec![vec![0_u8; 64]]).await.is_ok());
+            let collection = handle.register_buffers(vec![vec![0_u8; 64]]).await.unwrap();
 
             // Drop the caller's own reference; the registration keeps it open.
             drop(file);
 
-            let read = handle
-                .read_into_registered(FileTarget::Registered { index: 0 }, 0, 0, 11, 0)
+            let buffer = collection.check_out(0).unwrap();
+            let (result, buffer) = handle
+                .read_registered(FileTarget::Registered { index: 0 }, buffer, 0, 11, 0)
                 .await
-                .unwrap();
-            assert_eq!(read, 11);
+                .into_parts();
+            assert_eq!(result.unwrap(), 11);
+            // Both registrations combined, and the bytes came back readable.
+            // The buffer was registered already fully initialized, so its
+            // prefix spans the whole extent; the read filled its first 11 bytes.
+            assert_eq!(&buffer[..11], b"registered!");
 
+            drop(buffer);
             handle.shutdown();
             driver_task.await.unwrap();
         })

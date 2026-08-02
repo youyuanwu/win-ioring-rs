@@ -94,6 +94,31 @@ pub enum Error {
         extent: u64,
     },
 
+    /// A registered buffer is already checked out.
+    ///
+    /// Only one handle to a given registered buffer may exist at a time, so
+    /// that an operation in flight and the application can never reach the same
+    /// bytes at once. A buffer held by an operation returns when that operation
+    /// reports, which may be later than the point its future was dropped.
+    BufferCheckedOut {
+        /// The index that is already checked out.
+        index: u32,
+    },
+
+    /// The registration this collection came from has been superseded.
+    ///
+    /// Its buffers remain valid for as long as any handle holds them, but the
+    /// collection no longer yields new ones: the indices it names belong to a
+    /// registration the platform is no longer resolving against.
+    RegistrationSuperseded,
+
+    /// A registration request is in flight, so no handle may be checked out.
+    ///
+    /// A registration is adopted when it completes rather than when it is
+    /// requested. A handle taken in between would name a set about to be
+    /// superseded, so checkout is refused for the duration.
+    RegistrationPending,
+
     /// The driver is shutting down and is not accepting new operations.
     ShuttingDown,
 
@@ -255,6 +280,17 @@ impl fmt::Display for Error {
                 "registered buffer {index} range {offset}..{} exceeds its extent of {extent}",
                 offset.saturating_add(*length)
             ),
+            Error::BufferCheckedOut { index } => {
+                write!(f, "registered buffer {index} is already checked out")
+            }
+            Error::RegistrationSuperseded => write!(
+                f,
+                "the registration this collection came from has been superseded"
+            ),
+            Error::RegistrationPending => write!(
+                f,
+                "a registration request is in flight, so no buffer may be checked out"
+            ),
             Error::ShuttingDown => write!(f, "the driver is shutting down"),
             Error::AbandonedAtShutdown => write!(
                 f,
@@ -369,6 +405,9 @@ mod tests {
                 length: 16,
                 extent: 16,
             },
+            Error::BufferCheckedOut { index: 2 },
+            Error::RegistrationSuperseded,
+            Error::RegistrationPending,
             Error::ShuttingDown,
             Error::AbandonedAtShutdown,
             Error::ShutdownStalled { outstanding: 3 },
@@ -400,6 +439,9 @@ mod tests {
             | Error::BufferTooSmall { .. }
             | Error::UninitializedWriteRange { .. }
             | Error::RegisteredRangeOutOfBounds { .. }
+            | Error::BufferCheckedOut { .. }
+            | Error::RegistrationSuperseded
+            | Error::RegistrationPending
             | Error::ShuttingDown
             | Error::AbandonedAtShutdown
             | Error::ShutdownStalled { .. }

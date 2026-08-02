@@ -124,23 +124,88 @@ its driver accumulates submission queue entries and submits them with one
 because an operation that has not been issued yet cannot be batched with one that
 has.
 
-### Registration is a permanent transfer of ownership
+### Registration lends buffers, it does not take them
 
 The platform has no unregister entry point, and gives no signal that it has
-stopped referencing a superseded registration. There is therefore no moment at
-which handing the resources back is provably safe.
+stopped referencing a superseded registration. So the *mapping* is permanent: a
+registration lasts until the ring closes, and registering again supersedes the
+previous set without releasing it.
 
-So a successful registration takes ownership for the life of the ring.
-Registering again supersedes the previous set without returning it; superseded
-sets are retained until the ring closes. `register_files` is the exception to the
-*taking* part: it only needs its own reference to each handle, so it borrows.
+What is **not** permanent is the application's access to the buffers. An earlier
+design moved them into the driver and addressed them by a bare `u32`, with a
+registered read resolving to a transfer count — so nothing could ever read what
+arrived. That made the crate's principal optimisation unusable for real work, and
+it was found by trying to benchmark it: the registered path would have measured
+well precisely because it delivered less than what it was compared against.
 
-Registered buffers carry an **initialization watermark** alongside their extent.
-A read may target the whole extent, but a write is bounded by the watermark, so
-uninitialized memory is never sent to the kernel. Completing a read raises the
-watermark — but only if the read started at or before it, because a read landing
-past the watermark would otherwise vouch for a gap of genuinely uninitialized
-bytes in front of it.
+Registration now follows the model `tokio-uring` established. A successful
+registration yields a **collection**; the application checks a buffer out of it
+and receives a handle that dereferences to the bytes, satisfies the buffer
+contract so it flows through operations and comes back the same way, and returns
+itself on drop. `register_files` is unchanged: it only needs its own reference to
+each handle, so it borrows.
+
+**INV-REG-ONE-HANDLE.** At most one handle to a buffer exists at a time, so an
+operation in flight and the application can never reach the same bytes. Enforced
+by ownership rather than documentation: an operation takes the handle by value,
+so the application cannot name it until it comes back. A `compile_fail`
+doc-test asserts it.
+
+**INV-REG-NO-STALE-HANDLE.** A handle names a buffer by index, and the platform
+resolves that index against whatever registration the ring currently holds — so a
+handle outliving its own registration silently addresses different memory. Five
+guards close every route there, and only all five together suffice:
+
+1. re-registering is refused while any handle is checked out;
+2. checkout is refused while a registration request is in flight, because a
+   registration is adopted when it *completes*, not when it is requested;
+3. a collection retained across a successful re-registration stops yielding;
+4. checkout is refused once the driver is gone or shutting down;
+5. a second registration request is refused while one is in flight.
+
+Route 5 is the one that is easy to miss. Two requests may be in flight at once;
+the first adopts, a handle is taken from it, and the second retires that
+registration underneath the handle — and no per-registration flag can see it,
+because the registration the handle came from did not exist when the second
+request was made. That is why the lock-out lives on the driver, and why the
+registry holds a `Weak` back to it and asks. Weak, because a strong reference
+from a leaked handle would make the driver unreachable but alive, silently
+disabling the abort that catches a ring left open.
+
+The in-flight flag is scoped to *buffer* registrations on both set and clear.
+`register_files` shares the payload field, the slab and the future, so a
+variant-blind clear would let a file registration completing first reopen the
+window.
+
+**INV-REG-LIVES-LONGEST.** A registration's memory has three claimants — the
+driver, an outstanding handle, and the platform — and outlives whichever ends
+last. It is shared by `Rc`, so a handle held across ring closure still addresses
+live memory, and a superseded set is retained until the ring closes because the
+platform may still hold pointers into it.
+
+**INV-REG-DRIVER-BOUND.** An operation checks by pointer identity that a handle
+belongs to *this* driver's current registration. Nothing else would catch a
+handle from another driver: registrations are per-driver, and an index alone
+cannot distinguish them.
+
+**INV-REG-LOCK-ORDER.** Checkout takes the driver borrow and then the registry's;
+nothing takes them the other way. `Drop for RegisteredBuf` touches only the
+registry, never the driver, because it can run while the driver is mutably
+borrowed — during completion reaping, or teardown.
+
+Registered buffers carry an **initialized prefix** alongside their extent. A read
+may target the whole extent, but a write is bounded by the prefix, so
+uninitialized memory is never sent to the kernel. A completed transfer extends
+the prefix — but only if it started at or before it, because one landing further
+on would vouch for a gap of genuinely uninitialized bytes in front. The count is
+maintained by the driver on completion whether or not a future is waiting, and a
+handle caches a read-through copy so the buffer-contract methods take no borrow.
+
+Two behaviours are accepted rather than prevented, recorded so they are not later
+filed as defects. A registration whose future is dropped before it completes is
+still adopted, but its collection is discarded — leaving a registration nothing
+can check out of. And a leaked handle blocks re-registration for the life of the
+ring; there is no reclamation path and none is offered.
 
 ### Shutdown drains to quiescence
 

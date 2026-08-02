@@ -77,43 +77,53 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     drop(output);
     writeln!(out, "on disk: {:?}", std::fs::read(sink.path()).unwrap()).unwrap();
 
-    // Registered buffers, including the initialization watermark rule.
+    // Registered buffers, including the initialized-prefix rule and reading the
+    // result back through the handle — the whole point of checking one out.
     let registered = File::open(source.path()).unwrap();
     let buffers: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
-    writeln!(
-        out,
-        "register_buffers: {:?}",
-        matches!(handle.register_buffers(buffers).await, Registered::Ok)
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "write_from_registered before init: {:?}",
-        handle
-            .write_from_registered(FileTarget::Owned(&registered), 0, 0, 4, 0)
-            .await
-            .err()
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "read_into_registered: {:?}",
-        handle
-            .read_into_registered(FileTarget::Owned(&registered), 0, 0, 8, 0)
-            .await
-    )
-    .unwrap();
+    let collection = match handle.register_buffers(buffers).await {
+        Registered::Ok(collection) => {
+            writeln!(out, "register_buffers: true").unwrap();
+            collection
+        }
+        Registered::Failed(e, _) => {
+            writeln!(out, "register_buffers failed: {e:?}").unwrap();
+            return out;
+        }
+    };
 
-    // An out-of-range registered index is refused without reaching the kernel.
+    // An index the registration does not contain is refused at checkout, before
+    // any operation exists.
     writeln!(
         out,
         "bad registered index: {:?}",
-        handle
-            .read_into_registered(FileTarget::Owned(&registered), 9, 0, 4, 0)
-            .await
-            .err()
+        collection.check_out(9).err()
     )
     .unwrap();
+
+    let buffer = collection.check_out(0).unwrap();
+    // Nothing has been written into it yet, so a write may source nothing.
+    let (result, buffer) = handle
+        .write_registered(FileTarget::Owned(&registered), buffer, 0, 4, 0)
+        .await
+        .into_parts();
+    writeln!(out, "write_registered before init: {:?}", result.err()).unwrap();
+
+    let (result, buffer) = handle
+        .read_registered(FileTarget::Owned(&registered), buffer, 0, 8, 0)
+        .await
+        .into_parts();
+    writeln!(out, "read_registered: {result:?}").unwrap();
+    writeln!(out, "registered bytes: {:?}", &buffer[..]).unwrap();
+
+    // Now that the read has established an initialized prefix, a write may
+    // source from it.
+    let (result, buffer) = handle
+        .write_registered(FileTarget::Owned(&registered), buffer, 0, 4, 0)
+        .await
+        .into_parts();
+    writeln!(out, "write_registered after init: {:?}", result.is_ok()).unwrap();
+    drop(buffer);
 
     // A read whose identifier is then cancelled after it has already finished:
     // this must be harmless, and must leave the ring usable. Cancelling an

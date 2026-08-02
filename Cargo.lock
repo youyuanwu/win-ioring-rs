@@ -282,6 +282,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "win-ioring-bench"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "win-ioring",
+ "windows",
+]
+
+[[package]]
 name = "win-ioring-tests"
 version = "0.1.0"
 dependencies = [

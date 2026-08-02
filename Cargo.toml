@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/win-ioring", "crates/win-ioring-tests"]
+members = ["crates/win-ioring", "crates/win-ioring-tests", "crates/win-ioring-bench"]
 resolver = "3"
 
 [workspace.package]
