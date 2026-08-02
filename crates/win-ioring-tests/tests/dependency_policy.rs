@@ -30,6 +30,10 @@ const ASYNC_RUNTIMES: &[&str] = &[
 /// The manifest of the crate under test.
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../win-ioring/Cargo.toml");
 
+/// The workspace root manifest, which is where inherited dependencies are
+/// actually declared.
+const WORKSPACE_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+
 /// Collects the names of every dependency in `manifest` that reaches a
 /// consumer.
 ///
@@ -37,31 +41,56 @@ const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../win-ioring/Cargo
 /// crate's own tests, which is why Tokio may appear there. Everything else
 /// counts, including build and target-specific dependencies.
 ///
-/// Both the key and any `package` rename are collected, because
-/// `not_tokio = { package = "tokio" }` is a dependency on Tokio however it is
-/// spelled at the use site.
-fn dependency_names(manifest: &Table) -> Vec<String> {
-    fn extend(names: &mut Vec<String>, table: Option<&Value>) {
+/// Three spellings all have to resolve to the same crate:
+///
+/// - `tokio = "1"`, the plain form;
+/// - `not_tokio = { package = "tokio" }`, renamed at the use site;
+/// - `not_tokio.workspace = true` paired with a `package` rename in the
+///   workspace manifest, which is the form this repository actually uses.
+///
+/// The last is why `workspace` is passed in: without it an inherited dependency
+/// would be collected under its local alias alone, and the policy could be
+/// evaded by renaming it once in the workspace manifest.
+fn dependency_names(manifest: &Table, workspace: &Table) -> Vec<String> {
+    /// The `[workspace.dependencies]` table, if there is one.
+    fn workspace_dependencies(workspace: &Table) -> Option<&Value> {
+        workspace.get("workspace")?.get("dependencies")
+    }
+
+    let inherited = workspace_dependencies(workspace);
+
+    let mut names = Vec::new();
+    let mut extend = |table: Option<&Value>| {
         let Some(Value::Table(t)) = table else {
             return;
         };
         for (key, spec) in t {
             names.push(key.clone());
+
+            // A rename declared here.
             if let Some(Value::String(renamed)) = spec.get("package") {
                 names.push(renamed.clone());
             }
-        }
-    }
 
-    let mut names = Vec::new();
-    extend(&mut names, manifest.get("dependencies"));
-    extend(&mut names, manifest.get("build-dependencies"));
+            // A rename declared in the workspace and inherited here.
+            if spec.get("workspace") == Some(&Value::Boolean(true))
+                && let Some(Value::String(renamed)) = inherited
+                    .and_then(|d| d.get(key))
+                    .and_then(|d| d.get("package"))
+            {
+                names.push(renamed.clone());
+            }
+        }
+    };
+
+    extend(manifest.get("dependencies"));
+    extend(manifest.get("build-dependencies"));
 
     // `[target.<cfg>.dependencies]` and its build counterpart.
     if let Some(Value::Table(targets)) = manifest.get("target") {
         for spec in targets.values() {
-            extend(&mut names, spec.get("dependencies"));
-            extend(&mut names, spec.get("build-dependencies"));
+            extend(spec.get("dependencies"));
+            extend(spec.get("build-dependencies"));
         }
     }
 
@@ -70,18 +99,26 @@ fn dependency_names(manifest: &Table) -> Vec<String> {
     names
 }
 
-/// Parses the manifest of the crate under test.
-fn crate_manifest() -> Table {
-    std::fs::read_to_string(MANIFEST)
-        .expect("the crate under test must have a manifest")
+/// Parses a manifest.
+fn parse_manifest(path: &str) -> Table {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{path} must be readable: {e}"))
         .parse()
-        .expect("the manifest must be valid TOML")
+        .unwrap_or_else(|e| panic!("{path} must be valid TOML: {e}"))
+}
+
+/// The dependency names the crate under test actually takes on.
+fn crate_dependency_names() -> Vec<String> {
+    dependency_names(
+        &parse_manifest(MANIFEST),
+        &parse_manifest(WORKSPACE_MANIFEST),
+    )
 }
 
 /// SC-005: no async runtime appears among the crate's dependencies.
 #[test]
 fn the_crate_declares_no_async_runtime_dependency() {
-    let declared = dependency_names(&crate_manifest());
+    let declared = crate_dependency_names();
 
     // Guard against the parse silently returning nothing, which would make the
     // assertion below pass without checking anything.
@@ -109,9 +146,7 @@ fn dev_dependencies_are_excluded() {
         "this test assumes the crate has Tokio as a dev-dependency"
     );
     assert!(
-        !dependency_names(&crate_manifest())
-            .iter()
-            .any(|d| d == "tokio"),
+        !crate_dependency_names().iter().any(|d| d == "tokio"),
         "dev-dependencies leaked into the collected set"
     );
 }
@@ -127,6 +162,8 @@ fn the_collector_sees_every_dependency_form() {
 [dependencies]
 plain = "1"
 renamed = { package = "the-real-name", version = "1" }
+inherited.workspace = true
+inherited-and-renamed.workspace = true
 
 [dependencies.as-its-own-table]
 version = "1"
@@ -144,15 +181,29 @@ only-for-tests = "1"
     .parse()
     .unwrap();
 
+    // The rename lives in the workspace manifest, not the crate's, which is the
+    // form this repository uses and the one that evaded an earlier version of
+    // this collector.
+    let workspace: Table = r#"
+[workspace.dependencies]
+inherited = "1"
+inherited-and-renamed = { package = "the-real-inherited-name", version = "1" }
+"#
+    .parse()
+    .unwrap();
+
     assert_eq!(
-        dependency_names(&manifest),
+        dependency_names(&manifest, &workspace),
         vec![
             "as-its-own-table",
             "at-build-time",
+            "inherited",
+            "inherited-and-renamed",
             "plain",
             "renamed",
             "target-renamed",
             "target-specific",
+            "the-real-inherited-name",
             "the-real-name",
             "the-real-target-name",
         ],
