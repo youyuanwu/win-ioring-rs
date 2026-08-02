@@ -1,8 +1,16 @@
 //! SC-005: the crate under test must not depend on an async runtime.
 //!
 //! "Runtime agnostic" is a claim about the dependency graph as much as about
-//! the API, and a dependency can be added without any test noticing. This
-//! reads the manifest so that adding one breaks the build.
+//! the API, and a dependency can be added without any test noticing. This reads
+//! the manifest so that adding one breaks the build.
+//!
+//! The manifest is parsed as TOML rather than scanned for text, because Cargo
+//! accepts several forms a naive scan would miss: `[dependencies.tokio]` as its
+//! own table, and `[target.'cfg(windows)'.dependencies]` for target-specific
+//! dependencies. Each would violate the claim just as surely as an entry under
+//! `[dependencies]`.
+
+use toml::{Table, Value};
 
 /// Runtimes the crate must not pull in.
 ///
@@ -11,7 +19,6 @@
 const ASYNC_RUNTIMES: &[&str] = &[
     "tokio",
     "async-std",
-    "async_std",
     "smol",
     "compio",
     "monoio",
@@ -20,70 +27,118 @@ const ASYNC_RUNTIMES: &[&str] = &[
     "async-global-executor",
 ];
 
-/// Returns the `[dependencies]` section of the crate's manifest.
-///
-/// A crude section split is enough here and avoids a TOML parser dependency:
-/// the assertion is about `[dependencies]` alone, since `[dev-dependencies]`
-/// legitimately contains Tokio for the crate's own tests.
-fn runtime_dependencies_section() -> String {
-    let manifest = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../win-ioring/Cargo.toml"
-    ))
-    .expect("the crate under test must have a manifest");
+/// The manifest of the crate under test.
+const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../win-ioring/Cargo.toml");
 
-    let mut section = String::new();
-    let mut in_dependencies = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dependencies = trimmed == "[dependencies]";
-            continue;
-        }
-        if in_dependencies {
-            section.push_str(line);
-            section.push('\n');
+/// Collects the names of every dependency in `manifest` that reaches a
+/// consumer.
+///
+/// `[dev-dependencies]` is deliberately excluded: those exist only for the
+/// crate's own tests, which is why Tokio may appear there. Everything else
+/// counts, including build and target-specific dependencies.
+fn dependency_names(manifest: &Table) -> Vec<String> {
+    fn extend(names: &mut Vec<String>, table: Option<&Value>) {
+        if let Some(Value::Table(t)) = table {
+            names.extend(t.keys().cloned());
         }
     }
-    section
+
+    let mut names = Vec::new();
+    extend(&mut names, manifest.get("dependencies"));
+    extend(&mut names, manifest.get("build-dependencies"));
+
+    // `[target.<cfg>.dependencies]` and its build counterpart.
+    if let Some(Value::Table(targets)) = manifest.get("target") {
+        for spec in targets.values() {
+            extend(&mut names, spec.get("dependencies"));
+            extend(&mut names, spec.get("build-dependencies"));
+        }
+    }
+
+    names.sort();
+    names
 }
 
-/// SC-005: no async runtime appears under `[dependencies]`.
+/// Parses the manifest of the crate under test.
+fn crate_manifest() -> Table {
+    std::fs::read_to_string(MANIFEST)
+        .expect("the crate under test must have a manifest")
+        .parse()
+        .expect("the manifest must be valid TOML")
+}
+
+/// SC-005: no async runtime appears among the crate's dependencies.
 #[test]
 fn the_crate_declares_no_async_runtime_dependency() {
-    let section = runtime_dependencies_section();
+    let declared = dependency_names(&crate_manifest());
 
-    // Guard against the section parser silently returning nothing, which would
-    // make every assertion below pass without checking anything.
+    // Guard against the parse silently returning nothing, which would make the
+    // assertion below pass without checking anything.
     assert!(
-        section.contains("windows"),
-        "the dependencies section was not found; parsed:\n{section}"
+        declared.iter().any(|d| d == "windows"),
+        "no dependencies were found; the manifest parse is wrong: {declared:?}"
     );
 
     for runtime in ASYNC_RUNTIMES {
         assert!(
-            !section.contains(runtime),
-            "`{runtime}` appears under [dependencies]; the crate must stay runtime agnostic:\n{section}"
+            !declared.iter().any(|d| d == runtime),
+            "`{runtime}` is a dependency of the crate, which must stay runtime \
+             agnostic; declared: {declared:?}"
         );
     }
 }
 
-/// The parser must actually distinguish the two sections, or the test above
-/// would pass even with Tokio promoted to a real dependency.
+/// Dev-dependencies must be excluded, or the assertion above would fail on the
+/// crate's own Tokio-based tests.
 #[test]
-fn the_manifest_parser_excludes_dev_dependencies() {
-    let manifest = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../win-ioring/Cargo.toml"
-    ))
-    .unwrap();
-
+fn dev_dependencies_are_excluded() {
+    let manifest = std::fs::read_to_string(MANIFEST).unwrap();
     assert!(
         manifest.contains("[dev-dependencies]") && manifest.contains("tokio"),
         "this test assumes the crate has Tokio as a dev-dependency"
     );
     assert!(
-        !runtime_dependencies_section().contains("tokio"),
-        "the parser leaked [dev-dependencies] into the [dependencies] section"
+        !dependency_names(&crate_manifest())
+            .iter()
+            .any(|d| d == "tokio"),
+        "dev-dependencies leaked into the collected set"
+    );
+}
+
+/// The collector must see every form Cargo accepts.
+///
+/// Without this, the policy test could quietly stop working the day someone
+/// writes a dependency as its own table or scopes it to a target — which is
+/// exactly how the first version of this test could have been bypassed.
+#[test]
+fn the_collector_sees_table_and_target_dependency_forms() {
+    let manifest: Table = r#"
+[dependencies]
+plain = "1"
+
+[dependencies.as-its-own-table]
+version = "1"
+
+[target.'cfg(windows)'.dependencies]
+target-specific = "1"
+
+[build-dependencies]
+at-build-time = "1"
+
+[dev-dependencies]
+only-for-tests = "1"
+"#
+    .parse()
+    .unwrap();
+
+    assert_eq!(
+        dependency_names(&manifest),
+        vec![
+            "as-its-own-table",
+            "at-build-time",
+            "plain",
+            "target-specific"
+        ],
+        "the collector missed a dependency form, or picked up a dev-dependency"
     );
 }
