@@ -2,6 +2,7 @@
 //! exercise the `win-ioring` crate. Nothing here is io_ring specific.
 
 pub mod rt;
+pub mod temp;
 
 #[allow(dead_code)]
 mod sched;

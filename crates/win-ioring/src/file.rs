@@ -13,18 +13,40 @@
 //! was dropped. Raw handles remain available through [`crate::io_ring`], which
 //! is unsafe and documents the obligation.
 
+use std::cell::Cell;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::FILE_FLUSH_MODE;
+
+use crate::buf::{IoBuf, IoBufMut};
+use crate::error::Error;
+use crate::io_ring::ops::SqeFlags;
+use crate::runtime::{FlushFuture, Handle, OperationId, Outcome, ReadFuture, WriteFuture};
 
 /// State shared between a [`File`] and any operations naming it.
 ///
-/// Phase 5 extends this with the sequential cursor and its outstanding-operation
-/// flag; for now it owns the handle.
+/// The cursor and the outstanding-operation flag live here rather than in
+/// [`File`] because the driver must be able to clear the flag on terminal
+/// completion, which can happen long after the caller dropped both the future
+/// and its `File`.
 #[derive(Debug)]
 pub struct FileState {
     handle: OwnedHandle,
+    /// Where the next sequential operation starts.
+    cursor: Cell<u64>,
+    /// Whether a sequential operation is outstanding in the kernel.
+    ///
+    /// Exclusive access to the `File` is not enough on its own: dropping a
+    /// sequential operation's future releases that access while the kernel is
+    /// still working, so a second operation could otherwise start against a
+    /// cursor position the first is about to consume.
+    sequential_outstanding: Cell<bool>,
 }
 
 impl FileState {
@@ -34,6 +56,37 @@ impl FileState {
     /// reference count guarantees.
     pub fn raw_handle(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
+    }
+
+    /// Marks a sequential operation as no longer outstanding.
+    pub(crate) fn clear_sequential(&self) {
+        self.sequential_outstanding.set(false);
+    }
+}
+
+/// Clears a file's outstanding-sequential flag when the operation ends.
+///
+/// The driver keeps this in the operation's payload, so the flag clears on
+/// terminal completion whether or not the future survived to see it. If the
+/// driver has to abandon its payloads, the flag stays set, which is correct: an
+/// operation the kernel may still be running must not be joined by another.
+#[derive(Debug)]
+pub(crate) struct SequentialGuard(Rc<FileState>);
+
+impl SequentialGuard {
+    /// Claims the sequential slot, or reports that it is already taken.
+    pub(crate) fn claim(state: &Rc<FileState>) -> Option<Self> {
+        if state.sequential_outstanding.replace(true) {
+            None
+        } else {
+            Some(Self(Rc::clone(state)))
+        }
+    }
+}
+
+impl Drop for SequentialGuard {
+    fn drop(&mut self) {
+        self.0.clear_sequential();
     }
 }
 
@@ -54,6 +107,8 @@ impl File {
         Self {
             state: Rc::new(FileState {
                 handle: OwnedHandle::from(file),
+                cursor: Cell::new(0),
+                sequential_outstanding: Cell::new(false),
             }),
         }
     }
@@ -78,6 +133,8 @@ impl File {
         Self {
             state: Rc::new(FileState {
                 handle: unsafe { OwnedHandle::from_raw_handle(handle.0) },
+                cursor: Cell::new(0),
+                sequential_outstanding: Cell::new(false),
             }),
         }
     }
@@ -103,6 +160,198 @@ impl File {
     /// still tracking.
     pub fn reference_count(&self) -> usize {
         Rc::strong_count(&self.state)
+    }
+
+    /// Returns where the next sequential operation will start.
+    pub fn cursor(&self) -> u64 {
+        self.state.cursor.get()
+    }
+
+    /// Moves the cursor.
+    ///
+    /// This takes exclusive access, so it cannot race a sequential operation's
+    /// own future. It can still be called while an operation dropped mid-flight
+    /// is outstanding; that operation will not advance the cursor when it
+    /// completes, so the position set here is the one that stands.
+    pub fn set_cursor(&mut self, position: u64) {
+        self.state.cursor.set(position);
+    }
+
+    /// Reports whether a sequential operation is still outstanding.
+    ///
+    /// This can be true while no future is alive, if a sequential operation's
+    /// future was dropped before its operation completed. Sequential operations
+    /// are refused until it clears.
+    pub fn sequential_outstanding(&self) -> bool {
+        self.state.sequential_outstanding.get()
+    }
+
+    /// Reads `len` bytes at `offset` into `buffer`, without touching the cursor.
+    ///
+    /// Positional operations need only shared access, so any number of them may
+    /// be in flight against the same file at once.
+    pub fn read_at<B: IoBufMut>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> ReadFuture<B> {
+        handle.read(self, buffer, len, offset)
+    }
+
+    /// Writes `len` bytes from `buffer` at `offset`, without touching the
+    /// cursor.
+    pub fn write_at<B: IoBuf>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> WriteFuture<B> {
+        handle.write(self, buffer, len, offset)
+    }
+
+    /// Reads `len` bytes from the cursor into `buffer`, advancing the cursor.
+    ///
+    /// Exclusive access stops two sequential futures existing at once. It does
+    /// not stop a *dropped* future's operation from still being outstanding, so
+    /// this also fails with [`Error::OperationOutstanding`] until that one
+    /// completes.
+    ///
+    /// The cursor advances by exactly the number of bytes transferred, and only
+    /// when this future observes the completion: dropping it leaves the cursor
+    /// where it was.
+    pub fn read<'a, B: IoBufMut>(
+        &'a mut self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+    ) -> SequentialRead<'a, B> {
+        let offset = self.state.cursor.get();
+        let guard = match SequentialGuard::claim(&self.state) {
+            Some(guard) => guard,
+            None => {
+                return SequentialRead {
+                    inner: ReadFuture::failed(Error::OperationOutstanding, buffer),
+                    state: Rc::clone(&self.state),
+                    _file: PhantomData,
+                };
+            }
+        };
+        SequentialRead {
+            inner: handle.read_sequential(self, buffer, len, offset, guard),
+            state: Rc::clone(&self.state),
+            _file: PhantomData,
+        }
+    }
+
+    /// Writes `len` bytes from `buffer` at the cursor, advancing the cursor.
+    ///
+    /// The same exclusivity and cursor rules apply as for [`File::read`].
+    pub fn write<'a, B: IoBuf>(
+        &'a mut self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+    ) -> SequentialWrite<'a, B> {
+        let offset = self.state.cursor.get();
+        let guard = match SequentialGuard::claim(&self.state) {
+            Some(guard) => guard,
+            None => {
+                return SequentialWrite {
+                    inner: WriteFuture::failed(Error::OperationOutstanding, buffer),
+                    state: Rc::clone(&self.state),
+                    _file: PhantomData,
+                };
+            }
+        };
+        SequentialWrite {
+            inner: handle.write_sequential(self, buffer, len, offset, guard),
+            state: Rc::clone(&self.state),
+            _file: PhantomData,
+        }
+    }
+
+    /// Flushes the file, using the platform's default flush mode.
+    pub fn flush(&self, handle: &Handle) -> FlushFuture {
+        handle.flush(self)
+    }
+
+    /// Flushes the file with an explicit flush mode.
+    pub fn flush_with_mode(&self, handle: &Handle, mode: FILE_FLUSH_MODE) -> FlushFuture {
+        handle.flush_with_options(self, mode, SqeFlags::NONE)
+    }
+}
+
+/// A sequential read in progress.
+///
+/// Borrows the file exclusively, so a second sequential operation cannot be
+/// started while this exists.
+pub struct SequentialRead<'a, B: IoBufMut> {
+    inner: ReadFuture<B>,
+    state: Rc<FileState>,
+    _file: PhantomData<&'a mut File>,
+}
+
+impl<B: IoBufMut> SequentialRead<'_, B> {
+    /// Returns this operation's identifier, for cancellation.
+    ///
+    /// Absent if the operation was rejected before reaching the kernel.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBufMut> Future for SequentialRead<'_, B> {
+    type Output = Outcome<u32, B>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        advance_on_success(&self.state, &outcome);
+        Poll::Ready(outcome)
+    }
+}
+
+/// A sequential write in progress.
+///
+/// Borrows the file exclusively, as [`SequentialRead`] does.
+pub struct SequentialWrite<'a, B: IoBuf> {
+    inner: WriteFuture<B>,
+    state: Rc<FileState>,
+    _file: PhantomData<&'a mut File>,
+}
+
+impl<B: IoBuf> SequentialWrite<'_, B> {
+    /// Returns this operation's identifier, for cancellation.
+    ///
+    /// Absent if the operation was rejected before reaching the kernel.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBuf> Future for SequentialWrite<'_, B> {
+    type Output = Outcome<u32, B>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        advance_on_success(&self.state, &outcome);
+        Poll::Ready(outcome)
+    }
+}
+
+/// Advances the cursor by the bytes a completed sequential operation moved.
+///
+/// A failure transfers nothing, so it leaves the cursor alone. So does a
+/// zero-byte transfer, trivially.
+fn advance_on_success<B>(state: &FileState, outcome: &Outcome<u32, B>) {
+    if let Outcome::Completed(result) = outcome
+        && let Ok(transferred) = &result.result
+    {
+        state
+            .cursor
+            .set(state.cursor.get().saturating_add(u64::from(*transferred)));
     }
 }
 

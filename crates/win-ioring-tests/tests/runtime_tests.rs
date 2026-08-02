@@ -1,6 +1,7 @@
 use win_ioring::io_ring::IoRing;
 use win_ioring::runtime::Driver;
 use win_ioring_tests::README_PATH;
+use win_ioring_tests::temp::{TempFile, temp_path};
 
 /// The same read, driven by Tokio's local executor.
 #[tokio::test(flavor = "current_thread")]
@@ -501,16 +502,6 @@ async fn dropping_the_driver_resolves_surviving_futures() {
         .await;
 }
 
-fn temp_path(tag: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "win-ioring-rt-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    p
-}
-
 /// Write, flush, then read back through the safe API.
 #[tokio::test(flavor = "current_thread")]
 async fn write_flush_read_round_trip() {
@@ -773,24 +764,6 @@ async fn dropping_writes_in_flight_is_safe() {
             let _ = std::fs::remove_file(&path);
         })
         .await;
-}
-
-/// Removes a temporary file even if the test panics.
-struct TempFile(std::path::PathBuf);
-
-impl TempFile {
-    fn new(tag: &str) -> Self {
-        Self(temp_path(tag))
-    }
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 /// SC-009: a completed read must report exactly the bytes transferred, and a

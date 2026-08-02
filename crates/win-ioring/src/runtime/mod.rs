@@ -40,7 +40,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::buf::{BufResult, IoBuf, IoBufMut, check_read_capacity, check_write_initialized};
 use crate::error::{Error, Result};
-use crate::file::{File, FileState};
+use crate::file::{File, FileState, SequentialGuard};
 use crate::io_ring::IoRing;
 use crate::io_ring::ops::{ReadOp, SqeFlags};
 use crate::sys::AsyncEvent;
@@ -178,6 +178,9 @@ struct OpPayload {
     /// Held here rather than in the awaiting future so that dropping that
     /// future cannot free memory the platform still references.
     pending_registration: Option<PendingRegistration>,
+    /// Clears the file's outstanding-sequential flag when this payload is
+    /// dropped, which is exactly at terminal completion.
+    _sequential: Option<SequentialGuard>,
 }
 
 /// A registration that has been built but whose completion has not arrived.
@@ -1066,7 +1069,7 @@ impl Handle {
         offset: u64,
         sqe_flags: SqeFlags,
     ) -> ReadFuture<B> {
-        match self.try_read(file, buffer, len, offset, sqe_flags) {
+        match self.try_read(file, buffer, len, offset, sqe_flags, None) {
             Ok(fut) => fut,
             Err((error, buffer)) => ReadFuture::failed(error, buffer),
         }
@@ -1080,6 +1083,7 @@ impl Handle {
         len: u32,
         offset: u64,
         sqe_flags: SqeFlags,
+        sequential: Option<SequentialGuard>,
     ) -> std::result::Result<ReadFuture<B>, (Error, B)> {
         {
             let inner = self.strong.borrow();
@@ -1104,6 +1108,7 @@ impl Handle {
             registered_buffer: None,
             uses_registered_file: false,
             pending_registration: None,
+            _sequential: sequential,
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
@@ -1193,7 +1198,17 @@ impl Handle {
         flags: FILE_WRITE_FLAGS,
         sqe_flags: SqeFlags,
     ) -> WriteFuture<B> {
-        match self.try_write(file, buffer, len, offset, flags, sqe_flags) {
+        match self.try_write(
+            file,
+            buffer,
+            len,
+            offset,
+            WriteOptions {
+                flags,
+                sqe_flags,
+                sequential: None,
+            },
+        ) {
             Ok(fut) => fut,
             Err((error, buffer)) => WriteFuture::failed(error, buffer),
         }
@@ -1205,9 +1220,13 @@ impl Handle {
         buffer: B,
         len: u32,
         offset: u64,
-        flags: FILE_WRITE_FLAGS,
-        sqe_flags: SqeFlags,
+        options: WriteOptions,
     ) -> std::result::Result<WriteFuture<B>, (Error, B)> {
+        let WriteOptions {
+            flags,
+            sqe_flags,
+            sequential,
+        } = options;
         {
             let inner = self.strong.borrow();
             if inner.shutting_down {
@@ -1234,6 +1253,7 @@ impl Handle {
             registered_buffer: None,
             uses_registered_file: false,
             pending_registration: None,
+            _sequential: sequential,
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
@@ -1289,6 +1309,50 @@ impl Handle {
         })
     }
 
+    /// Reads on behalf of [`File::read`], carrying the sequential guard.
+    ///
+    /// The guard travels in the operation's payload so the file's outstanding
+    /// flag clears at terminal completion rather than when the future is
+    /// dropped.
+    pub(crate) fn read_sequential<B: IoBufMut>(
+        &self,
+        file: &File,
+        buffer: B,
+        len: u32,
+        offset: u64,
+        guard: SequentialGuard,
+    ) -> ReadFuture<B> {
+        match self.try_read(file, buffer, len, offset, SqeFlags::NONE, Some(guard)) {
+            Ok(fut) => fut,
+            Err((error, buffer)) => ReadFuture::failed(error, buffer),
+        }
+    }
+
+    /// Writes on behalf of [`File::write`], carrying the sequential guard.
+    pub(crate) fn write_sequential<B: IoBuf>(
+        &self,
+        file: &File,
+        buffer: B,
+        len: u32,
+        offset: u64,
+        guard: SequentialGuard,
+    ) -> WriteFuture<B> {
+        match self.try_write(
+            file,
+            buffer,
+            len,
+            offset,
+            WriteOptions {
+                flags: FILE_WRITE_FLAGS_NONE,
+                sqe_flags: SqeFlags::NONE,
+                sequential: Some(guard),
+            },
+        ) {
+            Ok(fut) => fut,
+            Err((error, buffer)) => WriteFuture::failed(error, buffer),
+        }
+    }
+
     /// Flushes `file`, using the platform's default flush mode.
     pub fn flush(&self, file: &File) -> FlushFuture {
         self.flush_with_options(file, FILE_FLUSH_DEFAULT, SqeFlags::NONE)
@@ -1335,6 +1399,7 @@ impl Handle {
             registered_buffer: None,
             uses_registered_file: false,
             pending_registration: None,
+            _sequential: None,
         });
         let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
 
@@ -1467,6 +1532,7 @@ impl Handle {
                 watermarks,
                 descriptors,
             }),
+            _sequential: None,
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
@@ -1556,6 +1622,7 @@ impl Handle {
             registered_buffer: None,
             uses_registered_file: false,
             pending_registration: Some(PendingRegistration::Files { files: states }),
+            _sequential: None,
         });
         let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
 
@@ -1683,6 +1750,7 @@ impl Handle {
             )),
             uses_registered_file,
             pending_registration: None,
+            _sequential: None,
         });
         let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
 
@@ -1816,6 +1884,18 @@ fn unbox_pending<B: 'static>(pending: Option<PendingRegistration>) -> Vec<B> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// What varies between the write entry points, kept together so `try_write`
+/// does not grow an unreadable argument list.
+struct WriteOptions {
+    /// Platform write flags, such as write-through.
+    flags: FILE_WRITE_FLAGS,
+    /// Submission queue entry flags, such as draining preceding operations.
+    sqe_flags: SqeFlags,
+    /// Present only for a sequential write, whose file must be told when the
+    /// operation ends.
+    sequential: Option<SequentialGuard>,
 }
 
 /// A registration in progress.
@@ -2004,7 +2084,7 @@ enum BufOpState<B> {
 }
 
 impl<B: IoBufMut> ReadFuture<B> {
-    fn failed(error: Error, buffer: B) -> Self {
+    pub(crate) fn failed(error: Error, buffer: B) -> Self {
         Self {
             state: BufOpState::Failed(Some((error, buffer))),
         }
@@ -2064,7 +2144,7 @@ impl<B: IoBufMut> Future for ReadFuture<B> {
 }
 
 impl<B: IoBuf> WriteFuture<B> {
-    fn failed(error: Error, buffer: B) -> Self {
+    pub(crate) fn failed(error: Error, buffer: B) -> Self {
         // A rejected write never reaches the driver, so it needs no token. The
         // shared machinery is only for operations that did.
         Self {
