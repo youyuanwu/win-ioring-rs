@@ -7,8 +7,16 @@ publish = false
 
 [dependencies]
 futures.workspace = true
+# The shared executor-equivalence scenario lives in this crate's library so both
+# executors can run the same code, and it needs the crate under test.
+win-ioring.workspace = true
 
 [dev-dependencies]
-win-ioring.workspace = true
 tokio.workspace = true
 windows.workspace = true
+# Used by the dependency-policy test, which must understand every form Cargo
+# accepts for declaring a dependency rather than pattern-matching the manifest.
+toml.workspace = true
+
+[lints]
+workspace = true

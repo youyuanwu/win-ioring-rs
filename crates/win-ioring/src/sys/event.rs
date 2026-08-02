@@ -1,11 +1,11 @@
-use futures::FutureExt;
-use futures::channel::oneshot;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    CreateEventW, INFINITE, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWait,
+    CreateEventW, INFINITE, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWaitEx,
     WT_EXECUTEONLYONCE, WaitForSingleObject,
 };
 
@@ -21,6 +21,8 @@ impl AsyncEvent {
     /// Creates a new auto-reset event in the non-signaled state.
     /// Auto-reset events automatically return to non-signaled state after one waiter is released.
     pub fn new() -> windows::core::Result<Self> {
+        // SAFETY: all arguments are plain values. The handle is owned by the
+        // `AsyncEvent` built from it and closed exactly once, on drop.
         let handle = unsafe { CreateEventW(None, false, false, None)? };
         Ok(Self { handle })
     }
@@ -28,18 +30,21 @@ impl AsyncEvent {
     /// Creates a new manual-reset event in the non-signaled state.
     /// Manual-reset events remain signaled until explicitly reset, allowing multiple waiters to be released.
     pub fn new_manual_reset() -> windows::core::Result<Self> {
+        // SAFETY: as for `new`, but asking for a manual-reset event.
         let handle = unsafe { CreateEventW(None, true, false, None)? };
         Ok(Self { handle })
     }
 
     /// Signals the event, allowing waiting tasks to complete.
     pub fn signal(&self) -> windows::core::Result<()> {
+        // SAFETY: `self.handle` is open for as long as `self` is alive.
         unsafe { SetEvent(self.handle) }
     }
 
     /// Resets the event to the non-signaled state, allowing it to be reused.
     /// After calling reset(), new calls to wait() will block until signal() is called again.
     pub fn reset(&self) -> windows::core::Result<()> {
+        // SAFETY: `self.handle` is open for as long as `self` is alive.
         unsafe { ResetEvent(self.handle) }
     }
 
@@ -60,6 +65,8 @@ impl AsyncEvent {
     /// * `Err(windows::core::Error)` if the wait failed or timed out
     pub fn wait_sync(&self, timeout_ms: Option<u32>) -> windows::core::Result<()> {
         let timeout = timeout_ms.unwrap_or(INFINITE);
+        // SAFETY: `self.handle` is open for as long as `self` is alive, and the
+        // timeout is a plain value.
         unsafe {
             match WaitForSingleObject(self.handle, timeout) {
                 WAIT_OBJECT_0 => Ok(()),
@@ -75,125 +82,215 @@ impl AsyncEvent {
         self.wait_sync(None)
     }
 
+    /// Returns the raw event handle.
+    ///
+    /// Used to hand the event to the platform, which signals it when a
+    /// completion is queued. The handle is owned by this event and closed with
+    /// it, so the caller must not close it.
     pub fn handle(&self) -> HANDLE {
         self.handle
     }
 }
 
-pub struct EventWaitFuture<'a> {
-    event: &'a AsyncEvent,
-    state: EventWaitState,
+/// State shared between a waiting future and the thread pool callback that
+/// signals it.
+///
+/// The callback runs on an operating system thread pool thread, so this must be
+/// thread-safe even though the driver that ultimately consumes the wakeup is
+/// single-threaded. Waking across threads is exactly what makes the crate
+/// runtime-agnostic: the executor's own waker does the hand-off.
+struct WaitShared {
+    state: Mutex<WaitState>,
+    /// Set by the callback just before it returns.
+    ///
+    /// Read only after `UnregisterWaitEx` has confirmed no callback can still
+    /// be running, at which point it says definitively whether the callback
+    /// consumed the reference count that was handed to the operating system.
+    callback_ran: AtomicBool,
 }
 
-enum EventWaitState {
-    NotStarted,
-    Waiting {
-        wait_handle: HANDLE,
-        receiver: oneshot::Receiver<()>,
-    },
-    Completed,
+enum WaitState {
+    Waiting(Option<Waker>),
+    Signalled,
+}
+
+/// A live registration with the thread pool.
+struct Registration {
+    wait_handle: HANDLE,
+    shared: Arc<WaitShared>,
+    /// The reference count handed to the operating system, reclaimed on drop if
+    /// the callback never ran.
+    raw: *const WaitShared,
+}
+
+/// Waits for an [`AsyncEvent`] to become signalled.
+///
+/// The wait is registered with the operating system thread pool rather than
+/// occupying a thread, and completion is delivered through the task's waker, so
+/// this works under any executor.
+pub struct EventWaitFuture<'a> {
+    event: &'a AsyncEvent,
+    registration: Option<Registration>,
 }
 
 impl<'a> EventWaitFuture<'a> {
     fn new(event: &'a AsyncEvent) -> Self {
         Self {
             event,
-            state: EventWaitState::NotStarted,
+            registration: None,
         }
     }
 }
 
-impl<'a> Future for EventWaitFuture<'a> {
-    type Output = windows::core::Result<()>;
+impl Future for EventWaitFuture<'_> {
+    type Output = crate::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            EventWaitState::NotStarted => {
-                let (sender, receiver) = oneshot::channel();
+        let this = &mut *self;
 
-                // Box the sender so we can pass it to the callback
-                let sender_ptr = Box::into_raw(Box::new(sender));
+        if this.registration.is_none() {
+            let shared = Arc::new(WaitShared {
+                state: Mutex::new(WaitState::Waiting(Some(cx.waker().clone()))),
+                callback_ran: AtomicBool::new(false),
+            });
 
-                // Register the wait callback
-                let mut wait_handle = HANDLE::default();
-                let result = unsafe {
-                    RegisterWaitForSingleObject(
-                        &mut wait_handle,
-                        self.event.handle,
-                        Some(wait_callback),
-                        Some(sender_ptr as *const std::ffi::c_void),
-                        INFINITE,
-                        WT_EXECUTEONLYONCE,
-                    )
-                };
+            // Hand one reference count to the operating system. The callback
+            // reclaims it; if the callback never runs, `Drop` does.
+            let raw = Arc::into_raw(Arc::clone(&shared));
 
-                match result {
-                    Ok(_) => {
-                        self.state = EventWaitState::Waiting {
-                            wait_handle,
-                            receiver,
-                        };
-                        // Continue to poll the receiver
-                        self.poll(cx)
-                    }
-                    Err(e) => {
-                        // Clean up the sender if registration failed
-                        unsafe {
-                            drop(Box::from_raw(sender_ptr));
-                        }
-                        Poll::Ready(Err(e))
-                    }
-                }
+            let mut wait_handle = HANDLE::default();
+            // SAFETY: `wait_handle` is a local the call fills in, the event handle
+            // outlives the registration because the future holds the event, and `raw`
+            // is a reference count deliberately handed to the operating system for the
+            // callback to reclaim.
+            let result = unsafe {
+                RegisterWaitForSingleObject(
+                    &mut wait_handle,
+                    this.event.handle,
+                    Some(wait_callback),
+                    Some(raw as *const std::ffi::c_void),
+                    INFINITE,
+                    WT_EXECUTEONLYONCE,
+                )
+            };
+
+            if let Err(e) = result {
+                // Registration failed, so the callback will never run and the
+                // reference count we handed over must come back here.
+                // SAFETY: registration failed, so the callback will never run and never
+                // reclaim `raw`. This is the only place that count can come back, and it
+                // is taken exactly once because the early return follows.
+                unsafe { drop(Arc::from_raw(raw)) };
+                return Poll::Ready(Err(e.into()));
             }
-            EventWaitState::Waiting {
+
+            this.registration = Some(Registration {
                 wait_handle,
-                receiver,
-            } => {
-                match receiver.poll_unpin(cx) {
-                    Poll::Ready(Ok(())) => {
-                        // Unregister the wait
-                        let _ = unsafe { UnregisterWait(*wait_handle) };
-                        self.state = EventWaitState::Completed;
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Err(_)) => {
-                        // Channel was dropped, this shouldn't happen
-                        let _ = unsafe { UnregisterWait(*wait_handle) };
-                        panic!("Receiver was dropped before completion");
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
+                shared,
+                raw,
+            });
+        }
+
+        let registration = this.registration.as_ref().expect("just registered");
+        let mut state = registration
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &mut *state {
+            WaitState::Signalled => Poll::Ready(Ok(())),
+            WaitState::Waiting(slot) => {
+                // Refresh the waker: the future may have been polled by a
+                // different task than the one that registered it.
+                *slot = Some(cx.waker().clone());
+                Poll::Pending
             }
-            EventWaitState::Completed => Poll::Ready(Ok(())),
         }
     }
 }
 
-// Callback function called by Windows thread pool
-unsafe extern "system" fn wait_callback(
-    context: *mut std::ffi::c_void,
-    _timer_or_wait_fired: bool,
-) {
-    if !context.is_null() {
-        // Convert back to sender and send completion signal
-        let sender: Box<oneshot::Sender<()>> =
-            unsafe { Box::from_raw(context as *mut oneshot::Sender<()>) };
-        let _ = sender.send(());
-    }
-}
-
-impl<'a> Drop for EventWaitFuture<'a> {
+impl Drop for EventWaitFuture<'_> {
     fn drop(&mut self) {
-        if let EventWaitState::Waiting { wait_handle, .. } = &self.state {
-            // Unregister the wait if we're dropped while waiting
-            let _ = unsafe { UnregisterWait(*wait_handle) };
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+
+        if registration.shared.callback_ran.load(Ordering::Acquire) {
+            // The callback has already run, so it consumed the reference count
+            // and there is nothing to reclaim. Checking this *first* also
+            // avoids a self-deadlock: an executor may wake a task inline from
+            // the callback, and that task may drop this future, so blocking
+            // below would be waiting for the very callback we are inside.
+            // SAFETY: `wait_handle` came from a successful registration and has not
+            // been unregistered yet.
+            let _ = unsafe { UnregisterWaitEx(registration.wait_handle, None) };
+            return;
         }
+
+        // `INVALID_HANDLE_VALUE` asks the operating system to wait until every
+        // callback for this registration has finished. Without it the flag read
+        // below would be a guess rather than an answer.
+        // SAFETY: as above. `INVALID_HANDLE_VALUE` blocks until every callback for
+        // this registration has finished, which is what makes the flag read below
+        // an answer rather than a guess.
+        let _ = unsafe { UnregisterWaitEx(registration.wait_handle, Some(INVALID_HANDLE_VALUE)) };
+
+        if !registration.shared.callback_ran.load(Ordering::Acquire) {
+            // The callback never ran and never will, so the reference count
+            // handed to the operating system is ours to reclaim. Failing to do
+            // this leaks the shared state on every cancelled wait.
+            // SAFETY: the callback never ran and, after the blocking unregister above,
+            // never will, so this reference count is ours to reclaim. It is taken
+            // exactly once, since the wait is unregistered.
+            unsafe { drop(Arc::from_raw(registration.raw)) };
+        }
+    }
+}
+
+/// Invoked by the operating system thread pool when the event is signalled.
+///
+/// # Safety
+///
+/// `context` must be the pointer produced by `Arc::into_raw` when the wait was
+/// registered, and this function must be called at most once for it, which
+/// `WT_EXECUTEONLYONCE` guarantees.
+unsafe extern "system" fn wait_callback(context: *mut std::ffi::c_void, _timer_fired: bool) {
+    if context.is_null() {
+        return;
+    }
+    // Take back the reference count that was handed to the operating system.
+    // SAFETY: `context` is the pointer handed to `RegisterWaitForSingleObject`,
+    // and the operating system calls back at most once per registration, so
+    // this count is reclaimed exactly once.
+    let shared = unsafe { Arc::from_raw(context as *const WaitShared) };
+
+    let waker = {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let waker = match &mut *state {
+            WaitState::Waiting(slot) => slot.take(),
+            WaitState::Signalled => None,
+        };
+        *state = WaitState::Signalled;
+        waker
+    };
+
+    // Publish before returning, so that a concurrent `Drop` which has just
+    // waited for this callback sees that the reference count was consumed.
+    shared.callback_ran.store(true, Ordering::Release);
+
+    // Wake outside the lock: the executor may poll the future immediately, and
+    // that poll takes the same lock.
+    drop(shared);
+    if let Some(waker) = waker {
+        waker.wake();
     }
 }
 
 // RAII wrapper for Windows Event handles
 impl Drop for AsyncEvent {
     fn drop(&mut self) {
+        // SAFETY: `self.handle` is open and owned by this event, and `self` is
+        // being dropped, so it cannot be closed again.
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.handle);
         }
@@ -437,5 +534,64 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Polls a wait once so it registers with the thread pool, then abandons
+    /// it. The future is dropped at the end of this call, not the pin.
+    fn register_then_abandon(event: &AsyncEvent) {
+        let fut = event.wait();
+        futures::pin_mut!(fut);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        // `fut` goes out of scope here, dropping the future itself.
+    }
+
+    /// A wait abandoned before the event fires must reclaim the reference count
+    /// it handed to the operating system. Previously every cancelled wait
+    /// leaked its shared state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_waits_do_not_leak() {
+        let event = AsyncEvent::new().unwrap();
+        for _ in 0..2000 {
+            register_then_abandon(&event);
+        }
+
+        // The event still works afterwards.
+        event.signal().unwrap();
+        timeout(Duration::from_millis(500), event.wait())
+            .await
+            .expect("wait timed out")
+            .unwrap();
+    }
+
+    /// Abandoning a wait at the moment the event fires exercises the race
+    /// between the thread pool callback and `UnregisterWaitEx`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_wait_while_it_fires_is_safe() {
+        for _ in 0..500 {
+            let event = AsyncEvent::new().unwrap();
+            {
+                let fut = event.wait();
+                futures::pin_mut!(fut);
+                let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                assert!(fut.as_mut().poll(&mut cx).is_pending());
+                // Signal while the wait is still registered, so the callback
+                // may be running concurrently with the drop below.
+                event.signal().unwrap();
+            }
+        }
+    }
+
+    /// A wait that is abandoned and replaced must still observe the signal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replacement_wait_still_sees_the_signal() {
+        let event = AsyncEvent::new_manual_reset().unwrap();
+        register_then_abandon(&event);
+
+        event.signal().unwrap();
+        timeout(Duration::from_millis(500), event.wait())
+            .await
+            .expect("replacement wait timed out")
+            .unwrap();
     }
 }
