@@ -77,6 +77,9 @@ pub struct RegistryInner {
     pointers: Vec<*mut u8>,
     /// Per-buffer bookkeeping.
     slots: RefCell<Vec<Slot>>,
+    /// The descriptor array handed to the platform, kept at a stable address for
+    /// as long as the registration can be reached.
+    _descriptors: Box<[crate::io_ring::BufferInfo]>,
 }
 
 impl std::fmt::Debug for RegistryInner {
@@ -89,10 +92,6 @@ impl std::fmt::Debug for RegistryInner {
 }
 
 impl RegistryInner {
-    // The driver wires these up when it gains handle-based operations; until
-    // then only this module's tests reach them.
-    #![allow(dead_code)]
-
     /// Builds a registration from its parts.
     ///
     /// `pointers` must be the addresses recorded in the descriptors handed to
@@ -102,6 +101,7 @@ impl RegistryInner {
         pointers: Vec<*mut u8>,
         extents: Vec<usize>,
         initialized: Vec<usize>,
+        descriptors: Box<[crate::io_ring::BufferInfo]>,
     ) -> Rc<Self> {
         debug_assert_eq!(buffers.len(), pointers.len());
         debug_assert_eq!(buffers.len(), extents.len());
@@ -119,6 +119,7 @@ impl RegistryInner {
             _buffers: buffers,
             pointers,
             slots: RefCell::new(slots),
+            _descriptors: descriptors,
         })
     }
 
@@ -220,16 +221,13 @@ pub struct RegisteredBuffers {
 }
 
 impl RegisteredBuffers {
-    // As on `RegistryInner`: the driver's side of this arrives with
-    // handle-based operations.
-    #![allow(dead_code)]
-
     /// Wraps a registration.
     pub(crate) fn from_inner(inner: Rc<RegistryInner>) -> Self {
         Self { inner }
     }
 
-    /// Returns the shared registration, for the driver's own bookkeeping.
+    /// Returns the shared registration, for this module's own tests.
+    #[cfg(test)]
     pub(crate) fn inner(&self) -> &Rc<RegistryInner> {
         &self.inner
     }
@@ -288,10 +286,6 @@ pub struct RegisteredBuf {
 }
 
 impl RegisteredBuf {
-    // `registry` and `refresh` exist for the driver, which reaches them once
-    // operations can carry a handle.
-    #![allow(dead_code)]
-
     /// Returns the index this buffer occupies in its registration.
     pub fn index(&self) -> u32 {
         self.index
@@ -458,7 +452,13 @@ mod tests {
             initialized.push(0);
             buffers.push(boxed);
         }
-        RegisteredBuffers::from_inner(RegistryInner::new(buffers, pointers, extents, initialized))
+        RegisteredBuffers::from_inner(RegistryInner::new(
+            buffers,
+            pointers,
+            extents,
+            initialized,
+            Vec::new().into_boxed_slice(),
+        ))
     }
 
     #[test]
