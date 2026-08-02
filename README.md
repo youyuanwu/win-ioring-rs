@@ -117,6 +117,13 @@ does no lifetime tracking; every method that hands work to the kernel is
 `unsafe` and documents what you must guarantee. Reach for it when you want the
 platform's semantics exactly, and take on the obligations yourself.
 
+## Contributing
+
+[`docs/`](docs/) covers the architecture and the reasoning behind it, the
+platform behaviours this crate was built around — several of which are
+undocumented and unintuitive — the verification approach, and the list of known
+limitations and deferred work.
+
 ## License
 
 This project is licensed under the MIT license.
