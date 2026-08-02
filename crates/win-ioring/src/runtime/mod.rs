@@ -2267,7 +2267,11 @@ mod tests {
     }
 
     fn readme() -> File {
-        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap()
+        File::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/sample.txt"
+        ))
+        .unwrap()
     }
 
     /// FR-038: filling the submission queue must produce a distinct, matchable

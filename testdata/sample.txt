@@ -1,0 +1,15 @@
+Sample data for the win-ioring test suite.
+
+This file exists so the tests have a fixture of stable, known length that
+nothing else in the repository is free to rewrite. They previously read
+README.md, which coupled every read test to the project's documentation: a
+rewrite of the README would silently change what the tests were reading, and a
+short README would break the tests that read a fixed number of bytes.
+
+Do not shorten this file below 512 bytes, and prefer appending to editing, so
+that offsets used by existing tests keep pointing at the same bytes.
+
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor
+jugs. How vexingly quick daft zebras jump. Sphinx of black quartz, judge my vow.
+The five boxing wizards jump quickly. Jackdaws love my big sphinx of quartz.
+Bright vixens jump; dozy fowl quack. Waltz, nymph, for quick jigs vex Bud.

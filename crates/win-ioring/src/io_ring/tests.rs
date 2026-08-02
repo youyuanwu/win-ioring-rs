@@ -3,7 +3,7 @@ use std::{cell::RefCell, fs::File, rc::Rc};
 use crate::io_ring::{BufferInfo, IoRing, ops::ReadOp};
 use crate::sys::AsyncEvent;
 
-const README_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md");
+const SAMPLE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/sample.txt");
 
 #[test]
 fn readme_test() {
@@ -14,7 +14,7 @@ fn readme_test() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(SAMPLE_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
@@ -59,7 +59,7 @@ fn readme_register_test() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(SAMPLE_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
@@ -113,7 +113,7 @@ async fn readme_test_async() {
     println!("ring created");
 
     // open file from std
-    let file = crate::file::File::from_std(File::open(README_PATH).expect("cannot open"));
+    let file = crate::file::File::from_std(File::open(SAMPLE_PATH).expect("cannot open"));
     let raw_handle = file.as_raw_handle(); // TODO: fix ownership
     println!("file opened");
 
@@ -623,7 +623,7 @@ fn full_submission_queue_reports_queue_full() {
     ring.set_io_ring_completion_event(event.handle()).unwrap();
     let capacity = ring.info().unwrap().submission_queue_size;
 
-    let file = crate::file::File::from_std(File::open(README_PATH).unwrap());
+    let file = crate::file::File::from_std(File::open(SAMPLE_PATH).unwrap());
     let mut buffer = vec![0_u8; 16];
 
     let mut queue_full = None;

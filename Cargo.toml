@@ -22,3 +22,10 @@ features = [
     "Win32_Security",
     "Win32_System_Threading",
 ]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+missing_safety_doc = "deny"

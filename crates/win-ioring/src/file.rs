@@ -132,6 +132,8 @@ impl File {
     pub unsafe fn from_raw_handle(handle: HANDLE) -> Self {
         Self {
             state: Rc::new(FileState {
+                // SAFETY: the caller guarantees `handle` is open and owned by
+                // nothing else, so this `OwnedHandle` becomes its sole owner.
                 handle: unsafe { OwnedHandle::from_raw_handle(handle.0) },
                 cursor: Cell::new(0),
                 sequential_outstanding: Cell::new(false),

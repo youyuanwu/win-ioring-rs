@@ -1,6 +1,6 @@
 use win_ioring::io_ring::IoRing;
 use win_ioring::runtime::Driver;
-use win_ioring_tests::README_PATH;
+use win_ioring_tests::SAMPLE_PATH;
 use win_ioring_tests::temp::{TempFile, temp_path};
 
 /// The same read, driven by Tokio's local executor.
@@ -17,7 +17,7 @@ async fn tokio_read_round_trip() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let (read, buffer) = handle
                 .read(&file, vec![0_u8; 64], 20, 0)
                 .await
@@ -50,7 +50,7 @@ fn custom_runtime_read_round_trip() {
             driver.drive().await;
         });
 
-        let file = win_ioring::file::File::open(README_PATH).unwrap();
+        let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
         let (read, buffer) = handle
             .read(&file, vec![0_u8; 64], 20, 0)
             .await
@@ -80,7 +80,7 @@ async fn dropping_reads_in_flight_is_safe() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             for _ in 0..100 {
                 let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
                 drop(fut);
@@ -121,7 +121,7 @@ async fn rejected_reads_return_the_buffer() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
 
             // Asking for more than the buffer can hold is rejected locally.
             let outcome = handle.read(&file, vec![0_u8; 4], 64, 0).await;
@@ -154,7 +154,7 @@ async fn submitting_after_shutdown_errors() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             handle.shutdown();
             driver_task.await.unwrap();
 
@@ -182,7 +182,7 @@ async fn a_read_keeps_its_file_alive() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
 
             // The driver holds a reference for the duration of the operation.
@@ -218,11 +218,11 @@ async fn inline_array_buffers_reach_the_kernel_correctly() {
             });
 
             let expected = {
-                let all = std::fs::read(README_PATH).unwrap();
+                let all = std::fs::read(SAMPLE_PATH).unwrap();
                 all[..20].to_vec()
             };
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let (read, buffer) = handle
                 .read(&file, [0_u8; 64], 20, 0)
                 .await
@@ -267,7 +267,7 @@ async fn dropping_in_flight_reads_repeatedly_is_safe() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
 
             for _ in 0..200 {
                 let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
@@ -310,7 +310,7 @@ async fn dropping_an_in_flight_read_does_not_block() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
             // Yield once so the operation has a chance to reach the kernel.
             // Whether it is still outstanding by the time we drop is genuinely
@@ -351,7 +351,7 @@ async fn explicit_cancellation_still_yields_a_terminal_result() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
             let id = fut.operation_id().expect("read was submitted");
 
@@ -388,7 +388,7 @@ async fn cancelling_a_finished_operation_is_harmless() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
             let id = fut.operation_id().expect("read was submitted");
 
@@ -428,7 +428,7 @@ async fn shutdown_with_work_in_flight_settles() {
                 driver.drive().await;
             });
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let futures: Vec<_> = (0..8)
                 .map(|_| handle.read(&file, vec![0_u8; 128], 64, 0))
                 .collect();
@@ -477,7 +477,7 @@ async fn dropping_the_driver_resolves_surviving_futures() {
             let driver = Driver::new(ring).unwrap();
             let handle = driver.handle();
 
-            let file = win_ioring::file::File::open(README_PATH).unwrap();
+            let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
             let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
 
             // No driver task was ever spawned, so nothing has been reaped. Drop

@@ -1,10 +1,11 @@
-//! Safe and unsafe Rust bindings for the Windows IoRing API.
-//!
-//! # Platform requirement
-//!
-//! IoRing requires Windows 11 or Windows Server 2022 or later. The platform
-//! entry points are statically imported, so a binary linking this crate will
-//! fail to load on an older host rather than reporting a runtime error.
+#![deny(missing_docs)]
+// Every unsafe block in shipped code must say why it is sound. Test code is
+// exempt: its unsafe blocks exist to set up or probe the very invariants under
+// test, and are read alongside the assertion they serve.
+#![cfg_attr(not(test), deny(clippy::undocumented_unsafe_blocks))]
+// The README is the crate's front page. Including it here means its example is
+// compiled as a doc-test, so the first code a reader sees cannot rot.
+#![doc = include_str!("../../../README.md")]
 //!
 //! # Compile-time guarantees
 //!
@@ -162,6 +163,11 @@ pub mod buf;
 pub mod error;
 pub mod file;
 pub mod io_ring;
+
+/// Thin wrappers over the Windows primitives the crate needs.
+///
+/// Exposed because the raw layer in [`io_ring`] needs a completion event, and a
+/// caller driving the ring by hand needs to be able to make one.
 pub mod sys;
 
 pub mod runtime;

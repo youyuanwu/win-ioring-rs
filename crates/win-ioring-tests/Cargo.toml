@@ -17,3 +17,6 @@ windows.workspace = true
 # Used by the dependency-policy test, which must understand every form Cargo
 # accepts for declaring a dependency rather than pattern-matching the manifest.
 toml.workspace = true
+
+[lints]
+workspace = true

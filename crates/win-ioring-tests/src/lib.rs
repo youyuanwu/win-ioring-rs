@@ -8,8 +8,12 @@ pub mod temp;
 #[allow(dead_code)]
 mod sched;
 
-/// Path to the workspace README, used as sample data by the tests.
-pub const README_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md");
+/// Path to the sample data the read tests use.
+///
+/// A purpose-built fixture rather than the README, so that documentation
+/// changes cannot alter what the tests read or shorten it below what they
+/// expect.
+pub const SAMPLE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/sample.txt");
 
 /// Yields until the driver has nothing outstanding.
 ///
