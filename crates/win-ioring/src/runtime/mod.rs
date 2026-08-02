@@ -400,13 +400,18 @@ struct DriverInner {
     /// the retry path cannot be exercised without injecting one.
     #[cfg(test)]
     fail_next_submits: u32,
-    /// Test seam: skip the quiescence drain at teardown.
+    /// Test seam: withhold this many rounds of completion reaping.
     ///
-    /// A ring that refuses to settle cannot be produced on demand, so the
-    /// retain-and-leak path needs injecting too. Replaced in a later phase by a
-    /// counted withhold-reaping seam.
+    /// Produces a driver that refuses to *observe* completions, so an operation
+    /// stays outstanding for a known number of drain steps. That is what makes
+    /// "the buffer was not released before its operation reported" observable at
+    /// all.
+    ///
+    /// Counted rather than a flag on purpose: the drain is unbounded, so a seam
+    /// that withheld reaping unconditionally would produce a test that hangs
+    /// forever instead of failing — a CI timeout rather than an assertion.
     #[cfg(test)]
-    force_unquiet_teardown: bool,
+    withhold_reaps: u32,
     /// Test seam: build the next buffer registration with no descriptors.
     ///
     /// The platform accepts a zero-*extent* descriptor but rejects a
@@ -660,8 +665,10 @@ impl DriverInner {
         }
         .build();
         let Ok(op) = op else {
-            // Nothing was queued, so retire the bookkeeping we just took.
-            self.slab.complete_cancel(cancel_token);
+            // Nothing was queued, so withdraw the bookkeeping we just took.
+            // Recorded as never-enqueued rather than completed, so a later
+            // attempt — the drain's, in particular — can try again.
+            self.slab.cancel_request_not_enqueued(cancel_token);
             return;
         };
 
@@ -681,9 +688,12 @@ impl DriverInner {
             // Failing to enqueue a cancellation is explicitly not an error: the
             // target simply runs to completion. Undo the bookkeeping so the
             // target's slot is not left waiting for a completion that will
-            // never arrive.
+            // never arrive — and record it as never-enqueued rather than
+            // completed, so the drain can request it again. Without that, one
+            // refused request would silently make the operation permanently
+            // uncancellable, turning an immediate shutdown into a graceful one.
             self.cancel_holds.retain(|(t, _)| *t != cancel_token);
-            self.slab.complete_cancel(cancel_token);
+            self.slab.cancel_request_not_enqueued(cancel_token);
             return;
         }
 
@@ -701,6 +711,11 @@ impl DriverInner {
     #[must_use = "the returned wakers must be woken after releasing the borrow"]
     fn reap_completions(&mut self) -> Vec<Waker> {
         let mut wakers = Vec::new();
+        #[cfg(test)]
+        if self.withhold_reaps > 0 {
+            self.withhold_reaps -= 1;
+            return wakers;
+        }
         loop {
             let cqe = match self.ring.pop_completion() {
                 Ok(Some(cqe)) => cqe,
@@ -778,99 +793,199 @@ impl DriverInner {
         }
     }
 
-    /// Closes the ring, releasing what is safe to release and leaking the rest.
+    /// Performs one bounded unit of teardown work.
     ///
-    /// Returns the wakers of any futures left waiting, for the caller to wake
-    /// after releasing its borrow.
+    /// Returns the wakers of any futures resolved along the way, for the caller
+    /// to wake after releasing its borrow, together with what the step
+    /// established. Splitting teardown into steps is what lets the caller wake
+    /// futures, deliver reports, and re-read the shutdown mode between them —
+    /// none of which can happen while this borrow is held.
     #[must_use = "the returned wakers must be woken after releasing the borrow"]
-    fn teardown(&mut self) -> Vec<Waker> {
-        if self.torn_down {
-            return Vec::new();
-        }
+    fn drain_step(&mut self) -> (Vec<Waker>, StepOutcome) {
         self.teardown_started = true;
-        // A teardown nobody requested is an abrupt one: there is no longer
-        // anyone to observe the results, so waiting for work to finish on its
-        // own would be waiting for nothing.
-        self.shutdown = self.shutdown.max(ShutdownMode::Immediate);
 
-        // Try to reach quiescence before deciding anything. Each round hands
-        // any queued entries to the kernel and then waits, briefly, for the
-        // outstanding operations to report. The wait is bounded so shutdown
-        // cannot hang; if the ring will not settle within it, quiescence is
-        // deemed unestablished and the leak path below runs.
-        let mut wakers = self.reap_completions();
-        #[cfg(test)]
-        let drain_rounds = if self.force_unquiet_teardown {
-            0
-        } else {
-            DRAIN_ROUNDS
-        };
-        #[cfg(not(test))]
-        let drain_rounds = DRAIN_ROUNDS;
+        // Slots that never reached the queue hold nothing the platform can
+        // touch, so they can be resolved here and now. Believed unreachable in
+        // practice — every insert is followed by a build or a cleanup within the
+        // same borrow — but the drain must not depend on that, because such a
+        // slot would otherwise be counted as outstanding forever.
+        let mut wakers = self.resolve_unqueued();
 
-        for _ in 0..drain_rounds {
-            if self.slab.outstanding() == 0 {
-                break;
+        // Hand over anything queued but not yet taken. One attempt per step: a
+        // retry loop here would spin under this borrow and starve the reporting
+        // that a stalled drain depends on.
+        self.submit_pending();
+
+        if self.shutdown >= ShutdownMode::Immediate {
+            // Ask the platform to abandon everything it currently holds.
+            // Requests that fail to enqueue are recorded as never-requested, so
+            // the next step tries them again.
+            for token in self.slab.submitted_uncancelled() {
+                self.issue_cancel(token);
             }
-            self.submit_pending();
-            let waiting = self.slab.outstanding();
-            // Submitting with a wait count blocks until that many completions
-            // are available or the timeout expires, which is how the driver
-            // waits without a timer of its own.
-            let _ = self.ring.submit(waiting, DRAIN_TIMEOUT_MS);
-            wakers.extend(self.reap_completions());
         }
+
+        // Never issue a waiting submission while a queue entry is still
+        // unaccepted. `SubmitIoRing` submits *and* waits in one call, and the
+        // wrapper discards its submitted-entry count on error — so a waiting
+        // call that times out could hand entries to the kernel while leaving
+        // them still marked unsubmitted. Residue detection would then conclude
+        // the kernel held nothing and release buffers it is writing into.
+        let built = self.slab.built().len();
+        if built == 0 {
+            let waiting = self.slab.outstanding();
+            if waiting > 0 {
+                // A wait count blocks until that many completions are available
+                // or the timeout expires, which is how the driver waits without
+                // a timer of its own. A timeout is reported as an error and is
+                // normal progress, not a failure.
+                let _ = self.ring.submit(waiting, DRAIN_TIMEOUT_MS);
+            }
+        }
+
+        wakers.extend(self.reap_completions());
 
         if self.slab.outstanding() == 0 {
-            let _ = self.ring.close();
-            drop(self.slab.drain());
-            self.cancel_holds.clear();
-            // The ring is closed and nothing is outstanding, so the kernel can
-            // no longer reach any registered resource: these are safe to free.
-            self.buffer_registration = None;
-            self.retired_buffer_registrations.clear();
-            self.file_registration = None;
-            self.retired_file_registrations.clear();
-            self.torn_down = true;
-            return wakers;
+            return (wakers, StepOutcome::Quiescent);
         }
 
-        // Work is still outstanding and quiescence cannot be established.
-        // Record the outcome for every waiting future *before* abandoning the
-        // buffers: the payloads hold the wakers, so leaking first would hang
-        // those futures forever rather than reporting to them.
-        self.slab.for_each_payload(|payload| {
-            if let Some(payload) = payload.downcast_mut::<OpPayload>() {
-                let mut slot = payload.slot.borrow_mut();
-                slot.retained = true;
-                if let Some(waker) = slot.waker.take() {
-                    wakers.push(waker);
-                }
+        // Nothing the platform accepted remains, yet entries are still queued
+        // and submission keeps failing. Those entries were never seen by the
+        // kernel, so closing the ring discards them and their buffers were never
+        // exposed. This is the only case in which abandoning a queue entry is
+        // sound, and it is bounded so it cannot be reached by a merely slow ring.
+        if self.slab.awaiting_kernel() == 0 && self.submit_failures >= RESIDUE_ATTEMPTS {
+            return (wakers, StepOutcome::UnsubmittableResidue);
+        }
+
+        (wakers, StepOutcome::Progressing)
+    }
+
+    /// Resolves slots that hold no queue entry, returning their buffers.
+    #[must_use = "the returned wakers must be woken after releasing the borrow"]
+    fn resolve_unqueued(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        for token in self.slab.described() {
+            if let Some(payload) = self.slab.complete(token) {
+                wakers.extend(resolve_abandoned(payload));
             }
-        });
-
-        let _ = self.ring.close();
-        self.slab.leak();
-        // The handles these hold may still be reachable by the kernel, so they
-        // are abandoned along with the buffers rather than closed.
-        for (_, file) in self.cancel_holds.drain(..) {
-            std::mem::forget(file);
         }
-        // Registered resources are reachable by the kernel for as long as the
-        // ring lives, and this ring could not be quiesced, so they must be
-        // abandoned too rather than freed with the driver.
-        std::mem::forget(self.buffer_registration.take());
-        std::mem::forget(std::mem::take(&mut self.retired_buffer_registrations));
-        std::mem::forget(self.file_registration.take());
-        std::mem::forget(std::mem::take(&mut self.retired_file_registrations));
+        wakers
+    }
 
+    /// Closes the ring and releases everything it was keeping alive.
+    ///
+    /// Only ever called once nothing the platform accepted remains outstanding.
+    /// Aborts if the ring cannot be closed: while it is open the kernel may
+    /// still reach these resources, so releasing them would be a use-after-free
+    /// and keeping them would leak with no prospect of recovery.
+    #[must_use = "the returned wakers must be woken after releasing the borrow"]
+    fn close_and_release(&mut self) -> Vec<Waker> {
+        let mut attempts = 0;
+        while self.ring.close().is_err() {
+            attempts += 1;
+            if attempts >= CLOSE_ATTEMPTS {
+                // Not recoverable in either direction. Aborting is the only
+                // option that is not a use-after-free.
+                abort_with("the I/O ring could not be closed at shutdown");
+            }
+        }
+
+        // The ring is closed, so nothing here is reachable by the kernel any
+        // more. Any payload still present belongs to a queue entry the platform
+        // never accepted; its future is owed a result and its buffer back.
+        let mut wakers = Vec::new();
+        for payload in self.slab.drain() {
+            wakers.extend(resolve_abandoned(payload));
+        }
+        self.cancel_holds.clear();
+        self.buffer_registration = None;
+        self.retired_buffer_registrations.clear();
+        self.file_registration = None;
+        self.retired_file_registrations.clear();
         self.torn_down = true;
         wakers
     }
+
+    /// Reports a drain that is taking an unusual number of steps.
+    ///
+    /// A drain is unbounded by design, so a stalled one would otherwise be
+    /// indistinguishable from a hang. Throttled the same way persistent
+    /// submission failures are, so a long shutdown does not flood the observer.
+    fn report_slow_drain(&mut self, steps: u32) {
+        if steps < SLOW_DRAIN_STEPS || !steps.is_multiple_of(SLOW_DRAIN_INTERVAL) {
+            return;
+        }
+        let outstanding = self.slab.outstanding();
+        if outstanding == 0 {
+            return;
+        }
+        self.deferred_reports
+            .push(Error::ShutdownStalled { outstanding });
+    }
 }
 
-/// How many rounds of draining to attempt before declaring the ring unquiet.
-const DRAIN_ROUNDS: u32 = 4;
+impl Drop for DriverInner {
+    fn drop(&mut self) {
+        // A backstop, not a routine path: `Driver` holds a strong reference, so
+        // this can only run after `Drop for Driver` has already torn down. If it
+        // ever runs with the ring still open, the kernel may still reach the
+        // buffers, file handles and registrations about to be freed — so ending
+        // the process is the only option that is not a use-after-free.
+        //
+        // Deliberately not also requiring work to be outstanding: registrations
+        // stay reachable by the kernel until the ring closes, so an open ring is
+        // unsafe to release from even with nothing in flight.
+        if !self.torn_down {
+            abort_with("the driver was destroyed while the I/O ring was still open");
+        }
+    }
+}
+
+/// After how many drain steps a shutdown is considered slow enough to report.
+const SLOW_DRAIN_STEPS: u32 = 8;
+
+/// How often to repeat the report once a drain is considered slow.
+const SLOW_DRAIN_INTERVAL: u32 = 8;
+
+/// Resolves a payload the driver ended itself, returning the caller's buffer.
+fn resolve_abandoned(mut payload: Box<dyn Any>) -> Option<Waker> {
+    let payload = payload.downcast_mut::<OpPayload>()?;
+    let buffer = payload.buffer.take();
+    let mut slot = payload.slot.borrow_mut();
+    // The buffer must travel with the result. Resolving without it would leave
+    // the caller's future to panic when it tries to recover it.
+    slot.completed = Some((Err(Error::AbandonedAtShutdown), buffer));
+    slot.waker.take()
+}
+
+/// Ends the process, reporting why.
+///
+/// Reached only where every alternative is worse than stopping: releasing memory
+/// the kernel may still write into, or continuing with a ring that can neither
+/// drain nor close.
+fn abort_with(reason: &str) -> ! {
+    eprintln!("win-ioring: aborting: {reason}");
+    std::process::abort()
+}
+
+/// What one drain step established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepOutcome {
+    /// Nothing is outstanding; the ring can be closed.
+    Quiescent,
+    /// Work remains and the drain should continue.
+    Progressing,
+    /// Only queue entries the platform has repeatedly refused remain. They were
+    /// never accepted, so closing the ring discards them safely.
+    UnsubmittableResidue,
+}
+
+/// How many consecutive submission failures mark a queue entry unsubmittable.
+const RESIDUE_ATTEMPTS: u32 = 8;
+
+/// How many times to retry closing the ring before giving up and aborting.
+const CLOSE_ATTEMPTS: u32 = 3;
 
 /// How long each drain round waits for outstanding operations to report.
 const DRAIN_TIMEOUT_MS: usize = 250;
@@ -979,7 +1094,7 @@ impl Driver {
                 #[cfg(test)]
                 fail_next_submits: 0,
                 #[cfg(test)]
-                force_unquiet_teardown: false,
+                withhold_reaps: 0,
                 #[cfg(test)]
                 fail_next_registration: false,
             })),
@@ -1069,9 +1184,49 @@ impl Driver {
             }
         }
 
+        self.run_teardown_async().await;
+    }
+
+    /// Drains cooperatively, yielding between steps.
+    ///
+    /// Yielding is what keeps a graceful shutdown escalatable. Everything here
+    /// is `!Send`, so `Handle::shutdown_now` can only be called from this very
+    /// thread — a drain that blocked it outright would make escalation
+    /// unreachable, and graceful mode never cancels, so escalation is the only
+    /// way out of a stalled one. The mode is therefore re-read every step.
+    ///
+    /// No unwind guard is needed here. A panic escaping this unwinds out of
+    /// `drive`, the `Driver` is dropped, and `Drop for Driver` re-enters and
+    /// finishes the drain — which works only because re-entry is guarded on
+    /// `torn_down` (finished) rather than on teardown having merely started.
+    async fn run_teardown_async(&self) {
+        let mut steps: u32 = 0;
+        loop {
+            let (wakers, reports, outcome) = {
+                let mut inner = self.inner.borrow_mut();
+                if inner.torn_down {
+                    return;
+                }
+                let (wakers, outcome) = inner.drain_step();
+                steps = steps.saturating_add(1);
+                inner.report_slow_drain(steps);
+                let reports = inner.take_reports();
+                (wakers, reports, outcome)
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            self.flush_reports(reports);
+
+            if outcome != StepOutcome::Progressing {
+                break;
+            }
+            yield_now().await;
+        }
+
         let (wakers, reports) = {
             let mut inner = self.inner.borrow_mut();
-            let wakers = inner.teardown();
+            let wakers = inner.close_and_release();
             let reports = inner.take_reports();
             (wakers, reports)
         };
@@ -1084,11 +1239,46 @@ impl Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        // An abrupt drop gets the same treatment as a requested shutdown: no
-        // memory the kernel might still reach is freed.
+        // A drop nobody asked for is an abrupt one: nothing is left to observe
+        // results, so waiting for work to finish on its own would be waiting for
+        // nothing. Escalate before draining so the drain cancels.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.torn_down {
+                return;
+            }
+            inner.shutdown = inner.shutdown.max(ShutdownMode::Immediate);
+        }
+
+        // Unlike the async loop, this one *does* need an unwind guard. A panic
+        // escaping here starts unwinding at a point where `Drop for Driver` will
+        // not run again, while the remaining fields still drop in declaration
+        // order — including the completion event, whose handle must not close
+        // while the ring can still signal it.
+        let guard = AbortOnUnwind;
+        let mut steps: u32 = 0;
+        loop {
+            let (wakers, reports, outcome) = {
+                let mut inner = self.inner.borrow_mut();
+                let (wakers, outcome) = inner.drain_step();
+                steps = steps.saturating_add(1);
+                inner.report_slow_drain(steps);
+                let reports = inner.take_reports();
+                (wakers, reports, outcome)
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            self.flush_reports(reports);
+
+            if outcome != StepOutcome::Progressing {
+                break;
+            }
+        }
+
         let (wakers, reports) = {
             let mut inner = self.inner.borrow_mut();
-            let wakers = inner.teardown();
+            let wakers = inner.close_and_release();
             let reports = inner.take_reports();
             (wakers, reports)
         };
@@ -1096,6 +1286,20 @@ impl Drop for Driver {
             waker.wake();
         }
         self.flush_reports(reports);
+        std::mem::forget(guard);
+    }
+}
+
+/// Ends the process if dropped while a panic is unwinding.
+///
+/// Used to fence teardown sections that call back into caller code — waking
+/// futures and delivering reports — because unwinding out of a half-finished
+/// teardown would drop the driver's fields while the ring is still open.
+struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+    fn drop(&mut self) {
+        abort_with("a panic escaped teardown while the I/O ring was still open");
     }
 }
 
@@ -2936,10 +3140,106 @@ mod tests {
         handle.shutdown();
     }
 
-    /// FR-020b / SC-030: when the ring will not settle, waiting futures must be
-    /// told their buffer was retained rather than being left pending forever.
+    /// SC-001 and SC-004, the headline property of this work: teardown releases
+    /// every caller buffer, and never before the operation holding it has
+    /// reported.
+    ///
+    /// The withhold seam is what makes the second half observable — it keeps an
+    /// operation outstanding for a known number of steps, so "not yet released"
+    /// can be checked at a moment when release would have been wrong.
     #[test]
-    fn unquiet_teardown_reports_retained_buffers() {
+    fn teardown_releases_caller_buffers_but_never_early() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        /// A caller buffer that records its own destruction.
+        struct CountingBuf(Vec<u8>);
+
+        impl Drop for CountingBuf {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // SAFETY: pointer and lengths come from the inner `Vec`, which nothing
+        // here grows, and the buffer has no interior mutability.
+        unsafe impl crate::buf::IoBuf for CountingBuf {
+            fn buf_ptr(&self) -> *const u8 {
+                self.0.as_ptr()
+            }
+            fn buf_len(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        // SAFETY: as above; `set_buf_init` only reports bytes the kernel wrote.
+        unsafe impl crate::buf::IoBufMut for CountingBuf {
+            fn buf_mut_ptr(&mut self) -> *mut u8 {
+                self.0.as_mut_ptr()
+            }
+            fn buf_capacity(&self) -> usize {
+                self.0.capacity()
+            }
+            unsafe fn set_buf_init(&mut self, len: usize) {
+                // SAFETY: the caller guarantees `len` bytes are initialized.
+                unsafe { self.0.set_len(len) }
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Detach the operation, so nothing but the driver owns the buffer and
+        // only teardown can release it.
+        let fut = handle.read(&file, CountingBuf(vec![0_u8; 128]), 64, 0);
+        let token = fut.operation_id().expect("read was built").0;
+        driver.inner.borrow_mut().submit_pending();
+        assert_eq!(
+            driver.inner.borrow().slab.state(token).map(|s| s.0),
+            Some(Lifecycle::Submitted),
+            "the operation must reach the kernel for this test to mean anything"
+        );
+        drop(fut);
+
+        // Refuse to observe completions for several steps. The operation stays
+        // outstanding, and its buffer must not be released while it is.
+        // Deliberately more than the loop below consumes, so that reaping is
+        // still withheld when teardown starts — that is what forces teardown to
+        // keep draining rather than give up, and what makes a give-up-and-leak
+        // teardown fail this test.
+        driver.inner.borrow_mut().withhold_reaps = 6;
+        for _ in 0..3 {
+            let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+            drop(wakers);
+            assert_eq!(
+                outcome,
+                StepOutcome::Progressing,
+                "the operation should still be outstanding while reaping is withheld"
+            );
+            assert_eq!(
+                DROPS.load(Ordering::SeqCst),
+                0,
+                "a buffer must not be released before its operation has reported"
+            );
+        }
+
+        drop(driver);
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            1,
+            "teardown must release the caller's buffer once the operation reports"
+        );
+    }
+
+    /// The inverse of what this test used to assert. Teardown no longer
+    /// abandons a waiting future's buffer: it drains until the operation
+    /// reports, so the future receives a real outcome and its buffer back.
+    #[test]
+    fn teardown_resolves_waiting_futures_and_returns_their_buffers() {
         let driver = test_driver();
         let handle = driver.handle();
         let file = readme();
@@ -2951,37 +3251,40 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
 
-        // Force the drain to be skipped, so quiescence cannot be established.
-        driver.inner.borrow_mut().force_unquiet_teardown = true;
-        let wakers = driver.inner.borrow_mut().teardown();
-        for w in wakers {
-            w.wake();
-        }
+        drop(driver);
 
         match Pin::new(&mut fut).poll(&mut cx) {
-            Poll::Ready(Outcome::Retained(e)) => {
-                assert!(matches!(e, Error::BufferRetained));
+            Poll::Ready(outcome) => {
+                let buffer = match outcome {
+                    Outcome::Completed(r) => r.into_parts().1,
+                    other => panic!("teardown must not abandon a buffer, got {other:?}"),
+                };
+                // The length reflects what was transferred; the capacity proves
+                // this is the caller's original allocation coming back rather
+                // than something reconstructed.
+                assert_eq!(
+                    buffer.capacity(),
+                    128,
+                    "the caller's own buffer must come back"
+                );
             }
-            Poll::Ready(other) => panic!("expected Retained, got {other:?}"),
             Poll::Pending => panic!("a future was left pending after teardown"),
         }
 
-        // FR-032: nothing may be submitted after teardown.
-        let outcome = handle.read(&file, vec![0_u8; 64], 20, 0);
-        let mut outcome = outcome;
+        // Nothing may be submitted after teardown.
+        let mut outcome = handle.read(&file, vec![0_u8; 64], 20, 0);
         match Pin::new(&mut outcome).poll(&mut cx) {
-            Poll::Ready(o) => assert!(matches!(o.err(), Some(Error::ShuttingDown))),
+            Poll::Ready(o) => assert!(o.err().is_some()),
             Poll::Pending => panic!("a post-teardown submission should fail immediately"),
         }
     }
 
-    /// SC-017: an unquiet teardown must abandon registered resources rather
-    /// than free them, since the kernel may still reach them.
-    ///
-    /// Freeing them here would be a use-after-free, so the test asserts through
-    /// a drop counter that nothing was dropped.
+    /// SC-003, and the inverse of what this test used to assert. Registered
+    /// buffers were previously abandoned whenever the ring would not settle.
+    /// Teardown now drains first, so by the time it releases them the kernel can
+    /// no longer reach them — and they must actually be freed, not leaked.
     #[test]
-    fn an_unquiet_teardown_abandons_registered_buffers() {
+    fn teardown_releases_registered_buffers() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static DROPS: AtomicUsize = AtomicUsize::new(0);
@@ -3051,21 +3354,17 @@ mod tests {
         );
         assert_eq!(DROPS.load(Ordering::SeqCst), 0);
 
-        // Strand an operation — built but never submitted — so quiescence
-        // cannot be established, then tear down without draining.
+        // Strand an operation — built but never submitted — so the drain has
+        // real work to do, then tear down. Everything must come back.
         let stranded = handle.read(&readme(), vec![0_u8; 64], 20, 0);
         assert_eq!(driver.inner.borrow().slab.outstanding(), 1);
-        driver.inner.borrow_mut().force_unquiet_teardown = true;
-        let wakers = driver.inner.borrow_mut().teardown();
-        for w in wakers {
-            w.wake();
-        }
+        drop(driver);
         drop(stranded);
 
         assert_eq!(
             DROPS.load(Ordering::SeqCst),
-            0,
-            "an unquiet teardown must not free a buffer the kernel may reach"
+            1,
+            "teardown must release registered buffers once the ring is closed"
         );
     }
 

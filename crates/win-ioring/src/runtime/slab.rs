@@ -431,6 +431,48 @@ impl OpSlab {
         }
     }
 
+    /// Records that a cancellation request was never actually enqueued.
+    ///
+    /// Restores the slot to a state where cancellation can be requested again.
+    /// This is **not** the same as [`OpSlab::complete_cancel`], which handles a
+    /// cancellation that reached the platform and has now reported: here nothing
+    /// was ever queued, so there is no completion to expect and nothing has been
+    /// duplicated. Treating the two the same is what would otherwise make a
+    /// failed request permanent, since [`OpSlab::register_cancel`] only accepts a
+    /// slot that has never been requested.
+    ///
+    /// Returns `true` if a pending request was withdrawn.
+    pub fn cancel_request_not_enqueued(&mut self, token: Token) -> bool {
+        if token.kind() != TokenKind::Cancel {
+            return false;
+        }
+        let index = token.index();
+        let generation = token.generation();
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.generation != generation {
+            return false;
+        }
+        match slot.state {
+            SlotState::Occupied {
+                cancel: ref mut cancel @ CancelState::Pending,
+                ..
+            } => {
+                *cancel = CancelState::NeverRequested;
+                true
+            }
+            // A tombstone is waiting on a cancellation completion that will now
+            // never arrive, so the slot must be released rather than withheld
+            // forever.
+            SlotState::Tombstone => {
+                self.free_slot(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handles an operation's own terminal completion.
     ///
     /// Returns the payload so the caller can resolve the future and release the
@@ -609,6 +651,89 @@ impl OpSlab {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Returns every slot for which no queue entry has been built yet.
+    ///
+    /// Nothing references such a slot's buffer, so teardown can resolve it
+    /// directly. Believed unreachable in practice, since every insert is
+    /// followed by a build or a cleanup within the same borrow — but a slot left
+    /// in this state would be counted as outstanding while no completion could
+    /// ever arrive for it, so the drain handles it rather than assuming.
+    pub fn described(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Described,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every submitted operation that has never had a cancellation
+    /// requested, whether or not a future is still waiting on it.
+    ///
+    /// Teardown uses this to ask the platform to abandon everything the kernel
+    /// currently holds. Unlike
+    /// [`OpSlab::detached_submitted_uncancelled`], operations a caller is still
+    /// awaiting are included: an immediate shutdown cancels those too.
+    pub fn submitted_uncancelled(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Submitted,
+                    cancel: CancelState::NeverRequested,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every slot holding a queue entry the kernel has not taken.
+    ///
+    /// Such an entry cannot be withdrawn and still references the caller's
+    /// buffer, so teardown must submit it rather than resolve it — and must not
+    /// issue a waiting submission while any remains, since that would submit and
+    /// wait in one call and could leave the slot still marked as unsubmitted.
+    pub fn built(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Built,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every slot the kernel has accepted, or whose cancellation is
+    /// still outstanding.
+    ///
+    /// These are exactly the slots that will eventually report. Teardown may
+    /// only abandon queue entries once this is empty.
+    pub fn awaiting_kernel(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.state,
+                    SlotState::Occupied {
+                        lifecycle: Lifecycle::Submitted,
+                        ..
+                    } | SlotState::Tombstone
+                )
+            })
+            .count()
     }
 
     /// Deliberately leaks every remaining payload and renders the slab unusable.

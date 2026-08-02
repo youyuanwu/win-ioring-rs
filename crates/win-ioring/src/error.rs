@@ -108,6 +108,27 @@ pub enum Error {
     /// The driver is shutting down and is not accepting new operations.
     ShuttingDown,
 
+    /// The operation was ended by shutdown before the platform ever ran it.
+    ///
+    /// Distinct from a natural I/O failure and from a cancellation: nothing was
+    /// attempted. It arises when teardown resolves an operation itself, rather
+    /// than waiting for a completion that is never coming — because the queue
+    /// entry was never accepted by the platform despite repeated attempts, and
+    /// closing the ring discards it. The caller's buffer is returned.
+    AbandonedAtShutdown,
+
+    /// Shutdown is taking an unusual amount of time to drain.
+    ///
+    /// Reported, throttled, while operations remain outstanding. Draining is
+    /// unbounded by design — it never abandons memory — so a shutdown blocked on
+    /// an operation that neither completes nor responds to cancellation would
+    /// otherwise be indistinguishable from a hang. Informational: the drain is
+    /// still making attempts.
+    ShutdownStalled {
+        /// How many operations are still outstanding.
+        outstanding: usize,
+    },
+
     /// A sequential operation is already outstanding on this file.
     ///
     /// Sequential file operations are serialized because they share a cursor. A
@@ -251,6 +272,14 @@ impl fmt::Display for Error {
             ),
             Error::DriverGone => write!(f, "the driver no longer exists"),
             Error::ShuttingDown => write!(f, "the driver is shutting down"),
+            Error::AbandonedAtShutdown => write!(
+                f,
+                "the operation was abandoned at shutdown before the platform ran it"
+            ),
+            Error::ShutdownStalled { outstanding } => write!(
+                f,
+                "shutdown is still draining, with {outstanding} operation(s) outstanding"
+            ),
             Error::OperationOutstanding => {
                 write!(
                     f,
@@ -359,6 +388,8 @@ mod tests {
             Error::BufferRetained,
             Error::DriverGone,
             Error::ShuttingDown,
+            Error::AbandonedAtShutdown,
+            Error::ShutdownStalled { outstanding: 3 },
             Error::OperationOutstanding,
             Error::RingClosed,
             Error::MissingField { field: "handle" },
@@ -390,6 +421,8 @@ mod tests {
             | Error::BufferRetained
             | Error::DriverGone
             | Error::ShuttingDown
+            | Error::AbandonedAtShutdown
+            | Error::ShutdownStalled { .. }
             | Error::OperationOutstanding
             | Error::RingClosed
             | Error::MissingField { .. }
