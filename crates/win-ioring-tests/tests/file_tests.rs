@@ -33,6 +33,22 @@ where
         .await;
 }
 
+/// Reports whether the file can be opened with no sharing allowed.
+///
+/// This is how the tests observe that a handle has been released. Deletion is
+/// no good as a probe: the standard library opens files with
+/// `FILE_SHARE_DELETE`, so a file can be removed while handles are still open.
+/// An exclusive open, by contrast, fails with a sharing violation for exactly
+/// as long as any other handle to the file exists.
+fn opens_exclusively(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .is_ok()
+}
+
 /// SC-012: a write-then-read round trip returns exactly the bytes written, in
 /// both the positional and the sequential form.
 #[tokio::test(flavor = "current_thread")]
@@ -223,47 +239,84 @@ async fn a_dropped_sequential_future_blocks_then_releases_the_file() {
     .await;
 }
 
-/// SC-022: dropping both the file and the future before completion must still
-/// be safe, because the operation holds its own reference to the handle.
+/// SC-022: an operation naming an owned file completes correctly even when the
+/// caller drops both the future and their own file reference first, and the
+/// handle is released only afterwards.
+///
+/// Release is observed with [`opens_exclusively`] rather than by probing the
+/// handle value, which another thread could be handed moments after it closes.
 #[tokio::test(flavor = "current_thread")]
-async fn dropping_the_file_and_future_before_completion_is_safe() {
+async fn an_operation_outlives_the_callers_file_and_future() {
     with_driver(|handle| async move {
         let temp = TempFile::new("file-dropboth");
         std::fs::write(temp.path(), b"0123456789").unwrap();
 
+        // First: drop the caller's file while the operation is in flight, but
+        // keep the future so the result can be checked. The operation must
+        // complete correctly against a file nobody else holds.
         let file = File::open(temp.path()).unwrap();
         let fut = file.read_at(&handle, vec![0_u8; 8], 8, 0);
         assert!(fut.operation_id().is_some());
+        assert_eq!(
+            file.reference_count(),
+            2,
+            "the driver must hold a reference"
+        );
+        drop(file);
 
-        // The caller walks away from everything while the kernel is still
-        // working. The handle must outlive both.
+        let (read, buffer) = fut.await.unwrap();
+        assert_eq!(read, 8);
+        assert_eq!(&buffer[..8], b"01234567");
+
+        // Now drop the future as well, before the operation completes.
+        let file = File::open(temp.path()).unwrap();
+        let fut = file.read_at(&handle, vec![0_u8; 8], 8, 0);
+        assert!(fut.operation_id().is_some());
         drop(fut);
         drop(file);
 
-        // Let the driver settle; nothing here may panic.
+        // Nothing has awaited since, so the driver has not run and the
+        // operation is certainly still outstanding: its handle must still be
+        // open, which deletion proves by failing.
+        assert!(
+            !opens_exclusively(temp.path()),
+            "the handle must stay open while the operation is outstanding"
+        );
+
         for _ in 0..1000 {
+            if handle.outstanding() == 0 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert_eq!(
+            handle.outstanding(),
+            0,
+            "the abandoned operation must still reach terminal completion"
+        );
 
-        // The ring is still usable afterwards.
-        let file = File::open(temp.path()).unwrap();
-        let (read, _) = file.read_at(&handle, vec![0_u8; 8], 8, 0).await.unwrap();
-        assert_eq!(read, 8);
+        // With the last reference gone the handle is released, which deletion
+        // now proves by succeeding.
+        assert!(
+            opens_exclusively(temp.path()),
+            "the handle must be released once the operation is done"
+        );
     })
     .await;
 }
 
-/// SC-026: a file adopted from `std::fs::File` works, and its handle is owned
-/// by exactly one `File`, released when the last reference goes.
+/// SC-026: a file adopted from `std::fs::File` performs operations correctly,
+/// and its handle is released exactly once — no earlier than the last
+/// reference, and no later.
 #[tokio::test(flavor = "current_thread")]
-async fn adopting_a_std_file_works_and_owns_the_handle() {
+async fn adopting_a_std_file_works_and_releases_the_handle_once() {
     with_driver(|handle| async move {
         let temp = TempFile::new("file-adopt");
         std::fs::write(temp.path(), b"adopted!!!").unwrap();
 
         let std_file = std::fs::File::open(temp.path()).unwrap();
         let file = File::from_std(std_file);
-        assert_eq!(file.reference_count(), 1);
+        assert_eq!(file.reference_count(), 1, "adoption takes sole ownership");
 
         let (read, buffer) = file.read_at(&handle, vec![0_u8; 16], 10, 0).await.unwrap();
         assert_eq!(read, 10);
@@ -274,6 +327,23 @@ async fn adopting_a_std_file_works_and_owns_the_handle() {
             file.reference_count(),
             1,
             "the driver must have released its reference"
+        );
+
+        // A second reference must keep the handle open: dropping one `File` is
+        // not enough to close it.
+        let second = file.clone();
+        assert_eq!(file.reference_count(), 2);
+        drop(file);
+        assert!(
+            !opens_exclusively(temp.path()),
+            "the handle must not be released while a reference remains"
+        );
+
+        // Dropping the last reference releases it.
+        drop(second);
+        assert!(
+            opens_exclusively(temp.path()),
+            "the handle must be released with the last reference"
         );
     })
     .await;
