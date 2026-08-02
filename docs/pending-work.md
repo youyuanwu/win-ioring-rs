@@ -25,10 +25,22 @@ most substantial gap in the API surface.
 The host reports `IORING_OP_NOP` as supported, but `windows` 0.62.2 exposes no
 `BuildIoRingNop`, so it is unreachable without hand-written bindings.
 
-### No batching API
+### Explicit batching control
 
-Each operation is submitted individually. An API that submits several built
-operations under one `SubmitIoRing` call would cut syscalls materially.
+Operations already coalesce: `submit_pending` issues one `SubmitIoRing` covering
+every entry built since the last call, so N operations started before the driver
+task next runs cost a single submission. This matches how `tokio-uring` behaves —
+it has no user-facing batch API either, and its driver accumulates submission
+queue entries and submits them with one `io_uring_enter`.
+
+What is *not* possible is batching across await points: a caller who awaits each
+operation in turn gets one submission each, because there is nothing to batch
+with an operation that has not been issued yet. That is inherent, not a gap.
+
+An explicit API would only add the ability to *withhold* the wake signal so that
+operations accumulate deliberately — trading latency for fewer submissions. A
+niche throughput knob rather than a missing capability, which is why it is low
+priority.
 
 ### Submission retry busy-loops
 

@@ -102,6 +102,19 @@ waking, so the driver would park forever on the retry path — no completion can
 arrive to prompt the next poll when the problem is that nothing was submitted.
 The crate uses a self-waking `YieldNow` instead.
 
+### Submission is batched implicitly
+
+`submit_pending` issues a single `SubmitIoRing` covering every entry built since
+the last call, and promotes all of them at once. So operations started before the
+driver task next runs — the usual case for concurrent work on a single-threaded
+executor — cost one submission between them, not one each.
+
+This is the same bargain `tokio-uring` makes: it exposes no batch API either, and
+its driver accumulates submission queue entries and submits them with one
+`io_uring_enter`. Batching across *await points* is not possible in either crate,
+because an operation that has not been issued yet cannot be batched with one that
+has.
+
 ### Registration is a permanent transfer of ownership
 
 The platform has no unregister entry point, and gives no signal that it has

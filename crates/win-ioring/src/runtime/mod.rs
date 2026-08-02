@@ -2446,6 +2446,42 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Operations built before the driver next runs share one submission.
+    ///
+    /// This is the crate's whole batching story — there is no explicit batch
+    /// API — so it is worth pinning. A regression that submitted per operation
+    /// would still pass every other test, just more slowly and with more
+    /// syscalls, which is exactly the kind of change nothing else would catch.
+    #[test]
+    fn operations_built_together_share_one_submission() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Three reads issued without awaiting any of them, so the driver has
+        // had no opportunity to submit in between.
+        let a = handle.read(&file, vec![0_u8; 64], 8, 0);
+        let b = handle.read(&file, vec![0_u8; 64], 8, 8);
+        let c = handle.read(&file, vec![0_u8; 64], 8, 16);
+        assert_eq!(
+            driver.inner.borrow().slab.outstanding(),
+            3,
+            "all three must be built before anything is submitted"
+        );
+        assert!(driver.inner.borrow().pending_submit);
+
+        // A single submission covers all three: nothing is left owed.
+        driver.inner.borrow_mut().submit_pending();
+        assert!(
+            !driver.inner.borrow().pending_submit,
+            "one SubmitIoRing must cover every entry built since the last one"
+        );
+
+        drop((a, b, c));
+        drain(&driver);
+        handle.shutdown();
+    }
+
     /// Runs the driver by hand until nothing is outstanding.
     ///
     /// Submits as well as reaps, because a tombstoned slot clears only once its
