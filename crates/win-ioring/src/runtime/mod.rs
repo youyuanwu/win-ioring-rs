@@ -160,11 +160,16 @@ struct DriverInner {
     pending_submit: bool,
     shutting_down: bool,
     torn_down: bool,
-    on_error: Option<ErrorObserver>,
+    /// Errors awaiting delivery to the observer.
+    ///
+    /// Reporting happens outside the driver's borrow, for the same reason
+    /// waking does: an observer may call back into the driver, and doing that
+    /// under an active borrow would panic.
+    deferred_reports: Vec<Error>,
     /// Consecutive failed submission attempts.
     ///
-    /// Used to stop retrying in a tight loop when the queue is persistently
-    /// stuck, and to avoid flooding the observer with identical errors.
+    /// Used to avoid flooding the observer with identical errors while a queue
+    /// is persistently stuck.
     submit_failures: u32,
     /// Test seam: fail this many submissions before letting one through.
     ///
@@ -175,10 +180,15 @@ struct DriverInner {
 }
 
 impl DriverInner {
-    fn report(&self, error: &Error) {
-        if let Some(observer) = &self.on_error {
-            observer(error);
-        }
+    /// Queues an error for delivery to the observer once the borrow is gone.
+    fn report(&mut self, error: Error) {
+        self.deferred_reports.push(error);
+    }
+
+    /// Takes the queued errors, for the caller to deliver outside the borrow.
+    #[must_use = "the returned errors must be reported after releasing the borrow"]
+    fn take_reports(&mut self) -> Vec<Error> {
+        std::mem::take(&mut self.deferred_reports)
     }
 
     /// Hands queued entries to the kernel.
@@ -196,7 +206,7 @@ impl DriverInner {
             let injected = Error::Os(windows::core::Error::from(
                 windows::Win32::Foundation::E_FAIL,
             ));
-            self.note_submit_failure(&injected);
+            self.note_submit_failure(injected);
             return;
         }
 
@@ -207,15 +217,15 @@ impl DriverInner {
                 self.slab.promote_built_to_submitted();
             }
             Err(e) => {
-                self.note_submit_failure(&e);
+                self.note_submit_failure(e);
                 // Leave `pending_submit` set. The entries are still queued and
                 // their buffers must stay retained until the kernel takes them.
             }
         }
     }
 
-    /// Records a failed submission and reports it, without flooding.
-    fn note_submit_failure(&mut self, error: &Error) {
+    /// Records a failed submission and queues a report, without flooding.
+    fn note_submit_failure(&mut self, error: Error) {
         self.submit_failures = self.submit_failures.saturating_add(1);
         // Report the first failure of a streak, then only occasionally, so a
         // persistently stuck queue does not drown the observer.
@@ -239,7 +249,7 @@ impl DriverInner {
                 Ok(Some(cqe)) => cqe,
                 Ok(None) => return wakers,
                 Err(e) => {
-                    self.report(&e);
+                    self.report(e);
                     return wakers;
                 }
             };
@@ -351,6 +361,9 @@ fn yield_now() -> YieldNow {
 /// single-threaded by design and cannot be sent between threads.
 pub struct Driver {
     inner: Rc<RefCell<DriverInner>>,
+    /// Held outside `DriverInner` so it is never invoked under the driver's
+    /// borrow; an observer may call back into the driver.
+    on_error: Option<ErrorObserver>,
     /// Signalled by the kernel when completions are available.
     completion_event: AsyncEvent,
     /// Signalled when work is queued or shutdown is requested.
@@ -394,14 +407,26 @@ impl Driver {
                 pending_submit: false,
                 shutting_down: false,
                 torn_down: false,
-                on_error: observer,
+                deferred_reports: Vec::new(),
                 submit_failures: 0,
                 #[cfg(test)]
                 fail_next_submits: 0,
             })),
+            on_error: observer,
             completion_event,
             wake,
         })
+    }
+
+    /// Delivers queued errors to the observer.
+    ///
+    /// Must be called with no borrow of `DriverInner` held.
+    fn flush_reports(&self, reports: Vec<Error>) {
+        if let Some(observer) = &self.on_error {
+            for error in reports {
+                observer(&error);
+            }
+        }
     }
 
     /// Returns a handle for issuing operations.
@@ -420,18 +445,21 @@ impl Driver {
         use futures::FutureExt;
 
         loop {
-            let (shutting_down, retry_owed, wakers) = {
+            let (shutting_down, retry_owed, wakers, reports) = {
                 let mut inner = self.inner.borrow_mut();
                 inner.submit_pending();
                 let wakers = inner.reap_completions();
-                (inner.shutting_down, inner.pending_submit, wakers)
+                let reports = inner.take_reports();
+                (inner.shutting_down, inner.pending_submit, wakers, reports)
             };
 
-            // Wake only after the borrow is released: an executor may poll the
-            // woken task inline, and that task may call back into the driver.
+            // Wake and report only after the borrow is released: an executor may
+            // poll the woken task inline, and an observer may call straight back
+            // into the driver. Either under a live borrow would panic.
             for waker in wakers {
                 waker.wake();
             }
+            self.flush_reports(reports);
 
             if shutting_down {
                 break;
@@ -465,10 +493,16 @@ impl Driver {
             }
         }
 
-        let wakers = self.inner.borrow_mut().teardown();
+        let (wakers, reports) = {
+            let mut inner = self.inner.borrow_mut();
+            let wakers = inner.teardown();
+            let reports = inner.take_reports();
+            (wakers, reports)
+        };
         for waker in wakers {
             waker.wake();
         }
+        self.flush_reports(reports);
     }
 }
 
@@ -476,10 +510,16 @@ impl Drop for Driver {
     fn drop(&mut self) {
         // An abrupt drop gets the same treatment as a requested shutdown: no
         // memory the kernel might still reach is freed.
-        let wakers = self.inner.borrow_mut().teardown();
+        let (wakers, reports) = {
+            let mut inner = self.inner.borrow_mut();
+            let wakers = inner.teardown();
+            let reports = inner.take_reports();
+            (wakers, reports)
+        };
         for waker in wakers {
             waker.wake();
         }
+        self.flush_reports(reports);
     }
 }
 
@@ -835,6 +875,11 @@ mod tests {
             inner.submit_pending();
             assert!(inner.pending_submit, "entries must stay queued on failure");
             assert_eq!(inner.slab.outstanding(), 1);
+            let reports = inner.take_reports();
+            drop(inner);
+            // Reports are delivered outside the borrow, exactly as the driver
+            // loop does it.
+            driver.flush_reports(reports);
         }
         assert_eq!(seen.borrow().len(), 1, "the first failure is reported");
 
@@ -858,7 +903,8 @@ mod tests {
 
         // Drain the completion so nothing is left in flight.
         loop {
-            for waker in driver.inner.borrow_mut().reap_completions() {
+            let wakers = driver.inner.borrow_mut().reap_completions();
+            for waker in wakers {
                 waker.wake();
             }
             if driver.inner.borrow().slab.outstanding() == 0 {
@@ -957,7 +1003,12 @@ mod tests {
         let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
 
         for _ in 0..100 {
-            driver.inner.borrow_mut().submit_pending();
+            let reports = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.take_reports()
+            };
+            driver.flush_reports(reports);
         }
 
         let failures = driver.inner.borrow().submit_failures;
@@ -983,7 +1034,8 @@ mod tests {
             "a successful retry after a long failure streak must still land"
         );
         loop {
-            for waker in driver.inner.borrow_mut().reap_completions() {
+            let wakers = driver.inner.borrow_mut().reap_completions();
+            for waker in wakers {
                 waker.wake();
             }
             if driver.inner.borrow().slab.outstanding() == 0 {
@@ -1041,7 +1093,8 @@ mod tests {
 
         // Only the completion releases it.
         loop {
-            for waker in driver.inner.borrow_mut().reap_completions() {
+            let wakers = driver.inner.borrow_mut().reap_completions();
+            for waker in wakers {
                 waker.wake();
             }
             if driver.inner.borrow().slab.outstanding() == 0 {
