@@ -723,3 +723,62 @@ fn bad_queue_size_is_not_reported_as_unsupported() {
         "argument failure must not be reported as an unsupported host: {err:?}"
     );
 }
+
+/// Every method must refuse a closed ring rather than reach the platform.
+///
+/// This is not defensive tidiness. `PopIoRingCompletion` given a closed ring
+/// handle faults rather than returning an error, so without the check the safe
+/// methods on `IoRing` would not be safe. The other methods are covered too
+/// because a caller cannot be expected to remember which one is the dangerous
+/// one.
+#[test]
+fn a_closed_ring_refuses_every_operation() {
+    let event = AsyncEvent::new().unwrap();
+    let mut ring = IoRing::builder().build().unwrap();
+    let file = crate::file::File::from_std(File::open(SAMPLE_PATH).unwrap());
+    let mut buffer = vec![0_u8; 32];
+
+    ring.close().unwrap();
+    assert!(ring.is_closed());
+
+    assert!(matches!(ring.info(), Err(Error::RingClosed)));
+    assert!(matches!(ring.submit(0, 0), Err(Error::RingClosed)));
+    // The one that would otherwise fault.
+    assert!(matches!(ring.pop_completion(), Err(Error::RingClosed)));
+    assert!(
+        !ring.is_op_supported(IORING_OP_READ),
+        "a closed ring must report nothing as supported"
+    );
+
+    // SAFETY: the ring is closed, so these return before touching the platform.
+    // The file and buffer outlive the calls regardless.
+    unsafe {
+        assert!(matches!(
+            ring.set_io_ring_completion_event(event.handle()),
+            Err(Error::RingClosed)
+        ));
+
+        let read = ReadOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_raw_data_address(buffer.as_mut_ptr() as *mut _)
+            .with_num_of_bytes_to_read(8)
+            .with_offset(0)
+            .with_user_data(1)
+            .build()
+            .unwrap();
+        assert!(matches!(ring.build_read_file(read), Err(Error::RingClosed)));
+
+        let flush = crate::io_ring::ops::FlushOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_user_data(2)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            ring.build_flush_file(flush),
+            Err(Error::RingClosed)
+        ));
+    }
+
+    // Closing again stays a no-op.
+    ring.close().unwrap();
+}

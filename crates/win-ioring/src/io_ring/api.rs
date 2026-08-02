@@ -62,9 +62,13 @@ pub struct RingInfo {
 /// There is deliberately no `Drop` implementation. Closing a ring while the
 /// kernel may still be working is exactly the decision this type refuses to
 /// make on the caller's behalf, so [`IoRing::close`] must be called explicitly;
-/// otherwise the ring handle is leaked. `close` is idempotent, and calling any
-/// other method after it is safe — the platform rejects the stale handle with
-/// an error rather than misbehaving.
+/// otherwise the ring handle is leaked. `close` is idempotent.
+///
+/// Every method checks first, so calling one on a closed ring returns
+/// [`Error::RingClosed`] rather than reaching the platform. That check is not
+/// belt-and-braces: passing a closed ring handle to `PopIoRingCompletion`
+/// faults rather than returning an error, so without it the safe methods on
+/// this type would not be safe.
 pub struct IoRing {
     /// The underlying platform ring handle.
     pub ring: HIORING,
@@ -259,9 +263,24 @@ impl IoRing {
         })
     }
 
+    /// Returns an error if this ring has been closed.
+    ///
+    /// The platform does not reliably reject a closed ring handle — passing one
+    /// to `PopIoRingCompletion` faults rather than returning an error — so every
+    /// method that touches the handle checks here first. That is what lets the
+    /// safe methods on this type stay safe after [`IoRing::close`].
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            Err(Error::RingClosed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Returns information about this ring, including the queue sizes the
     /// platform actually allocated.
     pub fn info(&self) -> Result<RingInfo> {
+        self.ensure_open()?;
         let mut info = IORING_INFO::default();
         // SAFETY: `self.ring` came from `CreateIoRing` and is never replaced. If
         // it has already been closed the platform rejects the stale handle with
@@ -279,10 +298,13 @@ impl IoRing {
     ///
     /// The platform returns a plain boolean with no error channel, so a `false`
     /// result means "not supported" and cannot be distinguished from a failed
-    /// query.
+    /// query. A closed ring reports `false` for everything.
     pub fn is_op_supported(&self, op: IORING_OP_CODE) -> bool {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the call only reads whether an op code
-        // is supported.
+        if self.closed {
+            return false;
+        }
+        // SAFETY: `self.ring` has not been closed, per the check above, and the
+        // call only reads whether an op code is supported.
         unsafe { IsIoRingOpSupported(self.ring, op) }.as_bool()
     }
 
@@ -308,7 +330,8 @@ impl IoRing {
     /// event is replaced. Closing it earlier leaves the kernel signalling a
     /// handle that may since have been reused for something else.
     pub unsafe fn set_io_ring_completion_event(&mut self, handle: HANDLE) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees `handle`
+        self.ensure_open()?;
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees `handle`
         // outlives the ring's use of it.
         unsafe { SetIoRingCompletionEvent(self.ring, handle) }.map_err(Error::from)
     }
@@ -318,7 +341,8 @@ impl IoRing {
     /// # Safety
     /// File ref and data ref must be valid until the operation is popped from the completion queue.
     pub unsafe fn build_read_file(&mut self, op: super::ops::ReadOp) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the file and data
+        self.ensure_open()?;
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the file and data
         // references stay valid until this operation's completion is dequeued.
         unsafe {
             BuildIoRingReadFile(
@@ -339,7 +363,8 @@ impl IoRing {
     /// # Safety
     /// File ref and data ref must be valid until the operation is popped from the completion queue.
     pub unsafe fn build_write_file(&mut self, op: super::ops::WriteOp) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the file and data
+        self.ensure_open()?;
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the file and data
         // references stay valid until this operation's completion is dequeued.
         unsafe {
             BuildIoRingWriteFile(
@@ -361,7 +386,8 @@ impl IoRing {
     /// # Safety
     /// File ref must be valid until the operation is popped from the completion queue.
     pub unsafe fn build_flush_file(&mut self, op: super::ops::FlushOp) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the file reference
+        self.ensure_open()?;
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the file reference
         // stays valid until this operation's completion is dequeued.
         unsafe {
             BuildIoRingFlushFile(
@@ -385,7 +411,8 @@ impl IoRing {
     /// # Safety
     /// File ref must be valid until the cancellation is popped from the completion queue.
     pub unsafe fn build_cancel_request(&mut self, op: super::ops::CancelOp) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the file reference
+        self.ensure_open()?;
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the file reference
         // stays valid until this cancellation's completion is dequeued.
         unsafe { BuildIoRingCancelRequest(self.ring, op.handle_ref, op.op_to_cancel, op.userdata) }
             .map_err(Error::from)
@@ -437,7 +464,7 @@ impl IoRing {
         handles: &[HANDLE],
         userdata: usize,
     ) -> Result<()> {
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the handles stay
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the handles stay
         // open for as long as the registration lives.
         unsafe { BuildIoRingRegisterFileHandles(self.ring, handles, userdata) }.map_err(Error::from)
     }
@@ -463,7 +490,7 @@ impl IoRing {
         let buffers = unsafe {
             std::slice::from_raw_parts(buffers.as_ptr() as *const IORING_BUFFER_INFO, buffers.len())
         };
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and the caller guarantees the registered
+        // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the registered
         // buffers stay alive and unmoved for as long as the registration lives.
         unsafe { BuildIoRingRegisterBuffers(self.ring, buffers, userdata) }.map_err(Error::from)
     }
@@ -475,8 +502,9 @@ impl IoRing {
     /// submission queue, so the caller must assume those entries — and any
     /// memory they reference — are still live.
     pub fn submit(&mut self, wait_operations: usize, milliseconds: usize) -> Result<u32> {
+        self.ensure_open()?;
         let mut submitted_entries = 0_u32;
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and `submitted_entries` is a local the call
+        // SAFETY: `self.ring` has not been closed, per the guard above, and `submitted_entries` is a local the call
         // fills in.
         unsafe {
             SubmitIoRing(
@@ -498,8 +526,9 @@ impl IoRing {
     /// Returns [`Error::Os`] if the platform reports anything other than a
     /// completion or an empty queue.
     pub fn pop_completion(&mut self) -> Result<Option<IORING_CQE>> {
+        self.ensure_open()?;
         let mut out = IORING_CQE::default();
-        // SAFETY: `self.ring` is a handle from `CreateIoRing`, and `out` is a local the call fills in.
+        // SAFETY: `self.ring` has not been closed, per the guard above, and `out` is a local the call fills in.
         let hr = unsafe { PopIoRingCompletion(self.ring, &mut out) };
         if hr == S_OK {
             Ok(Some(out))

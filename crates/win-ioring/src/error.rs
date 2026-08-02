@@ -116,6 +116,13 @@ pub enum Error {
     /// still in flight.
     OperationOutstanding,
 
+    /// The ring has been closed and can no longer be used.
+    ///
+    /// The platform does not reliably reject a closed ring handle — passing one
+    /// to `PopIoRingCompletion` faults rather than returning an error — so this
+    /// crate refuses the call itself.
+    RingClosed,
+
     /// A required field was not supplied when building an operation.
     MissingField {
         /// The name of the field that was not set.
@@ -250,6 +257,7 @@ impl fmt::Display for Error {
                     "a sequential operation is already outstanding on this file"
                 )
             }
+            Error::RingClosed => write!(f, "the ring has been closed"),
             Error::MissingField { field } => {
                 write!(f, "required field `{field}` was not set")
             }
