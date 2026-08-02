@@ -361,6 +361,25 @@ struct DriverInner {
     /// forever instead of failing — a CI timeout rather than an assertion.
     #[cfg(test)]
     withhold_reaps: u32,
+    /// Test seam: refuse to enqueue this many cancellation requests.
+    ///
+    /// `BuildIoRingCancelRequest` has no reliably reproducible failure mode, so
+    /// the retry path — the one that keeps a refused request from making an
+    /// operation permanently uncancellable — cannot be exercised without
+    /// injecting one.
+    ///
+    /// Counted rather than a flag for the same reason reaping is: the drain
+    /// retries until it succeeds, so an unconditional refusal under an immediate
+    /// shutdown produces a test that never terminates.
+    #[cfg(test)]
+    fail_next_cancels: u32,
+    /// Test seam: how many times a cancellation reached the enqueue attempt.
+    ///
+    /// Counting attempts is what stops the retry test passing vacuously: an
+    /// operation that simply completed on its own would satisfy "everything
+    /// resolved" without a single retry having happened.
+    #[cfg(test)]
+    cancel_attempts: u32,
     /// Test seam: build the next buffer registration with no descriptors.
     ///
     /// The platform accepts a zero-*extent* descriptor but rejects a
@@ -573,6 +592,18 @@ impl DriverInner {
         if self.torn_down {
             return;
         }
+        // The platform reads a cancellation target of zero as "everything on
+        // this handle", which would abort operations this driver never issued —
+        // including another ring's, elsewhere in the process. Token encoding
+        // makes zero unreachable (see `FIRST_GENERATION` in `slab`); this is the
+        // backstop, because the consequence of that invariant lapsing is silent
+        // damage outside the crate rather than a failure inside it. Declining to
+        // cancel is safe: the operation simply runs to completion, and the drain
+        // waits for it.
+        if token.as_user_data() == 0 {
+            debug_assert!(false, "an operation token must never be zero");
+            return;
+        }
         // Only submitted operations can be cancelled. A described one has
         // nothing in the queue, and a built one has not reached the kernel, so
         // there is nothing for the platform to find. A token that has since
@@ -629,11 +660,29 @@ impl DriverInner {
             self.cancel_holds.push((cancel_token, file));
         }
 
+        #[cfg(test)]
+        {
+            self.cancel_attempts = self.cancel_attempts.saturating_add(1);
+        }
+        #[cfg(test)]
+        let refused = {
+            let refused = self.fail_next_cancels > 0;
+            if refused {
+                self.fail_next_cancels -= 1;
+            }
+            refused
+        };
+        #[cfg(not(test))]
+        let refused = false;
+
+        // `||` short-circuits, so an injected refusal never reaches the platform.
+        //
         // SAFETY: an owned file's handle is kept open by the hold just pushed,
         // which is released only when this cancellation's own completion is
         // dequeued; a registered handle is owned by the driver until the ring
         // closes.
-        if unsafe { self.ring.build_cancel_request(op) }.is_err() {
+        let not_enqueued = refused || unsafe { self.ring.build_cancel_request(op) }.is_err();
+        if not_enqueued {
             // Failing to enqueue a cancellation is explicitly not an error: the
             // target simply runs to completion. Undo the bookkeeping so the
             // target's slot is not left waiting for a completion that will
@@ -1050,6 +1099,10 @@ impl Driver {
                 fail_next_submits: 0,
                 #[cfg(test)]
                 withhold_reaps: 0,
+                #[cfg(test)]
+                fail_next_cancels: 0,
+                #[cfg(test)]
+                cancel_attempts: 0,
                 #[cfg(test)]
                 fail_next_registration: false,
             })),
@@ -2701,6 +2754,146 @@ mod tests {
         .unwrap()
     }
 
+    /// A connected named-pipe pair opened for overlapped I/O.
+    ///
+    /// The only source of a genuinely long-running operation these tests have:
+    /// a read on the server end stays in the kernel until the client writes, so
+    /// "still in flight at shutdown" becomes a fact rather than a race. Every
+    /// other handle available here — a small local file — completes so quickly
+    /// that a test asserting an operation is still outstanding would be
+    /// asserting a timing accident.
+    struct Pipe {
+        server: File,
+        client: std::fs::File,
+    }
+
+    impl Pipe {
+        fn new() -> Self {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
+            use windows::Win32::System::Pipes::{
+                CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+            };
+
+            // Unique per pipe, so tests running concurrently in the same process
+            // never collide on a name.
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let name = format!(
+                r"\\.\pipe\win-ioring-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            );
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+
+            // SAFETY: the name is a NUL-terminated wide string that outlives the
+            // call, and no security attributes are supplied.
+            let raw = unsafe {
+                CreateNamedPipeW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    4096,
+                    4096,
+                    0,
+                    None,
+                )
+            };
+            assert!(
+                !raw.is_invalid(),
+                "creating the test pipe failed: {}",
+                std::io::Error::last_os_error()
+            );
+
+            // The client connects to the waiting instance; no `ConnectNamedPipe`
+            // is needed on the server side for the connection to be established.
+            let client = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED.0)
+                .open(&name)
+                .expect("connecting to the test pipe");
+
+            // SAFETY: `raw` is a freshly created handle that nothing else owns.
+            let server = unsafe { File::from_raw_handle(raw) };
+            Self { server, client }
+        }
+
+        /// Unblocks a pending read on the server end.
+        fn write_from_client(&mut self, bytes: &[u8]) {
+            use std::io::Write;
+            self.client.write_all(bytes).expect("writing to the pipe");
+            self.client.flush().ok();
+        }
+    }
+
+    /// Establishes the premise every long-running shutdown test rests on: a read
+    /// on an empty pipe really does stay in the kernel, and really does complete
+    /// once data arrives.
+    ///
+    /// Without this, a test that "proves" an operation was still in flight would
+    /// only be proving that a read had not been reaped yet.
+    #[test]
+    fn a_read_on_an_empty_pipe_stays_in_flight() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        let mut fut = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        for _ in 0..50 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "a read on an empty pipe must not complete on its own"
+        );
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "the kernel must still be holding the read"
+        );
+
+        pipe.write_from_client(b"hello");
+
+        let mut resolved = None;
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
+                resolved = Some(result);
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let (result, buffer) = resolved
+            .expect("the read must complete once data arrives")
+            .into_parts();
+        assert_eq!(result.expect("the read must succeed") as usize, 5);
+        assert_eq!(&buffer[..5], b"hello");
+
+        handle.shutdown();
+    }
+
     /// FR-038: filling the submission queue must produce a distinct, matchable
     /// error, and must hand the caller's buffer straight back.
     ///
@@ -3725,5 +3918,378 @@ mod tests {
         assert!(driver.inner.borrow().buffer_registration.is_none());
 
         handle.shutdown();
+    }
+
+    /// FR-008 in ordinary use rather than at shutdown: cancelling one operation
+    /// must not disturb another on the same file.
+    ///
+    /// The first operation a driver issues is the one that matters. Its token
+    /// occupies slot zero at the first generation, which is the only combination
+    /// that could encode to a user data of zero — and the platform reads a
+    /// cancellation target of zero as "everything on this handle". Dropping that
+    /// first future would then abort every other read in flight on the same
+    /// file, which is why this test drops the *first* of the two.
+    #[test]
+    fn cancelling_one_operation_leaves_its_siblings_alone() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        assert_eq!(
+            driver.inner.borrow().slab.outstanding(),
+            0,
+            "the next operation must be the driver's first, so it takes slot zero"
+        );
+        let first = handle.read(&pipe.server, vec![0_u8; 16], 16, 0);
+        let mut second = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        assert_ne!(
+            first
+                .operation_id()
+                .expect("the read was built")
+                .0
+                .as_user_data(),
+            0,
+            "the first operation's user data must not be the platform's cancel-everything value"
+        );
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        driver.inner.borrow_mut().submit_pending();
+
+        // Dropping the future cancels just this one operation.
+        drop(first);
+
+        let mut resolved = None;
+        for _ in 0..200 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if let Poll::Ready(result) = second.as_mut().poll(&mut cx) {
+                resolved = Some(result);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            resolved.is_none(),
+            "the surviving read must still be in flight: {:?}",
+            resolved.map(|r| r.into_parts().0)
+        );
+
+        // It is still a working operation, not merely an unreported one.
+        pipe.write_from_client(b"kept");
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if let Poll::Ready(result) = second.as_mut().poll(&mut cx) {
+                resolved = Some(result);
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let (transferred, buffer) = resolved
+            .expect("the surviving read must complete once data arrives")
+            .into_parts();
+        assert_eq!(
+            transferred.expect("the surviving read must not have been cancelled") as usize,
+            4
+        );
+        assert_eq!(&buffer[..4], b"kept");
+
+        handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// SC-009: a cancellation the platform refuses to enqueue must be tried
+    /// again, or one refusal would silently make an operation permanently
+    /// uncancellable and turn an immediate shutdown into a graceful one.
+    ///
+    /// The attempt count is what stops this passing vacuously. "Everything
+    /// resolved" is satisfied by operations that simply finished on their own,
+    /// which is why the operations here are pipe reads that cannot: nothing
+    /// writes to the pipe, so only a cancellation can end them.
+    #[test]
+    fn a_drain_retries_cancellations_the_platform_refuses() {
+        const OPERATIONS: u32 = 2;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+
+        let mut first = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let mut second = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        handle.shutdown_now();
+        // Enough refusals for two full rounds against both operations.
+        driver.inner.borrow_mut().fail_next_cancels = 2 * OPERATIONS;
+
+        for _ in 0..2 {
+            let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+            drop(wakers);
+            assert_eq!(
+                outcome,
+                StepOutcome::Progressing,
+                "nothing can finish while every cancellation is refused"
+            );
+        }
+
+        assert!(
+            driver.inner.borrow().cancel_attempts > OPERATIONS,
+            "a refused cancellation must be retried, not recorded as done: {} attempts for {OPERATIONS} operations",
+            driver.inner.borrow().cancel_attempts
+        );
+        assert!(
+            first.as_mut().poll(&mut cx).is_pending() && second.as_mut().poll(&mut cx).is_pending(),
+            "a refused cancellation must not resolve its operation"
+        );
+
+        // With the injected refusals exhausted, the retries get through and the
+        // drain finishes.
+        drop(driver);
+        assert!(
+            first.as_mut().poll(&mut cx).is_ready() && second.as_mut().poll(&mut cx).is_ready(),
+            "every operation must be resolved by the time teardown ends"
+        );
+    }
+
+    /// SC-011a: a graceful drain already under way can still be escalated, and
+    /// the escalation reaches the operations still in flight.
+    ///
+    /// The single most load-bearing test of the design. Everything here is
+    /// `!Send`, so `shutdown_now` can only be called from the driver's own
+    /// thread — a drain that blocked that thread outright would make escalation
+    /// unreachable, and a graceful drain never cancels, so escalation is the
+    /// only way out of one that has stalled. A single blocking drain loop shared
+    /// by `drive` and `Drop` would hang here forever.
+    #[test]
+    fn a_graceful_drain_can_be_escalated_to_immediate() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+
+        let mut fut = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        handle.shutdown();
+
+        // A graceful drain waits for an operation that will never finish, and
+        // does not cancel it.
+        for _ in 0..2 {
+            let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+            drop(wakers);
+            assert_eq!(
+                outcome,
+                StepOutcome::Progressing,
+                "a graceful drain cannot finish while an operation is stuck"
+            );
+        }
+        assert_eq!(
+            driver.inner.borrow().cancel_attempts,
+            0,
+            "a graceful shutdown must not cancel anything"
+        );
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Escalate part-way through, exactly as another task sharing the
+        // driver's thread would.
+        handle.shutdown_now();
+
+        let mut outcome = StepOutcome::Progressing;
+        for _ in 0..32 {
+            let (wakers, step) = driver.inner.borrow_mut().drain_step();
+            for waker in wakers {
+                waker.wake();
+            }
+            outcome = step;
+            if step != StepOutcome::Progressing {
+                break;
+            }
+        }
+        assert_eq!(
+            outcome,
+            StepOutcome::Quiescent,
+            "escalation must let a stalled drain finish"
+        );
+        assert!(
+            driver.inner.borrow().cancel_attempts > 0,
+            "escalation must reach the operations still in flight"
+        );
+        assert!(
+            fut.as_mut().poll(&mut cx).is_ready(),
+            "the escalated operation must be resolved"
+        );
+
+        drop(driver);
+    }
+
+    /// SC-024: an operation that reports only once the drain is already under
+    /// way must still have its report delivered, which is what "the ring is not
+    /// closed while the kernel still holds something" looks like from outside.
+    ///
+    /// The pipe is what makes the ordering a fact: the read cannot complete
+    /// before the write, and the write happens after the drain has taken a step.
+    /// The shutdown is graceful so that nothing cancels the read — the result
+    /// asserted below is the operation's own, not a cancellation's.
+    #[test]
+    fn an_operation_reporting_mid_drain_is_still_delivered() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        let mut fut = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        handle.shutdown();
+
+        let (wakers, outcome) = driver.inner.borrow_mut().drain_step();
+        drop(wakers);
+        assert_eq!(outcome, StepOutcome::Progressing);
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "the kernel must still hold the read once the drain has begun"
+        );
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Only now does the operation become able to report.
+        pipe.write_from_client(b"late");
+
+        let mut outcome = StepOutcome::Progressing;
+        for _ in 0..32 {
+            let (wakers, step) = driver.inner.borrow_mut().drain_step();
+            for waker in wakers {
+                waker.wake();
+            }
+            outcome = step;
+            if step != StepOutcome::Progressing {
+                break;
+            }
+        }
+        assert_eq!(outcome, StepOutcome::Quiescent);
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => {
+                let (transferred, buffer) = result.into_parts();
+                let transferred =
+                    transferred.expect("a report that arrived during the drain must survive it");
+                assert_eq!(transferred as usize, 4);
+                assert_eq!(
+                    &buffer[..4],
+                    b"late",
+                    "the caller's own data must come back"
+                );
+            }
+            Poll::Pending => panic!("a report delivered during the drain was lost"),
+        }
+
+        drop(driver);
+    }
+
+    /// SC-013: an immediate shutdown must not disturb an operation the driver
+    /// never issued, even on a file handle it uses itself.
+    ///
+    /// A cancellation names one specific operation's user data, so it cannot
+    /// reach a foreign ring's work — but that is an argument, and this makes it
+    /// an observation. The external read is genuinely still pending when the
+    /// shutdown happens: nothing has been written to the pipe yet, so it cannot
+    /// pass by having already finished.
+    #[test]
+    fn an_immediate_shutdown_leaves_operations_it_did_not_issue_alone() {
+        use crate::io_ring::ops::ReadOp;
+
+        const EXTERNAL_USER_DATA: usize = 0xE0E0;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        // A second ring, sharing the pipe handle but nothing else.
+        let mut external = IoRing::builder().build().unwrap();
+        let mut external_buf = vec![0_u8; 16];
+        let read = ReadOp::builder()
+            .with_raw_handle(pipe.server.as_raw_handle())
+            .with_raw_data_address(external_buf.as_mut_ptr().cast())
+            .with_num_of_bytes_to_read(external_buf.len() as u32)
+            .with_offset(0)
+            .with_user_data(EXTERNAL_USER_DATA)
+            .build()
+            .unwrap();
+        // SAFETY: `pipe` and `external_buf` both outlive `external`, which is
+        // closed at the end of this test before either is dropped.
+        unsafe { external.build_read_file(read) }.unwrap();
+        external.submit(0, 0).unwrap();
+
+        // The driver's own operation on the same handle, queued after the
+        // external one so the external read is first in line for any data.
+        let mut ours = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(ours.as_mut().poll(&mut cx).is_pending());
+
+        assert!(
+            external.pop_completion().unwrap().is_none(),
+            "the external read must still be pending for this test to mean anything"
+        );
+
+        handle.shutdown_now();
+        let mut outcome = StepOutcome::Progressing;
+        for _ in 0..32 {
+            let (wakers, step) = driver.inner.borrow_mut().drain_step();
+            for waker in wakers {
+                waker.wake();
+            }
+            outcome = step;
+            if step != StepOutcome::Progressing {
+                break;
+            }
+        }
+        assert_eq!(
+            outcome,
+            StepOutcome::Quiescent,
+            "the driver's own operation must be cancelled and drained"
+        );
+        assert!(ours.as_mut().poll(&mut cx).is_ready());
+        drop(driver);
+
+        // The external operation survived the shutdown untouched: still pending,
+        // and still able to report its own outcome.
+        assert!(
+            external.pop_completion().unwrap().is_none(),
+            "an immediate shutdown must not cancel an operation the driver never issued"
+        );
+
+        pipe.write_from_client(b"mine");
+        external.submit(1, 5000).unwrap();
+        let cqe = external
+            .pop_completion()
+            .unwrap()
+            .expect("the external read must report its own outcome");
+        assert_eq!(cqe.UserData, EXTERNAL_USER_DATA);
+        cqe.ResultCode.ok().expect("the external read must succeed");
+        assert_eq!(cqe.Information, 4);
+        assert_eq!(&external_buf[..4], b"mine");
+
+        external.close().unwrap();
     }
 }

@@ -96,6 +96,22 @@ const KIND_MASK: usize = (1 << KIND_BITS) - 1;
 const INDEX_MASK: usize = (1 << INDEX_BITS) - 1;
 const GENERATION_MASK: usize = (1usize << GENERATION_BITS) - 1;
 
+/// The generation a slot starts at, chosen so that **no issued token is ever
+/// zero**.
+///
+/// This is a platform requirement, not a bookkeeping preference. A cancellation
+/// request names its target by user data, and the platform reads a target of
+/// `0` as "everything on this handle": cancelling an operation whose user data
+/// were zero would abort every other pending operation on the same file —
+/// including operations issued by other rings elsewhere in the process, which
+/// this crate has no business touching.
+///
+/// Zero is only reachable as `Operation` (kind bit `0`) in slot `0` at
+/// generation `0`, so starting every slot one generation higher removes it. The
+/// counter only ever increases — an exhausted slot is retired rather than
+/// wrapped — so no slot returns to generation zero later.
+const FIRST_GENERATION: usize = 1;
+
 /// Identifies a slot, and what sort of completion to expect for it.
 ///
 /// Tokens are handed to the platform as user data and come back on completion.
@@ -273,7 +289,7 @@ impl OpSlab {
                     return Err(payload);
                 }
                 self.slots.push(Slot {
-                    generation: 0,
+                    generation: FIRST_GENERATION,
                     state: SlotState::Vacant { next_free: None },
                 });
                 self.slots.len() - 1
@@ -808,6 +824,38 @@ mod tests {
         assert_eq!(t.kind(), TokenKind::Cancel);
         assert_eq!(t.index(), max_index);
         assert_eq!(t.generation(), max_generation);
+    }
+
+    /// No token the slab issues may be zero, because the platform reads a
+    /// cancellation target of zero as "cancel everything on this handle" — which
+    /// would reach operations this crate never issued. The very first operation
+    /// is the dangerous one: slot 0 at the starting generation, with the kind bit
+    /// clear, is the only combination that could produce zero.
+    #[test]
+    fn no_issued_token_is_ever_zero() {
+        let mut slab = OpSlab::new();
+
+        let first = slab.insert(payload(1)).unwrap();
+        assert_eq!(
+            first.index(),
+            0,
+            "this must be the slot that could hit zero"
+        );
+        assert_ne!(first.as_user_data(), 0);
+        assert_ne!(first.to_cancel().as_user_data(), 0);
+
+        // And it stays true as slots are added and recycled.
+        let mut seen = vec![first];
+        for _ in 0..64 {
+            seen.push(slab.insert(payload(2)).unwrap());
+        }
+        for token in seen {
+            assert_ne!(token.as_user_data(), 0);
+            let _ = slab.complete(token);
+        }
+        for _ in 0..64 {
+            assert_ne!(slab.insert(payload(3)).unwrap().as_user_data(), 0);
+        }
     }
 
     /// A completion for a long-finished operation must never be attributed to

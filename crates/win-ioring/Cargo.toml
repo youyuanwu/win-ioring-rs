@@ -13,6 +13,10 @@ windows.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# Named pipes are the only source of a genuinely long-running I/O operation
+# available here, and shutdown tests need one to avoid passing vacuously.
+# Dev-only, so the library itself keeps its narrower platform surface.
+windows = { workspace = true, features = ["Win32_System_Pipes"] }
 
 [lints]
 workspace = true
