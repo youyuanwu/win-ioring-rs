@@ -18,10 +18,11 @@ are statically imported, so a binary linking this crate will fail to load at all
 on an older host — there is no opportunity to report a friendly error. If you
 need to support older Windows, load a separate module dynamically.
 
-Because of that, `Error::Unsupported` never reports "this host has no IoRing".
-It reports only the shortfalls a host with IoRing can still have: a ring version
-below what you asked for, a missing feature flag, or an operation the host does
-not implement. Those you *can* detect and handle.
+Because of that, this crate has no error meaning "this host has no IoRing". It
+reports only the shortfalls a host *with* IoRing can still have, each as its own
+variant you can match on: `Error::UnsupportedVersion` for a ring version below
+what you asked for, `Error::UnsupportedFeature` for a missing feature flag, and
+`Error::UnsupportedOp` for an operation the host does not implement.
 
 ## Runtime agnostic
 

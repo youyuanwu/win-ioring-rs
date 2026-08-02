@@ -777,6 +777,41 @@ fn a_closed_ring_refuses_every_operation() {
             ring.build_flush_file(flush),
             Err(Error::RingClosed)
         ));
+
+        let write = crate::io_ring::ops::WriteOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_raw_data_address(buffer.as_mut_ptr() as *mut _)
+            .with_num_of_bytes_to_write(8)
+            .with_offset(0)
+            .with_user_data(3)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            ring.build_write_file(write),
+            Err(Error::RingClosed)
+        ));
+
+        let cancel = crate::io_ring::ops::CancelOp::builder()
+            .with_raw_handle(file.as_raw_handle())
+            .with_op_to_cancel(1)
+            .with_user_data(4)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            ring.build_cancel_request(cancel),
+            Err(Error::RingClosed)
+        ));
+
+        assert!(matches!(
+            ring.build_register_file_handles(&[file.as_raw_handle()], 5),
+            Err(Error::RingClosed)
+        ));
+
+        let descriptor = crate::io_ring::BufferInfo::raw_from_vec(&mut buffer);
+        assert!(matches!(
+            ring.build_register_buffers(&[descriptor], 6),
+            Err(Error::RingClosed)
+        ));
     }
 
     // Closing again stays a no-op.

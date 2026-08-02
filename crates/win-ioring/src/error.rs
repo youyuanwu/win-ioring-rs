@@ -360,6 +360,7 @@ mod tests {
             Error::DriverGone,
             Error::ShuttingDown,
             Error::OperationOutstanding,
+            Error::RingClosed,
             Error::MissingField { field: "handle" },
             Error::Os(windows::core::Error::from(
                 windows::Win32::Foundation::E_FAIL,
@@ -367,6 +368,32 @@ mod tests {
         ];
         for v in variants {
             assert!(!v.to_string().is_empty(), "empty Display for {v:?}");
+        }
+    }
+
+    /// Fails to compile when a variant is added, so the list above cannot
+    /// silently fall behind.
+    ///
+    /// The `Display` test builds its variants by hand, and nothing else would
+    /// notice a new one being missed.
+    fn _every_variant_is_listed_above(e: &Error) {
+        match e {
+            Error::Unsupported
+            | Error::UnsupportedVersion { .. }
+            | Error::UnsupportedFeature { .. }
+            | Error::UnsupportedOp { .. }
+            | Error::QueueFull
+            | Error::InvalidRegisteredIndex { .. }
+            | Error::BufferTooSmall { .. }
+            | Error::UninitializedWriteRange { .. }
+            | Error::RegisteredRangeOutOfBounds { .. }
+            | Error::BufferRetained
+            | Error::DriverGone
+            | Error::ShuttingDown
+            | Error::OperationOutstanding
+            | Error::RingClosed
+            | Error::MissingField { .. }
+            | Error::Os(_) => {}
         }
     }
 }

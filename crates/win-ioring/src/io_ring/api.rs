@@ -464,6 +464,7 @@ impl IoRing {
         handles: &[HANDLE],
         userdata: usize,
     ) -> Result<()> {
+        self.ensure_open()?;
         // SAFETY: `self.ring` has not been closed, per the guard above, and the caller guarantees the handles stay
         // open for as long as the registration lives.
         unsafe { BuildIoRingRegisterFileHandles(self.ring, handles, userdata) }.map_err(Error::from)
@@ -483,6 +484,7 @@ impl IoRing {
         buffers: &[BufferInfo],
         userdata: usize,
     ) -> Result<()> {
+        self.ensure_open()?;
         // Convert the types.
         // SAFETY: `BufferInfo` is a transparent wrapper over `IORING_BUFFER_INFO`,
         // so the two have the same layout, and the slice is borrowed for the
