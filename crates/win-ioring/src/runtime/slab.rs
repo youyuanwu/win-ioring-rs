@@ -40,7 +40,7 @@
 //! detached-but-unsubmitted operation from a detached-and-submitted one, which
 //! need different handling: only the latter can be cancelled.
 //!
-//! [`SlotState::Tombstone`] is a third, terminal state, entered when an
+//! `SlotState::Tombstone` is a third, terminal state, entered when an
 //! operation's own completion arrives while cancellation requests against it are
 //! still outstanding.
 

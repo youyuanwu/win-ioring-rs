@@ -2270,6 +2270,60 @@ mod tests {
         File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap()
     }
 
+    /// FR-038: filling the submission queue must produce a distinct, matchable
+    /// error, and must hand the caller's buffer straight back.
+    ///
+    /// The buffer is what makes this worth testing separately from the raw
+    /// layer's own queue-full test: a safe API that swallowed it on rejection
+    /// would be losing the caller's data.
+    #[test]
+    fn a_full_submission_queue_returns_the_buffer_with_the_error() {
+        let ring = IoRing::builder()
+            .with_submission_queue_size(2)
+            .with_completion_queue_size(2)
+            .build()
+            .unwrap();
+        let capacity = ring.info().unwrap().submission_queue_size;
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Build without ever submitting, so the queue can only fill up.
+        let mut held = Vec::new();
+        let mut rejected = None;
+        for i in 0..(capacity + 4) {
+            let marker = (i % 251) as u8;
+            let fut = handle.read(&file, vec![marker; 16], 8, 0);
+            // A rejected operation never reached the kernel, so it has no
+            // identifier.
+            match fut.operation_id() {
+                Some(_) => held.push(fut),
+                None => {
+                    rejected = Some((marker, fut));
+                    break;
+                }
+            }
+        }
+
+        let (marker, fut) = rejected.expect("the submission queue never filled up");
+        let outcome = futures::executor::block_on(fut);
+        assert!(
+            matches!(outcome.err(), Some(Error::QueueFull)),
+            "expected QueueFull, got {:?}",
+            outcome.err()
+        );
+        let (_, buffer) = outcome.expect_completed().into_parts();
+        assert_eq!(
+            buffer,
+            vec![marker; 16],
+            "the rejected read must return the caller's buffer untouched"
+        );
+
+        drop(held);
+        handle.shutdown();
+        drain(&driver);
+    }
+
     /// Runs the driver by hand until nothing is outstanding.
     ///
     /// Submits as well as reaps, because a tombstoned slot clears only once its

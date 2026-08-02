@@ -36,3 +36,14 @@ jobs:
 
     - name: Run cargo test
       run: cargo test --workspace --all-targets --all-features
+
+    # `--all-targets` excludes documentation tests, and the crate's
+    # compile-time guarantees are asserted by `compile_fail` doc-tests, so they
+    # have to be invoked explicitly or those assertions never run.
+    - name: Run doc tests
+      run: cargo test --workspace --all-features --doc
+
+    - name: Build documentation
+      run: cargo doc --workspace --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
