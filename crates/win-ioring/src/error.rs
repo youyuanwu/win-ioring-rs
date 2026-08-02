@@ -94,17 +94,6 @@ pub enum Error {
         extent: u64,
     },
 
-    /// The operation could not complete and its buffer could not be recovered.
-    ///
-    /// This is the one case in which a caller does not get its buffer back. It
-    /// arises when the driver is torn down while a submission queue entry still
-    /// references the buffer, so releasing it would risk the kernel writing into
-    /// freed memory. The buffer is retained (leaked) instead.
-    BufferRetained,
-
-    /// The driver this operation belonged to no longer exists.
-    DriverGone,
-
     /// The driver is shutting down and is not accepting new operations.
     ShuttingDown,
 
@@ -266,11 +255,6 @@ impl fmt::Display for Error {
                 "registered buffer {index} range {offset}..{} exceeds its extent of {extent}",
                 offset.saturating_add(*length)
             ),
-            Error::BufferRetained => write!(
-                f,
-                "the operation could not complete and its buffer was retained because the kernel may still access it"
-            ),
-            Error::DriverGone => write!(f, "the driver no longer exists"),
             Error::ShuttingDown => write!(f, "the driver is shutting down"),
             Error::AbandonedAtShutdown => write!(
                 f,
@@ -385,8 +369,6 @@ mod tests {
                 length: 16,
                 extent: 16,
             },
-            Error::BufferRetained,
-            Error::DriverGone,
             Error::ShuttingDown,
             Error::AbandonedAtShutdown,
             Error::ShutdownStalled { outstanding: 3 },
@@ -418,8 +400,6 @@ mod tests {
             | Error::BufferTooSmall { .. }
             | Error::UninitializedWriteRange { .. }
             | Error::RegisteredRangeOutOfBounds { .. }
-            | Error::BufferRetained
-            | Error::DriverGone
             | Error::ShuttingDown
             | Error::AbandonedAtShutdown
             | Error::ShutdownStalled { .. }

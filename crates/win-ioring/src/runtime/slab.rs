@@ -217,10 +217,6 @@ pub struct OpSlab {
     slots: Vec<Slot>,
     free_head: Option<usize>,
     occupied: usize,
-    /// Set by [`OpSlab::leak`]. A leaked slab has abandoned buffers the kernel
-    /// may still write into, and its token namespace has been discarded, so it
-    /// must never hand out a token again.
-    poisoned: bool,
 }
 
 impl OpSlab {
@@ -230,13 +226,7 @@ impl OpSlab {
             slots: Vec::new(),
             free_head: None,
             occupied: 0,
-            poisoned: false,
         }
-    }
-
-    /// Returns `true` if this slab has been leaked and is no longer usable.
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
     }
 
     /// Returns the number of slots holding a live operation.
@@ -268,12 +258,8 @@ impl OpSlab {
     /// # Errors
     ///
     /// Returns the payload unchanged if the slab is full, which happens when
-    /// [`MAX_SLOTS`] slots are already in use, or if the slab has been leaked
-    /// and is therefore poisoned.
+    /// [`MAX_SLOTS`] slots are already in use.
     pub fn insert(&mut self, payload: Box<dyn Any>) -> Result<Token, Box<dyn Any>> {
-        if self.poisoned {
-            return Err(payload);
-        }
         let index = match self.free_head {
             Some(index) => {
                 let SlotState::Vacant { next_free } = self.slots[index].state else {
@@ -601,9 +587,7 @@ impl OpSlab {
     }
 
     /// Visits every live payload.
-    ///
-    /// Teardown uses this to resolve waiting futures before abandoning their
-    /// buffers, which must happen in that order or those futures hang forever.
+    #[cfg(test)]
     pub fn for_each_payload(&mut self, mut f: impl FnMut(&mut dyn Any)) {
         for slot in &mut self.slots {
             if let SlotState::Occupied {
@@ -734,31 +718,6 @@ impl OpSlab {
                 )
             })
             .count()
-    }
-
-    /// Deliberately leaks every remaining payload and renders the slab unusable.
-    ///
-    /// Used at teardown when the kernel may still hold pointers into those
-    /// buffers and quiescence could not be established. Leaking is the correct
-    /// trade against a use-after-free.
-    ///
-    /// This is a **terminal** operation. The slab is emptied and poisoned: it
-    /// will refuse to insert anything afterwards. That matters because leaking
-    /// discards the token namespace along with the slots, so a fresh insert
-    /// could otherwise mint a token identical to one the kernel still holds,
-    /// and a late completion would then release an unrelated payload.
-    pub fn leak(&mut self) -> usize {
-        let mut leaked = 0;
-        for slot in self.slots.drain(..) {
-            if let SlotState::Occupied { payload, .. } = slot.state {
-                std::mem::forget(payload);
-                leaked += 1;
-            }
-        }
-        self.free_head = None;
-        self.occupied = 0;
-        self.poisoned = true;
-        leaked
     }
 }
 
@@ -1165,55 +1124,5 @@ mod tests {
         assert_eq!(drained.len(), 5);
         assert_eq!(slab.occupied(), 0);
         assert_eq!(slab.outstanding(), 0);
-    }
-
-    #[test]
-    fn leak_forgets_payloads_without_dropping_them() {
-        use std::rc::Rc;
-
-        let witness = Rc::new(());
-        let mut slab = OpSlab::new();
-        for _ in 0..3 {
-            slab.insert(Box::new(witness.clone())).unwrap();
-        }
-        assert_eq!(Rc::strong_count(&witness), 4);
-
-        let leaked = slab.leak();
-        assert_eq!(leaked, 3);
-        assert_eq!(slab.occupied(), 0);
-        assert_eq!(slab.outstanding(), 0);
-        // The clones were forgotten rather than dropped, which is exactly what
-        // teardown needs when the kernel may still reach the buffers.
-        assert_eq!(Rc::strong_count(&witness), 4);
-    }
-
-    /// `leak` is terminal. Reusing the slab afterwards would mint tokens
-    /// identical to ones the kernel still holds, so a late completion could
-    /// release an unrelated payload.
-    #[test]
-    fn leak_poisons_the_slab_against_reuse() {
-        let mut slab = OpSlab::new();
-        let a = slab.insert(payload(1)).unwrap();
-        let b = slab.insert(payload(2)).unwrap();
-        // Free one slot so the free list is non-empty before leaking.
-        slab.complete(a).unwrap();
-
-        slab.leak();
-        assert!(slab.is_poisoned());
-        assert_eq!(slab.occupied(), 0);
-        assert_eq!(slab.outstanding(), 0);
-        assert_eq!(slab.lookup(a), Lookup::Unknown);
-        assert_eq!(slab.lookup(b), Lookup::Unknown);
-
-        // A fresh insert would otherwise reuse index 0 generation 0, exactly
-        // the token the kernel still holds for the leaked operation.
-        assert!(
-            slab.insert(payload(3)).is_err(),
-            "a leaked slab must refuse to mint new tokens"
-        );
-        assert_eq!(slab.occupied(), 0);
-
-        // Late completions for the leaked operations are inert.
-        assert!(slab.complete(b).is_none());
     }
 }

@@ -280,6 +280,11 @@ impl<T, B> BufResult<T, B> {
         self.result.is_ok()
     }
 
+    /// Returns the error, if the operation failed.
+    pub fn err(&self) -> Option<&Error> {
+        self.result.as_ref().err()
+    }
+
     /// Maps the success value, leaving the buffer untouched.
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> BufResult<U, B> {
         BufResult {

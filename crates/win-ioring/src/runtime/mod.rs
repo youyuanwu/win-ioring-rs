@@ -54,57 +54,6 @@ pub mod slab;
 
 use slab::{Lifecycle, OpSlab, Token, TokenKind};
 
-/// The outcome of an operation.
-///
-/// Almost every completion is [`Outcome::Completed`], which carries the result
-/// and hands the caller's buffer back. [`Outcome::Retained`] covers the one case
-/// where the buffer cannot be returned: the driver was torn down while the
-/// kernel could still reach it, so it was leaked rather than freed.
-#[derive(Debug)]
-pub enum Outcome<T, B> {
-    /// The operation reached a terminal state and the buffer came back.
-    Completed(BufResult<T, B>),
-    /// The buffer could not be recovered and was retained.
-    Retained(Error),
-}
-
-impl<T, B> Outcome<T, B> {
-    /// Returns the [`BufResult`], panicking if the buffer was retained.
-    ///
-    /// # Panics
-    ///
-    /// Panics on [`Outcome::Retained`], which only arises during an unclean
-    /// teardown.
-    pub fn expect_completed(self) -> BufResult<T, B> {
-        match self {
-            Outcome::Completed(r) => r,
-            Outcome::Retained(e) => panic!("operation buffer was retained: {e}"),
-        }
-    }
-
-    /// Returns the success value and the buffer, panicking on any failure.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the operation failed or its buffer was retained.
-    pub fn unwrap(self) -> (T, B) {
-        self.expect_completed().unwrap()
-    }
-
-    /// Returns `true` if the operation completed and succeeded.
-    pub fn is_ok(&self) -> bool {
-        matches!(self, Outcome::Completed(r) if r.is_ok())
-    }
-
-    /// Returns the error, if this outcome represents any kind of failure.
-    pub fn err(&self) -> Option<&Error> {
-        match self {
-            Outcome::Completed(r) => r.result.as_ref().err(),
-            Outcome::Retained(e) => Some(e),
-        }
-    }
-}
-
 /// Identifies a submitted operation, for explicit cancellation.
 ///
 /// The driver already knows which file an operation targets, so cancelling it
@@ -135,8 +84,6 @@ type CompletedOp = (Result<Transferred>, Option<Box<dyn Any>>);
 struct ResultSlot {
     /// The result and, for operations that carry one, the buffer.
     completed: Option<CompletedOp>,
-    /// Set at teardown when the buffer had to be abandoned.
-    retained: bool,
     waker: Option<Waker>,
 }
 
@@ -144,7 +91,6 @@ impl ResultSlot {
     fn new() -> Self {
         Self {
             completed: None,
-            retained: false,
             waker: None,
         }
     }
@@ -273,12 +219,9 @@ pub enum Registered<T> {
     Ok,
     /// The registration failed and the caller's resources are returned.
     ///
-    /// The one exception is [`Error::BufferRetained`]: the driver was torn down
-    /// while the registration was still outstanding, so the buffers were
-    /// abandoned rather than freed — the kernel may still hold pointers to them
-    /// — and this vector is empty. That is the same leak policy operations
-    /// follow, and it is the only case where a failure does not hand the
-    /// resources back.
+    /// Unlike before, there is no case in which they are not: teardown drains
+    /// until every registration attempt has reported, so a failure always hands
+    /// the resources back.
     Failed(Error, Vec<T>),
 }
 
@@ -383,6 +326,12 @@ struct DriverInner {
     /// Gates cancellation and submission, and resolves shutdown-completion
     /// waiters.
     torn_down: bool,
+    /// Wakers of futures awaiting the end of teardown, each tagged so a
+    /// re-poll replaces its own entry rather than adding a second, and a drop
+    /// removes it. Without both, a `select!` loop would grow this without bound.
+    shutdown_waiters: Vec<(u64, Waker)>,
+    /// Source of the tags above.
+    next_waiter_id: u64,
     /// Errors awaiting delivery to the observer.
     ///
     /// Reporting happens outside the driver's borrow, for the same reason
@@ -904,6 +853,10 @@ impl DriverInner {
         self.file_registration = None;
         self.retired_file_registrations.clear();
         self.torn_down = true;
+        // Everything is released, so anyone awaiting the end of teardown can be
+        // told. Collected rather than woken here, like every other waker: an
+        // executor may poll inline and call straight back into the driver.
+        wakers.extend(self.shutdown_waiters.drain(..).map(|(_, w)| w));
         wakers
     }
 
@@ -1088,6 +1041,8 @@ impl Driver {
                 pending_submit: false,
                 shutdown: ShutdownMode::Running,
                 teardown_started: false,
+                shutdown_waiters: Vec::new(),
+                next_waiter_id: 0,
                 torn_down: false,
                 deferred_reports: Vec::new(),
                 submit_failures: 0,
@@ -1296,10 +1251,63 @@ impl Drop for Driver {
 /// futures and delivering reports — because unwinding out of a half-finished
 /// teardown would drop the driver's fields while the ring is still open.
 struct AbortOnUnwind;
-
 impl Drop for AbortOnUnwind {
     fn drop(&mut self) {
         abort_with("a panic escaped teardown while the I/O ring was still open");
+    }
+}
+
+/// Resolves once the driver has finished tearing down.
+///
+/// Created by [`Handle::shutdown_complete`].
+pub struct ShutdownComplete {
+    driver: Rc<RefCell<DriverInner>>,
+    /// Assigned on first poll, so a re-poll replaces this future's waker rather
+    /// than registering a second one, and dropping removes exactly this entry.
+    id: Option<u64>,
+}
+
+impl Future for ShutdownComplete {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let mut inner = this.driver.borrow_mut();
+        if inner.torn_down {
+            return Poll::Ready(());
+        }
+
+        let id = match this.id {
+            Some(id) => id,
+            None => {
+                let id = inner.next_waiter_id;
+                inner.next_waiter_id += 1;
+                this.id = Some(id);
+                id
+            }
+        };
+
+        // Replace rather than append, or a future polled repeatedly — which is
+        // to say any future in a `select!` loop — would accumulate wakers.
+        if let Some(slot) = inner.shutdown_waiters.iter_mut().find(|(w, _)| *w == id) {
+            slot.1 = cx.waker().clone();
+        } else {
+            inner.shutdown_waiters.push((id, cx.waker().clone()));
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for ShutdownComplete {
+    fn drop(&mut self) {
+        let Some(id) = self.id else {
+            return;
+        };
+        // Abandoning the wait must not leave a waker behind. `try_borrow_mut`
+        // because this can run while the driver is mid-teardown.
+        if let Ok(mut inner) = self.driver.try_borrow_mut() {
+            inner.shutdown_waiters.retain(|(w, _)| *w != id);
+        }
     }
 }
 
@@ -1356,6 +1364,22 @@ impl Handle {
     /// [`Handle::shutdown`] or [`Handle::shutdown_now`].
     pub fn is_shutting_down(&self) -> bool {
         self.strong.borrow().shutdown != ShutdownMode::Running
+    }
+
+    /// Resolves once teardown has finished and every resource has been released.
+    ///
+    /// Resolves immediately if that has already happened. Useful for code that
+    /// holds a [`Handle`] but not the [`Driver`]; if you have the driver,
+    /// awaiting [`Driver::drive`] tells you the same thing.
+    ///
+    /// This cannot resolve unless something is driving the driver — either
+    /// [`Driver::drive`] is running, or the driver is dropped. Nothing here
+    /// performs the drain on its own.
+    pub fn shutdown_complete(&self) -> ShutdownComplete {
+        ShutdownComplete {
+            driver: Rc::clone(&self.strong),
+            id: None,
+        }
     }
 
     /// Returns the number of operations the driver is still tracking.
@@ -1630,6 +1654,7 @@ impl Handle {
 
         Ok(WriteFuture {
             inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
+            done: false,
             _buffer: PhantomData,
         })
     }
@@ -2181,10 +2206,8 @@ impl Future for RegisteredOpFuture {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(resolution) => {
                     this.state = RegisteredOpState::Done;
-                    Poll::Ready(match resolution {
-                        Resolution::Completed(result, _) => result,
-                        Resolution::Retained(e) => Err(e),
-                    })
+                    let Resolution(result, _) = resolution;
+                    Poll::Ready(result)
                 }
             },
         }
@@ -2250,14 +2273,13 @@ impl Future for RegistrationFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.inner.poll_resolution(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Resolution::Completed(result, returned)) => {
+            Poll::Ready(Resolution(result, returned)) => {
                 let returned = returned.and_then(|b| b.downcast::<PendingRegistration>().ok());
                 Poll::Ready(match result {
                     Ok(_) => Ok(()),
                     Err(e) => Err((e, returned.map(|b| *b))),
                 })
             }
-            Poll::Ready(Resolution::Retained(e)) => Poll::Ready(Err((e, None))),
         }
     }
 }
@@ -2293,14 +2315,13 @@ struct OpFuture {
     finished: bool,
 }
 
-/// How an operation ended.
-enum Resolution {
-    /// The kernel reported a terminal result, along with the buffer if the
-    /// operation carried one.
-    Completed(Result<Transferred>, Option<Box<dyn Any>>),
-    /// The buffer could not be recovered, so it was abandoned.
-    Retained(Error),
-}
+/// How an operation ended: the kernel's terminal result, along with the buffer
+/// if the operation carried one.
+///
+/// There is no "buffer abandoned" case. Teardown drains until every operation
+/// has reported before it releases anything, so a caller always gets its buffer
+/// back.
+struct Resolution(Result<Transferred>, Option<Box<dyn Any>>);
 
 impl OpFuture {
     fn pending(
@@ -2322,20 +2343,19 @@ impl OpFuture {
         if let Some((result, buffer)) = slot.completed.take() {
             drop(slot);
             self.finished = true;
-            return Poll::Ready(Resolution::Completed(result, buffer));
+            return Poll::Ready(Resolution(result, buffer));
         }
 
-        if slot.retained {
-            drop(slot);
-            self.finished = true;
-            return Poll::Ready(Resolution::Retained(Error::BufferRetained));
-        }
-
-        if self.driver.upgrade().is_none() {
-            drop(slot);
-            self.finished = true;
-            return Poll::Ready(Resolution::Retained(Error::DriverGone));
-        }
+        // There is deliberately no third case here. Teardown resolves every
+        // slot before the driver's state can be destroyed, and no operation can
+        // be started afterwards, so an unresolved slot with a dead driver cannot
+        // occur. Reaching this point with neither a result nor a live driver
+        // would mean that invariant had been broken, and the alternatives are a
+        // silent hang or an outcome with no buffer to return.
+        debug_assert!(
+            self.driver.strong_count() > 0,
+            "an operation outlived its driver without being resolved by teardown"
+        );
 
         slot.waker = Some(cx.waker().clone());
         Poll::Pending
@@ -2387,16 +2407,12 @@ impl Drop for OpFuture {
     }
 }
 
-/// Turns a resolution into an outcome, recovering the caller's buffer.
-fn into_outcome<B: 'static>(resolution: Resolution) -> Outcome<Transferred, B> {
-    match resolution {
-        Resolution::Completed(result, buffer) => {
-            let buffer = buffer.expect("a buffer-carrying operation lost its buffer");
-            let buffer = *buffer.downcast::<B>().expect("buffer type mismatch");
-            Outcome::Completed(BufResult::new(result, buffer))
-        }
-        Resolution::Retained(e) => Outcome::Retained(e),
-    }
+/// Turns a resolution into a buffer result, recovering the caller's buffer.
+fn into_outcome<B: 'static>(resolution: Resolution) -> BufResult<Transferred, B> {
+    let Resolution(result, buffer) = resolution;
+    let buffer = buffer.expect("a buffer-carrying operation lost its buffer");
+    let buffer = *buffer.downcast::<B>().expect("buffer type mismatch");
+    BufResult::new(result, buffer)
 }
 
 /// A read in progress.
@@ -2407,6 +2423,9 @@ pub struct ReadFuture<B> {
 /// A write in progress.
 pub struct WriteFuture<B> {
     inner: OpFuture,
+    /// Set once a result has been handed out, so a second poll panics rather
+    /// than falling through to a path that cannot produce a buffer.
+    done: bool,
     /// Records the buffer type without affecting auto traits.
     _buffer: PhantomData<fn() -> B>,
 }
@@ -2448,7 +2467,7 @@ impl<B: IoBufMut> ReadFuture<B> {
 }
 
 impl<B: IoBufMut> Future for ReadFuture<B> {
-    type Output = Outcome<Transferred, B>;
+    type Output = BufResult<Transferred, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -2456,16 +2475,14 @@ impl<B: IoBufMut> Future for ReadFuture<B> {
             BufOpState::Failed(taken) => {
                 let (error, buffer) = taken.take().expect("polled after completion");
                 this.state = BufOpState::Done;
-                Poll::Ready(Outcome::Completed(BufResult::new(Err(error), buffer)))
+                Poll::Ready(BufResult::new(Err(error), buffer))
             }
             BufOpState::Done => panic!("read future polled after completion"),
             BufOpState::Waiting(op) => match op.poll_resolution(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(resolution) => {
-                    let mut outcome = into_outcome::<B>(resolution);
-                    if let Outcome::Completed(result) = &mut outcome
-                        && let Ok(transferred) = &result.result
-                    {
+                    let mut result = into_outcome::<B>(resolution);
+                    if let Ok(transferred) = &result.result {
                         // SAFETY: the kernel reported writing this many bytes
                         // into the buffer, so they are initialized, and the
                         // count is bounded by the capacity checked before
@@ -2473,7 +2490,7 @@ impl<B: IoBufMut> Future for ReadFuture<B> {
                         unsafe { result.buffer.set_buf_init(*transferred as usize) };
                     }
                     this.state = BufOpState::Done;
-                    Poll::Ready(outcome)
+                    Poll::Ready(result)
                 }
             },
         }
@@ -2489,12 +2506,12 @@ impl<B: IoBuf> WriteFuture<B> {
                 token: Token::from_user_data(0),
                 slot: Rc::new(RefCell::new(ResultSlot {
                     completed: Some((Err(error), Some(Box::new(buffer)))),
-                    retained: false,
                     waker: None,
                 })),
                 driver: Weak::new(),
                 finished: true,
             },
+            done: false,
             _buffer: PhantomData,
         }
     }
@@ -2511,15 +2528,21 @@ impl<B: IoBuf> WriteFuture<B> {
 }
 
 impl<B: IoBuf> Future for WriteFuture<B> {
-    type Output = Outcome<Transferred, B>;
+    type Output = BufResult<Transferred, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if this.done {
+            panic!("write future polled after completion");
+        }
         // A rejected write has its result waiting in the slot already, so this
         // takes the same path as a real completion.
         match this.inner.poll_resolution(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(resolution) => Poll::Ready(into_outcome::<B>(resolution)),
+            Poll::Ready(resolution) => {
+                this.done = true;
+                Poll::Ready(into_outcome::<B>(resolution))
+            }
         }
     }
 }
@@ -2527,7 +2550,7 @@ impl<B: IoBuf> Future for WriteFuture<B> {
 /// A flush in progress.
 ///
 /// Flush carries no caller buffer, so it resolves to a plain result rather than
-/// an [`Outcome`].
+/// a [`BufResult`].
 pub struct FlushFuture {
     state: FlushState,
 }
@@ -2565,10 +2588,8 @@ impl Future for FlushFuture {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(resolution) => {
                     this.state = FlushState::Done;
-                    Poll::Ready(match resolution {
-                        Resolution::Completed(result, _) => result.map(|_| ()),
-                        Resolution::Retained(e) => Err(e),
-                    })
+                    let Resolution(result, _) = resolution;
+                    Poll::Ready(result.map(|_| ()))
                 }
             },
         }
@@ -2580,22 +2601,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outcome_reports_errors_from_either_shape() {
-        let completed: Outcome<u32, Vec<u8>> =
-            Outcome::Completed(BufResult::new(Err(Error::QueueFull), vec![1]));
-        assert!(!completed.is_ok());
-        assert!(matches!(completed.err(), Some(Error::QueueFull)));
+    fn a_buffer_result_reports_success_and_failure() {
+        let failed: BufResult<u32, Vec<u8>> = BufResult::new(Err(Error::QueueFull), vec![1]);
+        assert!(!failed.is_ok());
+        assert!(matches!(failed.err(), Some(Error::QueueFull)));
 
-        let retained: Outcome<u32, Vec<u8>> = Outcome::Retained(Error::BufferRetained);
-        assert!(!retained.is_ok());
-        assert!(matches!(retained.err(), Some(Error::BufferRetained)));
-
-        let ok: Outcome<u32, Vec<u8>> = Outcome::Completed(BufResult::new(Ok(3), vec![1, 2, 3]));
+        let ok: BufResult<u32, Vec<u8>> = BufResult::new(Ok(3), vec![1, 2, 3]);
         assert!(ok.is_ok());
         assert!(ok.err().is_none());
         let (n, buf) = ok.unwrap();
         assert_eq!(n, 3);
         assert_eq!(buf, vec![1, 2, 3]);
+    }
+
+    /// SC-021: the completion signal resolves once teardown has finished, and
+    /// resolves immediately if it already has.
+    #[test]
+    fn shutdown_complete_resolves_after_teardown() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut before = Box::pin(handle.shutdown_complete());
+        assert!(
+            before.as_mut().poll(&mut cx).is_pending(),
+            "teardown has not happened yet"
+        );
+        assert_eq!(
+            driver.inner.borrow().shutdown_waiters.len(),
+            1,
+            "the waiter must be registered"
+        );
+
+        // Re-polling must replace this future's waker, not add a second.
+        assert!(before.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().shutdown_waiters.len(),
+            1,
+            "re-polling must not accumulate wakers"
+        );
+
+        drop(driver);
+
+        assert!(
+            before.as_mut().poll(&mut cx).is_ready(),
+            "the signal must resolve once teardown has finished"
+        );
+        let mut after = Box::pin(handle.shutdown_complete());
+        assert!(
+            after.as_mut().poll(&mut cx).is_ready(),
+            "the signal must resolve immediately when teardown is already done"
+        );
+    }
+
+    /// SC-022: several waiters are all resolved, and a waiter dropped before
+    /// resolution leaves nothing behind.
+    #[test]
+    fn shutdown_complete_handles_several_waiters_and_abandonment() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut a = Box::pin(handle.shutdown_complete());
+        let mut b = Box::pin(handle.shutdown_complete());
+        let mut abandoned = Box::pin(handle.shutdown_complete());
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        assert!(abandoned.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(driver.inner.borrow().shutdown_waiters.len(), 3);
+
+        // Abandoning a wait must deregister it, or a `select!` loop would pin
+        // wakers for every branch it ever lost.
+        drop(abandoned);
+        assert_eq!(
+            driver.inner.borrow().shutdown_waiters.len(),
+            2,
+            "a dropped waiter must be removed"
+        );
+
+        drop(driver);
+        assert!(a.as_mut().poll(&mut cx).is_ready());
+        assert!(b.as_mut().poll(&mut cx).is_ready());
     }
 
     fn test_driver() -> Driver {
@@ -2653,7 +2743,7 @@ mod tests {
             "expected QueueFull, got {:?}",
             outcome.err()
         );
-        let (_, buffer) = outcome.expect_completed().into_parts();
+        let (_, buffer) = outcome.into_parts();
         assert_eq!(
             buffer,
             vec![marker; 16],
@@ -3255,10 +3345,7 @@ mod tests {
 
         match Pin::new(&mut fut).poll(&mut cx) {
             Poll::Ready(outcome) => {
-                let buffer = match outcome {
-                    Outcome::Completed(r) => r.into_parts().1,
-                    other => panic!("teardown must not abandon a buffer, got {other:?}"),
-                };
+                let buffer = outcome.into_parts().1;
                 // The length reflects what was transferred; the capacity proves
                 // this is the caller's original allocation coming back rather
                 // than something reconstructed.

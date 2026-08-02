@@ -24,20 +24,12 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
 
     // Positional read.
     let input = File::open(source.path()).unwrap();
-    let (read, buffer) = input
-        .read_at(handle, vec![0_u8; 32], 16, 0)
-        .await
-        .expect_completed()
-        .unwrap();
+    let (read, buffer) = input.read_at(handle, vec![0_u8; 32], 16, 0).await.unwrap();
     writeln!(out, "read_at: {read} {:?}", &buffer[..read as usize]).unwrap();
     writeln!(out, "cursor after read_at: {}", input.cursor()).unwrap();
 
     // Short read: asking past the end succeeds with fewer bytes.
-    let (read, _) = input
-        .read_at(handle, vec![0_u8; 64], 40, 8)
-        .await
-        .expect_completed()
-        .unwrap();
+    let (read, _) = input.read_at(handle, vec![0_u8; 64], 40, 8).await.unwrap();
     writeln!(out, "short read_at: {read}").unwrap();
 
     // A read with nothing left to give fails rather than returning zero.
@@ -45,11 +37,7 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     writeln!(out, "eof read_at: {:?}", outcome.err()).unwrap();
 
     // Zero-length read at a valid offset succeeds.
-    let (read, _) = input
-        .read_at(handle, vec![0_u8; 8], 0, 0)
-        .await
-        .expect_completed()
-        .unwrap();
+    let (read, _) = input.read_at(handle, vec![0_u8; 8], 0, 0).await.unwrap();
     writeln!(out, "empty read_at: {read}").unwrap();
 
     // Rejected before submission: the buffer cannot hold what was asked for.
@@ -59,11 +47,7 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     // Sequential reads walk the file and move the cursor.
     let mut input = input;
     for _ in 0..2 {
-        let (read, buffer) = input
-            .read(handle, vec![0_u8; 4], 4)
-            .await
-            .expect_completed()
-            .unwrap();
+        let (read, buffer) = input.read(handle, vec![0_u8; 4], 4).await.unwrap();
         writeln!(
             out,
             "read: {read} {:?} cursor {}",
@@ -79,7 +63,6 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     let (written, _) = output
         .write_at(handle, b"positional".to_vec(), 10, 0)
         .await
-        .expect_completed()
         .unwrap();
     writeln!(out, "write_at: {written} cursor {}", output.cursor()).unwrap();
 
@@ -87,7 +70,6 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     let (written, _) = output
         .write(handle, b"sequential".to_vec(), 10)
         .await
-        .expect_completed()
         .unwrap();
     writeln!(out, "write: {written} cursor {}", output.cursor()).unwrap();
 
@@ -142,14 +124,13 @@ pub async fn transcript(handle: &Handle, dir_tag: &str) -> String {
     let id = pending
         .operation_id()
         .expect("the read must have been built");
-    let done = pending.await.expect_completed();
+    let done = pending.await;
     writeln!(out, "final read: {:?}", done.result).unwrap();
     handle.cancel(id);
 
     let (read, _) = registered
         .read_at(handle, vec![0_u8; 4], 4, 0)
         .await
-        .expect_completed()
         .unwrap();
     writeln!(out, "read after stale cancel: {read}").unwrap();
 
