@@ -10,11 +10,10 @@ Roughly ordered by value.
 
 ### Owned buffers cannot be combined with registered handles
 
-A registered file handle is reachable only from `read_into_registered` /
-`write_from_registered`, which *force* a registered buffer. So the two
-registration kinds cannot be mixed: a caller with registered handles but
-caller-owned buffers has to pass a raw `File`. `flush` cannot name a registered
-handle at all.
+A registered file handle is reachable only from `read_registered` /
+`write_registered`, which *force* a registered buffer. So the two registration
+kinds cannot be mixed: a caller with registered handles but caller-owned buffers
+has to pass a raw `File`. `flush` cannot name a registered handle at all.
 
 Fixing this means threading a `FileTarget` through `Handle::read`,
 `Handle::write` and `Handle::flush`, changing three public signatures. It is the
@@ -67,18 +66,22 @@ registration is in force when the operation is *described*. The submission-queue
 entry carries only the bare index, so the kernel resolves it when the operation
 *executes*.
 
-If a supersession is adopted in between — a real interleaving, since
-registrations are adopted in completion order and both can be in one submission
-batch — the kernel resolves the index against the **new** registration.
+**Resolved for buffers.** A supersession can no longer be adopted while an
+operation names the old registration: holding a handle refuses re-registration
+outright, and four further guards close the remaining routes — see
+`INV-REG-NO-STALE-HANDLE` in [design.md](design.md). The interleaving this entry
+described is therefore unreachable for buffers.
 
-Memory safety is not at risk: superseded buffers are retained, and the kernel
-bounds-checks against its own registered extents. The watermark update is
-generation-guarded, so bookkeeping stays coherent. What can differ is where the
-data lands, and an index valid at build time can be rejected at completion time.
+**Still open for files.** `register_files` has no equivalent guard, because
+nothing borrows a registered *file* the way a handle borrows a registered buffer.
+An operation naming file index 0 can still have a new file registration adopted
+under it, and the kernel will resolve the index against the new set. Memory
+safety is not at risk — superseded registrations are retained until the ring
+closes — but the operation may target a different file than the caller meant.
 
-**Guidance for now:** do not supersede a registration while operations naming it
-are outstanding. A stronger fix would refuse `register_*` while any registered
-operation is in flight, at the cost of an API restriction.
+**Guidance:** do not supersede a *file* registration while operations naming it
+are outstanding. Closing this properly would mean giving file registrations the
+same checked-out shape buffers now have.
 
 ### The sequential cursor advances on poll; the guard clears on completion
 
@@ -125,7 +128,7 @@ its next pass.
 ### SQE flags are not available on every path
 
 `read_with_flags` / `write_with_options` / `flush_with_options` expose
-`SqeFlags`, but `read_into_registered`, `write_from_registered`, `File::read_at`
+`SqeFlags`, but `read_registered`, `write_registered`, `File::read_at`
 and `File::write_at` do not. A caller needing `DRAIN_PRECEDING_OPS` cannot use the
 registered path at all.
 
@@ -162,8 +165,8 @@ timer that would fix the submission retry above would fix this.
 ## Test coverage gaps
 
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and
-  `register_buffers`, but not for `register_files`, `read_into_registered` or
-  `write_from_registered` — all three implement the check.
+  `register_buffers`, but not for `register_files`, `read_registered` or
+  `write_registered` — all three implement the check.
 - **Aborts cannot be provoked in-process.** The two memory-safety aborts — a
   panic escaping teardown, and `DriverInner` destroyed with the ring open — end
   the process, so a test cannot observe them without a subprocess harness. They

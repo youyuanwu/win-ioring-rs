@@ -115,10 +115,34 @@ is driving the ring waits forever. Having two ways to await the same thing with
 different failure modes is the sharpest edge in this API — prefer the first
 unless you cannot reach the driver.
 
-Registration follows the same logic. A registered buffer cannot be withdrawn —
-the platform offers no unregister call — so registering is a permanent transfer
-of ownership for the life of the ring, and registering again supersedes the old
-set without returning it.
+Registration lends buffers rather than taking them. The *mapping* is permanent —
+the platform offers no unregister call, so it lasts for the life of the ring, and
+registering again supersedes the old set without releasing it. But the buffers
+stay reachable: a successful registration yields a collection you check buffers
+out of, and the handle you get back dereferences to the bytes, goes into an
+operation by value, and comes back with the result. Exactly one handle to a
+buffer exists at a time, so an operation in flight and your code can never touch
+the same bytes — enforced by the compiler, not by documentation.
+
+```rust,ignore
+let buffers = handle.register_buffers(vec![vec![0_u8; 64 * 1024]]).await.unwrap();
+let buffer = buffers.check_out(0)?;
+
+let (result, buffer) = handle
+    .read_registered(FileTarget::Owned(&file), buffer, 0, 4096, 0)
+    .await
+    .into_parts();
+
+println!("{:?}", &buffer[..result?  as usize]);
+```
+
+## Is it faster?
+
+Measured, in [docs/performance.md](docs/performance.md), and the short answer on
+that measurement is **no** — `tokio::fs` is at parity or ahead almost everywhere.
+Run it yourself with `cargo run -p win-ioring-bench --release`; the harness runs
+one piece of application logic against every backend and rejects any run that did
+not do identical work.
 
 ## The unsafe layer
 
