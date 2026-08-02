@@ -311,15 +311,17 @@ struct DriverInner {
     /// How far along shutdown is. Escalation is monotonic: a graceful shutdown
     /// can become immediate, never the reverse.
     shutdown: ShutdownMode,
-    /// Set when teardown is entered, before any draining has happened.
+    /// Test seam: set when teardown is entered, before any draining happens.
     ///
-    /// Distinct from [`DriverInner::torn_down`], which is set only once the ring
-    /// is closed and every resource released. Teardown must be re-enterable
-    /// while this is set but that is not: a drain abandoned part-way — because
-    /// the future driving it was dropped, or because a caller's waker panicked —
-    /// has to be resumed, not skipped. Guarding re-entry on this flag instead
+    /// Deliberately not consulted by anything in production. Its purpose is to
+    /// record that no re-entry guard keys on "teardown has begun" — the guards
+    /// key on [`DriverInner::torn_down`], meaning *finished*. A drain abandoned
+    /// part-way, because the future driving it was dropped or a caller's waker
+    /// panicked, has to be resumed rather than skipped; a guard on "started"
     /// would let a half-torn-down driver release memory the kernel can still
-    /// reach.
+    /// reach. Tests use it to prove they abandoned a drain that had really
+    /// started.
+    #[cfg(test)]
     teardown_started: bool,
     /// Set only once the ring is closed and every resource has been released.
     ///
@@ -800,7 +802,10 @@ impl DriverInner {
     /// none of which can happen while this borrow is held.
     #[must_use = "the returned wakers must be woken after releasing the borrow"]
     fn drain_step(&mut self) -> (Vec<Waker>, StepOutcome) {
-        self.teardown_started = true;
+        #[cfg(test)]
+        {
+            self.teardown_started = true;
+        }
 
         // Slots that never reached the queue hold nothing the platform can
         // touch, so they can be resolved here and now. Believed unreachable in
@@ -950,14 +955,21 @@ const SLOW_DRAIN_STEPS: u32 = 8;
 /// How often to repeat the report once a drain is considered slow.
 const SLOW_DRAIN_INTERVAL: u32 = 8;
 
-/// Resolves a payload the driver ended itself, returning the caller's buffer.
+/// Resolves a payload the driver ended itself, returning the caller's resources.
 fn resolve_abandoned(mut payload: Box<dyn Any>) -> Option<Waker> {
     let payload = payload.downcast_mut::<OpPayload>()?;
-    let buffer = payload.buffer.take();
+    // A flush carries no buffer, and a registration carries its resources
+    // somewhere else entirely — so take both, exactly as the completion path
+    // does. Returning only `buffer` would hand a registration's caller an empty
+    // vector while its buffers were dropped here.
+    let mut resources = payload.buffer.take();
+    if let Some(pending) = payload.pending_registration.take() {
+        resources = Some(Box::new(pending) as Box<dyn Any>);
+    }
     let mut slot = payload.slot.borrow_mut();
-    // The buffer must travel with the result. Resolving without it would leave
-    // the caller's future to panic when it tries to recover it.
-    slot.completed = Some((Err(Error::AbandonedAtShutdown), buffer));
+    // They must travel with the result. Resolving without them would leave the
+    // caller's future to panic when it tries to recover its buffer.
+    slot.completed = Some((Err(Error::AbandonedAtShutdown), resources));
     slot.waker.take()
 }
 
@@ -1112,6 +1124,7 @@ impl Driver {
                 wake: Rc::clone(&wake),
                 pending_submit: false,
                 shutdown: ShutdownMode::Running,
+                #[cfg(test)]
                 teardown_started: false,
                 shutdown_waiters: Vec::new(),
                 next_waiter_id: 0,
@@ -1313,11 +1326,16 @@ impl Drop for Driver {
             let reports = inner.take_reports();
             (wakers, reports)
         };
+        // The ring is closed and everything is released, so nothing the kernel
+        // can reach remains and the fields below are safe to drop. Ending the
+        // process for a panic in a caller's waker past this point would exceed
+        // the guard's stated justification, so it is released here rather than
+        // after the callbacks.
+        std::mem::forget(guard);
         for waker in wakers {
             waker.wake();
         }
         self.flush_reports(reports);
-        std::mem::forget(guard);
     }
 }
 
@@ -4123,6 +4141,48 @@ mod tests {
                 );
             }
             Poll::Pending => panic!("an unsubmittable entry left its future pending"),
+        }
+    }
+
+    /// The registration counterpart of the test above, and the gap that let a
+    /// real bug through: a registration carries the caller's buffers in a
+    /// different field from an ordinary operation, so a teardown path that
+    /// returned only `buffer` dropped them and handed back an empty vector.
+    #[test]
+    fn a_registration_the_kernel_never_accepted_still_returns_its_buffers() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        driver.inner.borrow_mut().fail_next_submits = RESIDUE_ATTEMPTS * 4;
+        let mut fut = Box::pin(handle.register_buffers(vec![vec![7_u8; 16], vec![9_u8; 32]]));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().slab.built().len(),
+            1,
+            "the registration must be queued but unaccepted for this test to mean anything"
+        );
+
+        handle.shutdown_now();
+        drop(driver);
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Registered::Failed(e, returned)) => {
+                assert!(
+                    matches!(e, Error::AbandonedAtShutdown),
+                    "an abandoned registration must report the teardown error: {e:?}"
+                );
+                assert_eq!(
+                    returned,
+                    vec![vec![7_u8; 16], vec![9_u8; 32]],
+                    "the caller's own buffers must come back"
+                );
+            }
+            Poll::Ready(Registered::Ok) => {
+                panic!("a registration the kernel never accepted must not report success")
+            }
+            Poll::Pending => panic!("an unsubmittable registration left its future pending"),
         }
     }
 

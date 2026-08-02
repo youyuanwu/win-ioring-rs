@@ -177,13 +177,15 @@ Four invariants carry it:
 - **INV-RING-CLOSED-FIRST** — nothing the kernel can reach is released until the
   ring is closed, and the ring is closed before any `Driver` field is dropped.
 
-#### Two flags, and two loops
+#### Re-entry, and two loops
 
-Teardown tracks `teardown_started` and `torn_down` separately. Re-entry is
-guarded on `torn_down` — *finished* — because a drain abandoned part-way must
-resume rather than skip to releasing. Guarding on "started" would let a second
-call return as though teardown were done, leaving the ring open and everything in
-it stranded.
+Re-entry into teardown is guarded on `torn_down` — *finished* — and never on
+"teardown has begun". A drain abandoned part-way, because the future driving it
+was dropped or a caller's waker panicked, must **resume** rather than skip to
+releasing. A guard on "started" would let a second call return as though
+teardown were done, leaving the ring open and everything in it stranded. That
+coupling is load-bearing enough that a `#[cfg(test)]` `teardown_started` flag
+exists solely so a test can prove it abandoned a drain that had really begun.
 
 There are two drain loops, not one: a cooperative one in `drive` that yields
 between steps, and a synchronous one in `Drop for Driver`. Sharing a single
