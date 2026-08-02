@@ -962,3 +962,207 @@ async fn sqe_flags_are_selectable_on_read_write_and_flush() {
         })
         .await;
 }
+
+/// Registration takes ownership on success, and hands the resources straight
+/// back on failure.
+#[tokio::test(flavor = "current_thread")]
+async fn registering_buffers_takes_ownership_and_returns_them_on_failure() {
+    use win_ioring::runtime::Registered;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            // The platform accepts an empty registration and then fails it at
+            // completion, so the crate rejects it up front where the error is
+            // actually useful.
+            let empty: Vec<Vec<u8>> = Vec::new();
+            match handle.register_buffers(empty).await {
+                Registered::Failed(_, returned) => assert!(returned.is_empty()),
+                Registered::Ok => panic!("an empty registration should be refused"),
+            }
+
+            let buffers = vec![vec![0_u8; 128], vec![0_u8; 128]];
+            assert!(handle.register_buffers(buffers).await.is_ok());
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+        })
+        .await;
+}
+
+/// SC-017a: reads may fill a registered buffer's whole extent, but writes are
+/// bounded by how much of it is initialized, and a completed read raises that
+/// watermark.
+#[tokio::test(flavor = "current_thread")]
+async fn registered_writes_are_bounded_by_the_initialization_watermark() {
+    use win_ioring::runtime::FileTarget;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("regwatermark");
+            std::fs::write(temp.path(), b"0123456789").unwrap();
+            let out_temp = TempFile::new("regwatermark-out");
+
+            // Registered with capacity 64 but nothing initialized.
+            let buffer: Vec<u8> = Vec::with_capacity(64);
+            assert!(handle.register_buffers(vec![buffer]).await.is_ok());
+
+            let input = win_ioring::file::File::open(temp.path()).unwrap();
+            // A separate destination: `File::create` truncates, which would
+            // empty the source if they were the same file.
+            let out = win_ioring::file::File::create(out_temp.path()).unwrap();
+
+            // Writing before anything is initialized must be refused.
+            let err = handle
+                .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
+                .await
+                .expect_err("writing uninitialized registered bytes must be refused");
+            assert!(
+                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
+                "got {err:?}"
+            );
+
+            // Reading may target the whole extent, and raises the watermark.
+            let read = handle
+                .read_into_registered(FileTarget::Owned(&input), 0, 0, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(read, 10);
+
+            // Now the same write is within the watermark.
+            let written = handle
+                .write_from_registered(FileTarget::Owned(&out), 0, 0, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(written, 10);
+
+            // Beyond the watermark is still refused.
+            let err = handle
+                .write_from_registered(FileTarget::Owned(&out), 0, 0, 40, 0)
+                .await
+                .expect_err("writing past the watermark must be refused");
+            assert!(matches!(
+                err,
+                win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+            ));
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(input);
+            drop(out);
+        })
+        .await;
+}
+
+/// An out-of-range registered index must be rejected before anything is
+/// submitted.
+#[tokio::test(flavor = "current_thread")]
+async fn out_of_range_registered_indices_are_rejected() {
+    use win_ioring::runtime::FileTarget;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("regindex");
+            std::fs::write(temp.path(), b"data").unwrap();
+            let file = win_ioring::file::File::open(temp.path()).unwrap();
+
+            // Nothing registered at all yet.
+            let err = handle
+                .read_into_registered(FileTarget::Owned(&file), 0, 0, 4, 0)
+                .await
+                .expect_err("no registration exists");
+            assert!(matches!(
+                err,
+                win_ioring::Error::InvalidRegisteredIndex { index: 0 }
+            ));
+
+            assert!(handle.register_buffers(vec![vec![0_u8; 32]]).await.is_ok());
+
+            // Index past the end of the registration.
+            let err = handle
+                .read_into_registered(FileTarget::Owned(&file), 5, 0, 4, 0)
+                .await
+                .expect_err("index five does not exist");
+            assert!(matches!(
+                err,
+                win_ioring::Error::InvalidRegisteredIndex { index: 5 }
+            ));
+
+            // Offset plus length past the registered extent.
+            let err = handle
+                .read_into_registered(FileTarget::Owned(&file), 0, 30, 8, 0)
+                .await
+                .expect_err("range exceeds the registered extent");
+            assert!(matches!(
+                err,
+                win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+            ));
+
+            // A registered file index with no file registration.
+            let err = handle
+                .read_into_registered(FileTarget::Registered { index: 0 }, 0, 0, 4, 0)
+                .await
+                .expect_err("no file registration exists");
+            assert!(matches!(
+                err,
+                win_ioring::Error::InvalidRegisteredIndex { index: 0 }
+            ));
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(file);
+        })
+        .await;
+}
+
+/// Registered file handles must be usable as an operation's target.
+#[tokio::test(flavor = "current_thread")]
+async fn registered_file_handles_can_target_operations() {
+    use win_ioring::runtime::FileTarget;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("regfile");
+            std::fs::write(temp.path(), b"registered!").unwrap();
+
+            let file = win_ioring::file::File::open(temp.path()).unwrap();
+            assert!(handle.register_files(vec![file.clone()]).await.is_ok());
+            assert!(handle.register_buffers(vec![vec![0_u8; 64]]).await.is_ok());
+
+            // Drop the caller's own reference; the registration keeps it open.
+            drop(file);
+
+            let read = handle
+                .read_into_registered(FileTarget::Registered { index: 0 }, 0, 0, 11, 0)
+                .await
+                .unwrap();
+            assert_eq!(read, 11);
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+        })
+        .await;
+}

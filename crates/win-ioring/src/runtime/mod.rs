@@ -47,7 +47,7 @@ use crate::sys::AsyncEvent;
 
 use windows::Win32::Storage::FileSystem::{
     FILE_FLUSH_DEFAULT, FILE_FLUSH_MODE, FILE_WRITE_FLAGS, FILE_WRITE_FLAGS_NONE, IORING_OP_FLUSH,
-    IORING_OP_WRITE,
+    IORING_OP_READ, IORING_OP_REGISTER_BUFFERS, IORING_OP_REGISTER_FILES, IORING_OP_WRITE,
 };
 
 pub mod slab;
@@ -154,17 +154,134 @@ impl ResultSlot {
 struct OpPayload {
     /// The caller's buffer, type-erased so the slab need not know about it.
     buffer: Option<Box<dyn Any>>,
-    /// Keeps the target file's handle open for as long as the kernel may use it,
-    /// and lets a cancellation name the same file the operation named.
-    file: Rc<FileState>,
+    /// Keeps the target file's handle open for as long as the kernel may use
+    /// it, and lets a cancellation name the same file the operation named.
+    ///
+    /// Absent for registrations, which name no single file.
+    file: Option<Rc<FileState>>,
     /// Shared with the future awaiting this operation.
     slot: Rc<RefCell<ResultSlot>>,
+    /// The registered buffer this operation targets, if any.
+    ///
+    /// Recorded so a completed read can raise that buffer's initialization
+    /// watermark, and so the registration's reference count can be released.
+    registered_buffer: Option<(u32, u32)>,
+    /// Whether this operation names a registered file handle.
+    ///
+    /// Recorded for diagnostics and to make the registered path explicit at the
+    /// point of submission.
+    #[allow(dead_code)]
+    uses_registered_file: bool,
+}
+
+/// An active buffer registration.
+///
+/// Registered buffers live in the driver at stable addresses. The platform
+/// provides no way to release a registration, so one lasts until it is
+/// superseded by another or the ring is closed.
+struct BufferRegistration {
+    /// The caller's buffers, boxed so their addresses are stable. Retained for
+    /// as long as the platform may reference them, which is until the ring is
+    /// closed.
+    _buffers: Vec<Box<dyn Any>>,
+    /// The registered extent of each buffer, in bytes.
+    extents: Vec<usize>,
+    /// How many bytes of each buffer are initialized.
+    ///
+    /// Reads may target the whole extent, but writes are bounded by this, so
+    /// uninitialized memory is never sent to the kernel.
+    watermarks: Vec<usize>,
+    /// The descriptor array handed to the platform, kept at a stable address
+    /// for as long as the registration is active.
+    _descriptors: Box<[crate::io_ring::BufferInfo]>,
+}
+
+/// An active file handle registration.
+struct FileRegistration {
+    /// Kept so the registered handles stay open for as long as the platform
+    /// may use them.
+    _files: Vec<Rc<FileState>>,
+    /// How many handles were registered, for index validation.
+    count: usize,
+}
+
+/// Names a buffer for an operation: the caller's own, or a registered one.
+pub enum BufferSource<B> {
+    /// A buffer owned by the caller, handed to the driver for the operation.
+    Owned(B),
+    /// A slice of a previously registered buffer.
+    Registered {
+        /// The registration index.
+        index: u32,
+        /// The offset within that buffer.
+        offset: u32,
+    },
+}
+
+/// Names the file an operation targets.
+pub enum FileTarget<'a> {
+    /// A file the caller owns.
+    Owned(&'a File),
+    /// A previously registered file handle.
+    Registered {
+        /// The registration index.
+        index: u32,
+    },
+}
+
+/// The result of a registration attempt.
+///
+/// On success the driver takes ownership of the resources, because the platform
+/// keeps pointers to them until the registration is superseded or the ring
+/// closes. On failure they come straight back.
+pub enum Registered<T> {
+    /// The registration succeeded and the driver now owns the resources.
+    Ok,
+    /// The registration failed; the caller's resources are returned.
+    Failed(Error, Vec<T>),
+}
+
+impl<T> Registered<T> {
+    /// Returns `true` if the registration succeeded.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Registered::Ok)
+    }
+
+    /// Returns the error, if the registration failed.
+    pub fn err(&self) -> Option<&Error> {
+        match self {
+            Registered::Ok => None,
+            Registered::Failed(e, _) => Some(e),
+        }
+    }
+
+    /// Unwraps a successful registration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registration failed.
+    pub fn unwrap(self) {
+        if let Registered::Failed(e, _) = self {
+            panic!("registration failed: {e}");
+        }
+    }
 }
 
 /// Shared driver state, reached by handles and futures.
 struct DriverInner {
     ring: IoRing,
     slab: OpSlab,
+    /// The active buffer registration, if any.
+    buffer_registration: Option<BufferRegistration>,
+    /// Buffer registrations that have been superseded but are still referenced.
+    ///
+    /// Their resources return to the caller once the last operation using them
+    /// completes.
+    retired_buffer_registrations: Vec<BufferRegistration>,
+    /// The active file handle registration, if any.
+    file_registration: Option<FileRegistration>,
+    /// Superseded file registrations still referenced by in-flight operations.
+    retired_file_registrations: Vec<FileRegistration>,
     /// Resources a cancellation request needs kept alive.
     ///
     /// A cancellation names the file its target named, and completes
@@ -263,6 +380,57 @@ impl DriverInner {
         }
     }
 
+    /// Validates a registered buffer reference.
+    ///
+    /// Reads may target the buffer's whole registered extent; writes are
+    /// bounded by how much of it is initialized, so uninitialized memory is
+    /// never handed to the kernel.
+    fn check_registered_buffer(
+        &self,
+        index: u32,
+        offset: u32,
+        len: u32,
+        for_write: bool,
+    ) -> Result<()> {
+        let registration = self
+            .buffer_registration
+            .as_ref()
+            .ok_or(Error::InvalidRegisteredIndex { index })?;
+        let extent = *registration
+            .extents
+            .get(index as usize)
+            .ok_or(Error::InvalidRegisteredIndex { index })?;
+        let bound = if for_write {
+            registration.watermarks[index as usize]
+        } else {
+            extent
+        };
+
+        let end = (offset as u64).saturating_add(len as u64);
+        if end > bound as u64 {
+            return Err(Error::RegisteredRangeOutOfBounds {
+                index,
+                offset: offset as u64,
+                length: len as u64,
+                extent: bound as u64,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates a registered file index.
+    fn check_registered_file(&self, index: u32) -> Result<()> {
+        let registration = self
+            .file_registration
+            .as_ref()
+            .ok_or(Error::InvalidRegisteredIndex { index })?;
+        if (index as usize) < registration.count {
+            Ok(())
+        } else {
+            Err(Error::InvalidRegisteredIndex { index })
+        }
+    }
+
     /// Records a failed submission and queues a report, without flooding.
     fn note_submit_failure(&mut self, error: Error) {
         self.submit_failures = self.submit_failures.saturating_add(1);
@@ -333,7 +501,7 @@ impl DriverInner {
             .slab
             .payload_mut(token)
             .and_then(|p| p.downcast_mut::<OpPayload>())
-            .map(|p| Rc::clone(&p.file))
+            .and_then(|p| p.file.clone())
         else {
             return;
         };
@@ -422,6 +590,19 @@ impl DriverInner {
 
             // A flush carries no buffer, so this is legitimately absent.
             let buffer = payload.buffer.take();
+
+            // A completed read into a registered buffer raises that buffer's
+            // initialization watermark, so a later write may source the bytes it
+            // just filled.
+            if let Some((index, offset)) = payload.registered_buffer
+                && let Ok(transferred) = &result
+                && let Some(registration) = self.buffer_registration.as_mut()
+                && let Some(mark) = registration.watermarks.get_mut(index as usize)
+            {
+                let filled = offset as usize + *transferred as usize;
+                *mark = (*mark).max(filled);
+            }
+
             let mut slot = payload.slot.borrow_mut();
             slot.completed = Some((result, buffer));
             if let Some(waker) = slot.waker.take() {
@@ -585,6 +766,10 @@ impl Driver {
             inner: Rc::new(RefCell::new(DriverInner {
                 ring,
                 slab: OpSlab::new(),
+                buffer_registration: None,
+                retired_buffer_registrations: Vec::new(),
+                file_registration: None,
+                retired_file_registrations: Vec::new(),
                 cancel_holds: Vec::new(),
                 deferred_cancels: Vec::new(),
                 wake: Rc::clone(&wake),
@@ -799,8 +984,10 @@ impl Handle {
         // after that placement.
         let payload = Box::new(OpPayload {
             buffer: None,
-            file: file.state(),
+            file: Some(file.state()),
             slot: Rc::clone(&slot),
+            registered_buffer: None,
+            uses_registered_file: false,
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
@@ -926,8 +1113,10 @@ impl Handle {
 
         let payload = Box::new(OpPayload {
             buffer: None,
-            file: file.state(),
+            file: Some(file.state()),
             slot: Rc::clone(&slot),
+            registered_buffer: None,
+            uses_registered_file: false,
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
@@ -1024,8 +1213,10 @@ impl Handle {
         // for as long as the kernel is working on it.
         let payload = Box::new(OpPayload {
             buffer: None,
-            file: file.state(),
+            file: Some(file.state()),
             slot: Rc::clone(&slot),
+            registered_buffer: None,
+            uses_registered_file: false,
         });
         let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
 
@@ -1062,6 +1253,335 @@ impl Handle {
         })
     }
 
+    /// Registers buffers with the ring.
+    ///
+    /// On success the driver takes ownership: the platform keeps pointers to
+    /// these buffers, and provides no way to release a registration, so they
+    /// cannot be handed back while the ring lives. Registering again supersedes
+    /// this registration, and the superseded buffers return to the caller once
+    /// every operation referencing them has completed.
+    ///
+    /// On failure the buffers come straight back.
+    pub async fn register_buffers<B: IoBufMut>(&self, buffers: Vec<B>) -> Registered<B> {
+        if buffers.is_empty() {
+            // The platform accepts an empty registration and then fails it at
+            // completion time, so reject it here where the error is useful.
+            return Registered::Failed(Error::MissingField { field: "buffers" }, buffers);
+        }
+        {
+            let inner = self.strong.borrow();
+            if inner.shutting_down {
+                return Registered::Failed(Error::ShuttingDown, buffers);
+            }
+            if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_REGISTER_BUFFERS) {
+                return Registered::Failed(e, buffers);
+            }
+        }
+
+        // Box each buffer first, so the descriptors describe stable addresses.
+        let boxed: Vec<Box<B>> = buffers.into_iter().map(Box::new).collect();
+        let mut extents = Vec::with_capacity(boxed.len());
+        let mut watermarks = Vec::with_capacity(boxed.len());
+        let mut descriptors = Vec::with_capacity(boxed.len());
+        for buffer in &boxed {
+            let extent = buffer.buf_capacity();
+            extents.push(extent);
+            watermarks.push(buffer.buf_len());
+            // SAFETY: the buffer is boxed and stays in the registration until it
+            // is superseded and drained, so this address remains valid for as
+            // long as the platform may use it.
+            descriptors.push(unsafe {
+                crate::io_ring::BufferInfo::from_raw_parts(
+                    buffer.buf_ptr() as *mut _,
+                    extent as u32,
+                )
+            });
+        }
+        let descriptors: Box<[crate::io_ring::BufferInfo]> = descriptors.into_boxed_slice();
+
+        let slot = Rc::new(RefCell::new(ResultSlot::new()));
+        let token = {
+            let mut inner = self.strong.borrow_mut();
+            // A registration carries no per-operation file, so it borrows the
+            // ring's own lifetime rather than a file's.
+            let payload = Box::new(OpPayload {
+                buffer: None,
+                file: None,
+                slot: Rc::clone(&slot),
+                registered_buffer: None,
+                uses_registered_file: false,
+            });
+            let token = match inner.slab.insert(payload) {
+                Ok(token) => token,
+                Err(_) => {
+                    return Registered::Failed(Error::QueueFull, unbox(boxed));
+                }
+            };
+
+            // SAFETY: `descriptors` is boxed and moved into the registration
+            // below, so it and the buffers it points at outlive this operation.
+            if let Err(e) = unsafe {
+                inner
+                    .ring
+                    .build_register_buffers(&descriptors, token.as_user_data())
+            } {
+                drop(inner.slab.complete(token));
+                return Registered::Failed(e, unbox(boxed));
+            }
+            inner.slab.set_lifecycle(token, Lifecycle::Built);
+            inner.pending_submit = true;
+            token
+        };
+        let _ = self.wake.signal();
+
+        let outcome = RegistrationFuture {
+            inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
+        }
+        .await;
+
+        if let Err(e) = outcome {
+            return Registered::Failed(e, unbox(boxed));
+        }
+
+        // The platform has the registration, so the driver keeps the buffers.
+        let mut inner = self.strong.borrow_mut();
+        let previous = inner.buffer_registration.replace(BufferRegistration {
+            _buffers: boxed.into_iter().map(|b| b as Box<dyn Any>).collect(),
+            extents,
+            watermarks,
+            _descriptors: descriptors,
+        });
+        if let Some(previous) = previous {
+            // Superseded, but the platform may still be using it and operations
+            // may still reference it, so it is retained rather than released.
+            inner.retired_buffer_registrations.push(previous);
+        }
+        Registered::Ok
+    }
+
+    /// Registers file handles with the ring.
+    ///
+    /// The same ownership rules apply as for [`Handle::register_buffers`].
+    pub async fn register_files(&self, files: Vec<File>) -> Registered<File> {
+        if files.is_empty() {
+            return Registered::Failed(Error::MissingField { field: "files" }, files);
+        }
+        {
+            let inner = self.strong.borrow();
+            if inner.shutting_down {
+                return Registered::Failed(Error::ShuttingDown, files);
+            }
+            if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_REGISTER_FILES) {
+                return Registered::Failed(e, files);
+            }
+        }
+
+        let handles: Vec<_> = files.iter().map(|f| f.as_raw_handle()).collect();
+        let states: Vec<Rc<FileState>> = files.iter().map(|f| f.state()).collect();
+
+        let slot = Rc::new(RefCell::new(ResultSlot::new()));
+        let token = {
+            let mut inner = self.strong.borrow_mut();
+            let payload = Box::new(OpPayload {
+                buffer: None,
+                file: None,
+                slot: Rc::clone(&slot),
+                registered_buffer: None,
+                uses_registered_file: false,
+            });
+            let token = match inner.slab.insert(payload) {
+                Ok(token) => token,
+                Err(_) => return Registered::Failed(Error::QueueFull, files),
+            };
+
+            // SAFETY: the handles are kept open by the `Rc<FileState>` clones
+            // moved into the registration below, which outlive this operation.
+            if let Err(e) = unsafe {
+                inner
+                    .ring
+                    .build_register_file_handles(&handles, token.as_user_data())
+            } {
+                drop(inner.slab.complete(token));
+                return Registered::Failed(e, files);
+            }
+            inner.slab.set_lifecycle(token, Lifecycle::Built);
+            inner.pending_submit = true;
+            token
+        };
+        let _ = self.wake.signal();
+
+        let outcome = RegistrationFuture {
+            inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
+        }
+        .await;
+
+        if let Err(e) = outcome {
+            return Registered::Failed(e, files);
+        }
+
+        let mut inner = self.strong.borrow_mut();
+        let previous = inner.file_registration.replace(FileRegistration {
+            count: states.len(),
+            _files: states,
+        });
+        if let Some(previous) = previous {
+            inner.retired_file_registrations.push(previous);
+        }
+        Registered::Ok
+    }
+
+    /// Reads into a previously registered buffer.
+    ///
+    /// The data lands in the registration rather than in a buffer the caller
+    /// owns, so this resolves to the transfer count alone. A successful read
+    /// raises that buffer's initialization watermark, so a later write may
+    /// source the bytes it just filled.
+    pub fn read_into_registered(
+        &self,
+        target: FileTarget<'_>,
+        buffer_index: u32,
+        buffer_offset: u32,
+        len: u32,
+        file_offset: u64,
+    ) -> RegisteredOpFuture {
+        self.registered_op(target, buffer_index, buffer_offset, len, file_offset, false)
+    }
+
+    /// Writes from a previously registered buffer.
+    ///
+    /// The range is bounded by the buffer's initialization watermark, so
+    /// uninitialized memory is never sent to the kernel.
+    pub fn write_from_registered(
+        &self,
+        target: FileTarget<'_>,
+        buffer_index: u32,
+        buffer_offset: u32,
+        len: u32,
+        file_offset: u64,
+    ) -> RegisteredOpFuture {
+        self.registered_op(target, buffer_index, buffer_offset, len, file_offset, true)
+    }
+
+    fn registered_op(
+        &self,
+        target: FileTarget<'_>,
+        buffer_index: u32,
+        buffer_offset: u32,
+        len: u32,
+        file_offset: u64,
+        is_write: bool,
+    ) -> RegisteredOpFuture {
+        match self.try_registered_op(
+            target,
+            buffer_index,
+            buffer_offset,
+            len,
+            file_offset,
+            is_write,
+        ) {
+            Ok(fut) => fut,
+            Err(e) => RegisteredOpFuture {
+                state: RegisteredOpState::Failed(Some(e)),
+            },
+        }
+    }
+
+    fn try_registered_op(
+        &self,
+        target: FileTarget<'_>,
+        buffer_index: u32,
+        buffer_offset: u32,
+        len: u32,
+        file_offset: u64,
+        is_write: bool,
+    ) -> Result<RegisteredOpFuture> {
+        let op_code = if is_write {
+            IORING_OP_WRITE
+        } else {
+            IORING_OP_READ
+        };
+        {
+            let inner = self.strong.borrow();
+            if inner.shutting_down {
+                return Err(Error::ShuttingDown);
+            }
+            inner.ring.ensure_op_supported(op_code)?;
+            // Reads may fill the whole registered extent; writes may only
+            // source what has been initialized.
+            inner.check_registered_buffer(buffer_index, buffer_offset, len, is_write)?;
+            if let FileTarget::Registered { index } = target {
+                inner.check_registered_file(index)?;
+            }
+        }
+
+        let slot = Rc::new(RefCell::new(ResultSlot::new()));
+        let mut inner = self.strong.borrow_mut();
+
+        let (file_state, uses_registered_file) = match target {
+            FileTarget::Owned(file) => (Some(file.state()), false),
+            FileTarget::Registered { .. } => (None, true),
+        };
+
+        let payload = Box::new(OpPayload {
+            buffer: None,
+            file: file_state,
+            slot: Rc::clone(&slot),
+            registered_buffer: Some((buffer_index, buffer_offset)),
+            uses_registered_file,
+        });
+        let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
+
+        let built = if is_write {
+            let mut builder = crate::io_ring::ops::WriteOp::builder()
+                .with_registered_data_index_and_offset(buffer_index, buffer_offset)
+                .with_num_of_bytes_to_write(len)
+                .with_offset(file_offset)
+                .with_user_data(token.as_user_data());
+            builder = match target {
+                FileTarget::Owned(file) => builder.with_raw_handle(file.as_raw_handle()),
+                FileTarget::Registered { index } => builder.with_registered_handle_index(index),
+            };
+            builder.build().and_then(|op| {
+                // SAFETY: the registered buffer and handle are owned by the
+                // driver's registrations, which outlive this operation.
+                unsafe { inner.ring.build_write_file(op) }
+            })
+        } else {
+            let mut builder = crate::io_ring::ops::ReadOp::builder()
+                .with_registered_data_index_and_offset(buffer_index, buffer_offset)
+                .with_num_of_bytes_to_read(len)
+                .with_offset(file_offset)
+                .with_user_data(token.as_user_data());
+            builder = match target {
+                FileTarget::Owned(file) => builder.with_raw_handle(file.as_raw_handle()),
+                FileTarget::Registered { index } => builder.with_registered_handle_index(index),
+            };
+            builder.build().and_then(|op| {
+                // SAFETY: as above.
+                unsafe { inner.ring.build_read_file(op) }
+            })
+        };
+
+        if let Err(e) = built {
+            drop(inner.slab.complete(token));
+            return Err(e);
+        }
+
+        inner.slab.set_lifecycle(token, Lifecycle::Built);
+        inner.pending_submit = true;
+        drop(inner);
+
+        let _ = self.wake.signal();
+
+        Ok(RegisteredOpFuture {
+            state: RegisteredOpState::Waiting(OpFuture::pending(
+                token,
+                slot,
+                Weak::clone(&self.inner),
+            )),
+        })
+    }
+
     /// Cancellation is best-effort: it may fail, or arrive too late, and neither
     /// is an error. The caller keeps the original future and still observes that
     /// operation's terminal result, which is the only thing that releases the
@@ -1069,6 +1589,84 @@ impl Handle {
     /// finished, is a no-op.
     pub fn cancel(&self, id: OperationId) {
         self.strong.borrow_mut().request_cancel(id.0);
+    }
+}
+
+/// An operation against registered resources.
+///
+/// The data lives in the driver's registration rather than in a buffer the
+/// caller owns, so this resolves to the transfer count alone.
+pub struct RegisteredOpFuture {
+    state: RegisteredOpState,
+}
+
+enum RegisteredOpState {
+    Failed(Option<Error>),
+    Waiting(OpFuture),
+    Done,
+}
+
+impl RegisteredOpFuture {
+    /// Returns the identifier for cancelling this operation, if it was
+    /// submitted.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        match &self.state {
+            RegisteredOpState::Waiting(op) => Some(op.operation_id()),
+            _ => None,
+        }
+    }
+}
+
+impl Future for RegisteredOpFuture {
+    type Output = Result<Transferred>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        match &mut this.state {
+            RegisteredOpState::Failed(taken) => {
+                let error = taken.take().expect("polled after completion");
+                this.state = RegisteredOpState::Done;
+                Poll::Ready(Err(error))
+            }
+            RegisteredOpState::Done => panic!("registered operation polled after completion"),
+            RegisteredOpState::Waiting(op) => match op.poll_resolution(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(resolution) => {
+                    this.state = RegisteredOpState::Done;
+                    Poll::Ready(match resolution {
+                        Resolution::Completed(result, _) => result,
+                        Resolution::Retained(e) => Err(e),
+                    })
+                }
+            },
+        }
+    }
+}
+
+/// Recovers the caller's buffers from their boxes.
+///
+/// Used when a registration fails and the resources must go straight back.
+fn unbox<B: 'static>(boxed: Vec<Box<B>>) -> Vec<B> {
+    boxed.into_iter().map(|b| *b).collect()
+}
+
+/// A registration in progress.
+///
+/// Registration carries the caller's resources but hands back no buffer of its
+/// own, so it resolves to a plain result.
+struct RegistrationFuture {
+    inner: OpFuture,
+}
+
+impl Future for RegistrationFuture {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.inner.poll_resolution(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Resolution::Completed(result, _)) => Poll::Ready(result.map(|_| ())),
+            Poll::Ready(Resolution::Retained(e)) => Poll::Ready(Err(e)),
+        }
     }
 }
 
