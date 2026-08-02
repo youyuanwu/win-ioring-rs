@@ -313,8 +313,8 @@ async fn dropping_an_in_flight_read_does_not_block() {
             // racy — a small local read can complete immediately — so this
             // asserts the property that holds either way: neither the built nor
             // the submitted drop path may wait on the kernel. The
-            // repeatedly-dropped test above covers the submitted path
-            // specifically, and asserts it was exercised.
+            // crate's own unit tests cover each drop path deterministically,
+            // since only they can observe the operation's lifecycle.
             tokio::task::yield_now().await;
 
             let start = std::time::Instant::now();

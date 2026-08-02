@@ -162,6 +162,12 @@ struct DriverInner {
     /// completes, so the cancellation needs its own hold or the handle could
     /// close while the kernel is still working on the cancellation.
     cancel_holds: Vec<(Token, Rc<FileState>)>,
+    /// Cancellations requested before their operation reached the kernel.
+    ///
+    /// The platform can only cancel something it already has, so a request made
+    /// while the operation is still described or built is remembered here and
+    /// issued once submission promotes it.
+    deferred_cancels: Vec<Token>,
     /// Signalled to nudge the driver; held here so a dropped future can reach
     /// it to prompt submission of the cancellation it just queued.
     wake: Rc<AsyncEvent>,
@@ -256,19 +262,21 @@ impl DriverInner {
         }
     }
 
-    /// Cancels operations whose future was dropped before they reached the
-    /// kernel.
+    /// Cancels operations whose cancellation could not be issued earlier.
     ///
-    /// Dropping a future can only ask the platform to cancel an operation the
-    /// kernel already has. One dropped while still queued therefore gets its
-    /// cancellation deferred to here, once submission has promoted it.
+    /// Two groups qualify: those explicitly cancelled before the kernel had
+    /// them, and those whose future was dropped while they were still queued.
+    /// Both had nothing for the platform to act on at the time.
     fn cancel_abandoned(&mut self) {
+        for token in std::mem::take(&mut self.deferred_cancels) {
+            self.issue_cancel(token);
+        }
         for token in self.slab.detached_submitted_uncancelled() {
-            self.request_cancel(token);
+            self.issue_cancel(token);
         }
     }
 
-    /// Asks the platform to cancel a submitted operation.
+    /// Requests cancellation of an operation, now or as soon as possible.
     ///
     /// Best-effort by nature: the request may fail to build, may lose the race
     /// with the operation it targets, or may be refused outright. None of that
@@ -280,9 +288,31 @@ impl DriverInner {
         if self.shutting_down || self.torn_down {
             return;
         }
+        match self.slab.state(token).map(|(lifecycle, _)| lifecycle) {
+            Some(Lifecycle::Submitted) => self.issue_cancel(token),
+            // The kernel does not have this operation yet, so there is nothing
+            // to cancel. Remember the request and honour it on promotion,
+            // rather than silently dropping it.
+            Some(Lifecycle::Described | Lifecycle::Built)
+                if !self.deferred_cancels.contains(&token) =>
+            {
+                self.deferred_cancels.push(token);
+            }
+            _ => {}
+        }
+    }
+
+    /// Builds and queues a cancellation for an operation the kernel has.
+    ///
+    /// Does nothing if the operation is not, or is no longer, submitted.
+    fn issue_cancel(&mut self, token: Token) {
+        if self.shutting_down || self.torn_down {
+            return;
+        }
         // Only submitted operations can be cancelled. A described one has
         // nothing in the queue, and a built one has not reached the kernel, so
-        // there is nothing for the platform to find.
+        // there is nothing for the platform to find. A token that has since
+        // completed lands here too, and is likewise ignored.
         if self.slab.state(token).map(|(lifecycle, _)| lifecycle) != Some(Lifecycle::Submitted) {
             return;
         }
@@ -544,6 +574,7 @@ impl Driver {
                 ring,
                 slab: OpSlab::new(),
                 cancel_holds: Vec::new(),
+                deferred_cancels: Vec::new(),
                 wake: Rc::clone(&wake),
                 pending_submit: false,
                 shutting_down: false,
@@ -1099,6 +1130,65 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(Pin::new(&mut fut).poll(&mut cx).is_ready());
+    }
+
+    /// FR-004: cancelling immediately after submitting must work. This is the
+    /// obvious usage — take the id, decide to cancel — and the kernel does not
+    /// have the operation yet at that point, so the request has to be
+    /// remembered rather than dropped on the floor.
+    #[test]
+    fn cancelling_before_submission_is_honoured_on_promotion() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+        let id = fut.operation_id().expect("read was built");
+        let token = id.0;
+
+        // The operation is only built; the kernel has never seen it.
+        assert_eq!(
+            driver.inner.borrow().slab.state(token).map(|s| s.0),
+            Some(Lifecycle::Built)
+        );
+
+        handle.cancel(id);
+        // Cancelling repeatedly must not queue the request twice.
+        handle.cancel(id);
+        handle.cancel(id);
+
+        {
+            let inner = driver.inner.borrow();
+            assert_eq!(
+                inner.deferred_cancels.len(),
+                1,
+                "the request should be remembered exactly once"
+            );
+            assert!(
+                inner.cancel_holds.is_empty(),
+                "nothing can be cancelled before the kernel has the operation"
+            );
+        }
+
+        // Submission promotes the operation, at which point the remembered
+        // request must actually be issued.
+        driver.inner.borrow_mut().submit_pending();
+        {
+            let inner = driver.inner.borrow();
+            assert!(
+                inner.deferred_cancels.is_empty(),
+                "the remembered request should have been consumed"
+            );
+            assert!(
+                !inner.cancel_holds.is_empty(),
+                "cancelling before submission was silently lost"
+            );
+        }
+
+        // The caller still observes the operation's own terminal result.
+        drain(&driver);
+        drop(fut);
+        handle.shutdown();
     }
 
     /// Dropping a future whose operation the kernel already has must cancel it
