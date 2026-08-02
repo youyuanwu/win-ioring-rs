@@ -18,11 +18,7 @@ async fn tokio_read_round_trip() {
             });
 
             let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
-            let (read, buffer) = handle
-                .read(&file, vec![0_u8; 64], 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, vec![0_u8; 64], 20, 0).await.unwrap();
 
             assert_eq!(read, 20);
             assert_eq!(buffer.len(), 20, "initialized length tracks the transfer");
@@ -51,11 +47,7 @@ fn custom_runtime_read_round_trip() {
         });
 
         let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
-        let (read, buffer) = handle
-            .read(&file, vec![0_u8; 64], 20, 0)
-            .await
-            .expect_completed()
-            .unwrap();
+        let (read, buffer) = handle.read(&file, vec![0_u8; 64], 20, 0).await.unwrap();
 
         assert_eq!(read, 20);
         assert_eq!(buffer.len(), 20);
@@ -93,11 +85,7 @@ async fn dropping_reads_in_flight_is_safe() {
             win_ioring_tests::settle(&handle).await;
 
             // The ring still works afterwards.
-            let (read, _) = handle
-                .read(&file, vec![0_u8; 64], 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, _) = handle.read(&file, vec![0_u8; 64], 20, 0).await.unwrap();
             assert_eq!(read, 20);
 
             handle.shutdown();
@@ -125,7 +113,7 @@ async fn rejected_reads_return_the_buffer() {
 
             // Asking for more than the buffer can hold is rejected locally.
             let outcome = handle.read(&file, vec![0_u8; 4], 64, 0).await;
-            let result = outcome.expect_completed();
+            let result = outcome;
             assert!(!result.is_ok());
             let (err, buffer) = result.into_parts();
             assert!(matches!(
@@ -191,7 +179,7 @@ async fn a_read_keeps_its_file_alive() {
             // Drop the caller's own reference while the read is in flight.
             drop(file);
 
-            let (read, _) = fut.await.expect_completed().unwrap();
+            let (read, _) = fut.await.unwrap();
             assert_eq!(read, 20);
 
             handle.shutdown();
@@ -223,11 +211,7 @@ async fn inline_array_buffers_reach_the_kernel_correctly() {
             };
 
             let file = win_ioring::file::File::open(SAMPLE_PATH).unwrap();
-            let (read, buffer) = handle
-                .read(&file, [0_u8; 64], 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, [0_u8; 64], 20, 0).await.unwrap();
 
             assert_eq!(read, 20);
             assert_eq!(
@@ -238,11 +222,7 @@ async fn inline_array_buffers_reach_the_kernel_correctly() {
 
             // A boxed slice is the third container shape.
             let boxed: Box<[u8]> = vec![0_u8; 64].into_boxed_slice();
-            let (read, buffer) = handle
-                .read(&file, boxed, 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, boxed, 20, 0).await.unwrap();
             assert_eq!(read, 20);
             assert_eq!(&buffer[..20], expected.as_slice());
 
@@ -282,11 +262,7 @@ async fn dropping_in_flight_reads_repeatedly_is_safe() {
 
             // Let everything settle, then confirm the ring still works.
             win_ioring_tests::settle(&handle).await;
-            let (read, _) = handle
-                .read(&file, vec![0_u8; 64], 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, _) = handle.read(&file, vec![0_u8; 64], 20, 0).await.unwrap();
             assert_eq!(read, 20);
 
             handle.shutdown();
@@ -363,7 +339,7 @@ async fn explicit_cancellation_still_yields_a_terminal_result() {
             // Whether the cancellation wins is a race; either outcome is fine.
             // What must hold is that the future resolves with the buffer back.
             let outcome = fut.await;
-            let result = outcome.expect_completed();
+            let result = outcome;
             let (_, buffer) = result.into_parts();
             assert_eq!(buffer.capacity(), 128, "the buffer came back");
 
@@ -392,7 +368,7 @@ async fn cancelling_a_finished_operation_is_harmless() {
             let fut = handle.read(&file, vec![0_u8; 64], 20, 0);
             let id = fut.operation_id().expect("read was submitted");
 
-            let (read, _) = fut.await.expect_completed().unwrap();
+            let (read, _) = fut.await.unwrap();
             assert_eq!(read, 20);
 
             // The operation is long gone; this must simply do nothing.
@@ -400,11 +376,7 @@ async fn cancelling_a_finished_operation_is_harmless() {
             handle.cancel(id);
 
             // The ring is still usable.
-            let (read, _) = handle
-                .read(&file, vec![0_u8; 64], 20, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, _) = handle.read(&file, vec![0_u8; 64], 20, 0).await.unwrap();
             assert_eq!(read, 20);
 
             handle.shutdown();
@@ -436,25 +408,16 @@ async fn shutdown_with_work_in_flight_settles() {
             handle.shutdown();
             driver_task.await.unwrap();
 
-            // Every future must reach a terminal state; none may hang. The
-            // buffer comes back unless the kernel could still reach it, which
-            // is the one documented exception.
+            // Every future must reach a terminal state, and every buffer must
+            // come back. Teardown drains to quiescence, so there is no longer an
+            // "abandoned" case to tolerate.
             let mut completed = 0;
-            let mut retained = 0;
             for fut in futures {
-                match fut.await {
-                    win_ioring::runtime::Outcome::Completed(result) => {
-                        let (_, buffer) = result.into_parts();
-                        assert_eq!(buffer.capacity(), 128, "the buffer came back");
-                        completed += 1;
-                    }
-                    win_ioring::runtime::Outcome::Retained(e) => {
-                        assert!(matches!(e, win_ioring::Error::BufferRetained));
-                        retained += 1;
-                    }
-                }
+                let (_, buffer) = fut.await.into_parts();
+                assert_eq!(buffer.capacity(), 128, "the buffer came back");
+                completed += 1;
             }
-            assert_eq!(completed + retained, 8, "every future must resolve");
+            assert_eq!(completed, 8, "every future must resolve");
 
             // FR-032: nothing may be submitted once the driver is gone.
             let outcome = handle.read(&file, vec![0_u8; 64], 20, 0).await;
@@ -481,23 +444,13 @@ async fn dropping_the_driver_resolves_surviving_futures() {
             let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
 
             // No driver task was ever spawned, so nothing has been reaped. Drop
-            // the driver with the operation still outstanding. Teardown drains
-            // with a bounded wait, so the read may well complete normally; what
-            // matters is that the future reaches a terminal state either way
-            // rather than hanging.
+            // the driver with the operation still outstanding. Teardown now
+            // drains to quiescence, so the future must resolve *and* the buffer
+            // must come back — not merely reach some terminal state.
             drop(driver);
 
-            let outcome = fut.await;
-            match outcome {
-                win_ioring::runtime::Outcome::Completed(result) => {
-                    let (_, buffer) = result.into_parts();
-                    assert_eq!(buffer.capacity(), 128, "the buffer came back");
-                }
-                win_ioring::runtime::Outcome::Retained(_) => {
-                    // The kernel could still reach the buffer, so it was
-                    // abandoned. Also terminal, and also not a hang.
-                }
-            }
+            let (_, buffer) = fut.await.into_parts();
+            assert_eq!(buffer.capacity(), 128, "the buffer came back");
 
             // The handle still works well enough to report the state.
             assert!(handle.is_shutting_down());
@@ -524,7 +477,6 @@ async fn write_flush_read_round_trip() {
             let (written, buffer) = handle
                 .write(&out, payload, expected.len() as u32, 0)
                 .await
-                .expect_completed()
                 .unwrap();
             assert_eq!(written as usize, expected.len());
             assert_eq!(buffer, expected, "the buffer came back unchanged");
@@ -536,7 +488,6 @@ async fn write_flush_read_round_trip() {
             let (read, buffer) = handle
                 .read(&input, vec![0_u8; 64], expected.len() as u32, 0)
                 .await
-                .expect_completed()
                 .unwrap();
             assert_eq!(read as usize, expected.len());
             assert_eq!(buffer, expected);
@@ -569,7 +520,7 @@ async fn writes_past_initialized_bytes_are_rejected() {
             buffer.extend_from_slice(b"abc");
 
             let outcome = handle.write(&out, buffer, 32, 0).await;
-            let result = outcome.expect_completed();
+            let result = outcome;
             let (err, buffer) = result.into_parts();
             match err.unwrap_err() {
                 win_ioring::Error::UninitializedWriteRange {
@@ -615,11 +566,7 @@ async fn write_flags_reach_the_platform() {
             let payload = b"durable".to_vec();
 
             // Same write, with and without the flag.
-            let (written, payload) = handle
-                .write(&out, payload, 7, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (written, payload) = handle.write(&out, payload, 7, 0).await.unwrap();
             assert_eq!(written, 7, "the unflagged write should succeed");
 
             let outcome = handle
@@ -632,7 +579,7 @@ async fn write_flags_reach_the_platform() {
                     win_ioring::io_ring::ops::SqeFlags::NONE,
                 )
                 .await;
-            let result = outcome.expect_completed();
+            let result = outcome;
             let (err, buffer) = result.into_parts();
             let err = err.expect_err("write-through on cached I/O should be refused");
             assert!(
@@ -673,7 +620,6 @@ async fn flush_modes_are_selectable() {
             handle
                 .write(&out, payload.clone(), payload.len() as u32, 0)
                 .await
-                .expect_completed()
                 .unwrap();
 
             for mode in [
@@ -715,7 +661,7 @@ async fn write_and_flush_after_shutdown_error() {
             driver_task.await.unwrap();
 
             let outcome = handle.write(&out, b"data".to_vec(), 4, 0).await;
-            let result = outcome.expect_completed();
+            let result = outcome;
             let (err, buffer) = result.into_parts();
             assert!(matches!(err.unwrap_err(), win_ioring::Error::ShuttingDown));
             assert_eq!(buffer, b"data", "the buffer came back");
@@ -752,11 +698,7 @@ async fn dropping_writes_in_flight_is_safe() {
             win_ioring_tests::settle(&handle).await;
 
             // The ring still works.
-            let (written, _) = handle
-                .write(&out, b"final".to_vec(), 5, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (written, _) = handle.write(&out, b"final".to_vec(), 5, 0).await.unwrap();
             assert_eq!(written, 5);
 
             handle.shutdown();
@@ -785,21 +727,13 @@ async fn read_transfer_accounting_covers_partial_and_empty() {
             let file = win_ioring::file::File::open(temp.path()).unwrap();
 
             // Full read.
-            let (read, buffer) = handle
-                .read(&file, vec![0_u8; 32], 10, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, vec![0_u8; 32], 10, 0).await.unwrap();
             assert_eq!(read, 10);
             assert_eq!(buffer.len(), 10);
             assert_eq!(&buffer[..], b"0123456789");
 
             // Asking for more than remains is a short read, not an error.
-            let (read, buffer) = handle
-                .read(&file, vec![0_u8; 32], 32, 6)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, vec![0_u8; 32], 32, 6).await.unwrap();
             assert_eq!(read, 4, "only four bytes remain past offset six");
             assert_eq!(
                 buffer.len(),
@@ -809,11 +743,7 @@ async fn read_transfer_accounting_covers_partial_and_empty() {
             assert_eq!(&buffer[..], b"6789");
 
             // Zero-length read at a valid offset: legal, transfers nothing.
-            let (read, buffer) = handle
-                .read(&file, vec![0_u8; 32], 0, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (read, buffer) = handle.read(&file, vec![0_u8; 32], 0, 0).await.unwrap();
             assert_eq!(read, 0);
             assert_eq!(buffer.len(), 0);
 
@@ -821,7 +751,7 @@ async fn read_transfer_accounting_covers_partial_and_empty() {
             // error rather than a zero-byte success. That is the platform's
             // behaviour, and differs from a short read.
             let outcome = handle.read(&file, vec![0_u8; 32], 8, 100).await;
-            let (result, buffer) = outcome.expect_completed().into_parts();
+            let (result, buffer) = outcome.into_parts();
             let err = result.expect_err("reading past the end should report EOF");
             assert!(
                 matches!(err, win_ioring::Error::Os(_)),
@@ -865,7 +795,7 @@ async fn zero_length_buffers_are_submitted_not_rejected() {
                 read.operation_id().is_some(),
                 "a zero-length read must reach the kernel, not be rejected locally"
             );
-            let (transferred, buffer) = read.await.expect_completed().unwrap();
+            let (transferred, buffer) = read.await.unwrap();
             assert_eq!(transferred, 0);
             assert_eq!(buffer.len(), 0);
 
@@ -877,7 +807,7 @@ async fn zero_length_buffers_are_submitted_not_rejected() {
                 write.operation_id().is_some(),
                 "a zero-length write must reach the kernel too"
             );
-            let (transferred, _) = write.await.expect_completed().unwrap();
+            let (transferred, _) = write.await.unwrap();
             assert_eq!(transferred, 0);
 
             handle.shutdown();
@@ -905,20 +835,12 @@ async fn inline_array_writes_reach_the_kernel_correctly() {
             let out = win_ioring::file::File::create(temp.path()).unwrap();
 
             let payload: [u8; 8] = *b"inlined!";
-            let (written, returned) = handle
-                .write(&out, payload, 8, 0)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (written, returned) = handle.write(&out, payload, 8, 0).await.unwrap();
             assert_eq!(written, 8);
             assert_eq!(returned, payload);
 
             let boxed: Box<[u8]> = b"boxedsli".to_vec().into_boxed_slice();
-            let (written, _) = handle
-                .write(&out, boxed, 8, 8)
-                .await
-                .expect_completed()
-                .unwrap();
+            let (written, _) = handle.write(&out, boxed, 8, 8).await.unwrap();
             assert_eq!(written, 8);
 
             handle.shutdown();
@@ -957,7 +879,6 @@ async fn sqe_flags_are_selectable_on_read_write_and_flush() {
                     SqeFlags::DRAIN_PRECEDING_OPS,
                 )
                 .await
-                .expect_completed()
                 .unwrap();
             assert_eq!(written, 7);
 
@@ -977,7 +898,6 @@ async fn sqe_flags_are_selectable_on_read_write_and_flush() {
             let (read, buffer) = handle
                 .read_with_flags(&input, vec![0_u8; 16], 7, 0, SqeFlags::DRAIN_PRECEDING_OPS)
                 .await
-                .expect_completed()
                 .unwrap();
             assert_eq!(read, 7);
             assert_eq!(&buffer[..], b"drained");

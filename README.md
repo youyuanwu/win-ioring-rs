@@ -52,7 +52,6 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
     let (bytes_read, buffer) = file
         .read_at(&handle, vec![0_u8; 4096], 4096, 0)
         .await
-        .expect_completed()
         .unwrap();
     println!("read {bytes_read} bytes: {:?}", &buffer[..bytes_read as usize]);
 
@@ -80,7 +79,7 @@ Any type implementing `IoBuf`/`IoBufMut` works; `Vec<u8>`, `Box<[u8]>` and
 because they promise the kernel a stable address and an honest initialized
 length that the compiler cannot check for you.
 
-## Cancellation, shutdown, and the leak policy
+## Cancellation and shutdown
 
 **Dropping a future is always safe and never blocks.** It detaches and, where the
 platform can act on one, requests cancellation. The buffer and the file handle
@@ -93,17 +92,28 @@ complete normally after being cancelled, and an operation the kernel has not yet
 seen is cancelled when it reaches the kernel rather than at drop time. The crate
 does not pretend otherwise.
 
-`Handle::shutdown` asks the driver to stop once outstanding work has drained.
-The driver makes a bounded attempt to drain, and:
+`Handle::shutdown` asks the driver to stop accepting new work and to let
+operations already in flight finish. `Handle::shutdown_now` asks it to cancel
+them instead. Either way the driver drains until every operation has reported,
+and only then closes the ring and releases what it was holding. **Shutdown never
+abandons memory**: every buffer comes back, every handle is closed, every
+registration is freed.
 
-- if the ring settles, everything is released normally;
-- if it does not settle, the driver **leaks** the buffers and handles the kernel
-  may still touch, rather than freeing memory that is still live. Futures still
-  waiting are resolved first, with `Outcome::Retained`, so nothing hangs.
+Draining is unbounded, because the alternative is worse. Closing the ring does
+not cancel in-flight operations and does not wait for them — the platform
+documents that memory may still be written afterwards — so giving up early would
+mean freeing memory the kernel is still using. The trade is that a shutdown
+blocked on an operation that neither completes nor responds to cancellation will
+not finish. That case is reported, throttled, through the error observer, and a
+graceful shutdown can be escalated with `Handle::shutdown_now` while it drains.
 
-Leaking is the correct outcome here, and the only sound one: there is no way to
-withdraw an operation the kernel has accepted, so the alternative is a
-use-after-free.
+**To know when shutdown has finished, await `Driver::drive`.** That is the
+recommended path and the one to reach for by default. `Handle::shutdown_complete`
+exists for code that holds a handle but not the driver; it resolves on the same
+event but cannot itself make progress, so awaiting it on a thread where nothing
+is driving the ring waits forever. Having two ways to await the same thing with
+different failure modes is the sharpest edge in this API — prefer the first
+unless you cannot reach the driver.
 
 Registration follows the same logic. A registered buffer cannot be withdrawn —
 the platform offers no unregister call — so registering is a permanent transfer

@@ -94,19 +94,29 @@ pub enum Error {
         extent: u64,
     },
 
-    /// The operation could not complete and its buffer could not be recovered.
-    ///
-    /// This is the one case in which a caller does not get its buffer back. It
-    /// arises when the driver is torn down while a submission queue entry still
-    /// references the buffer, so releasing it would risk the kernel writing into
-    /// freed memory. The buffer is retained (leaked) instead.
-    BufferRetained,
-
-    /// The driver this operation belonged to no longer exists.
-    DriverGone,
-
     /// The driver is shutting down and is not accepting new operations.
     ShuttingDown,
+
+    /// The operation was ended by shutdown before the platform ever ran it.
+    ///
+    /// Distinct from a natural I/O failure and from a cancellation: nothing was
+    /// attempted. It arises when teardown resolves an operation itself, rather
+    /// than waiting for a completion that is never coming — because the queue
+    /// entry was never accepted by the platform despite repeated attempts, and
+    /// closing the ring discards it. The caller's buffer is returned.
+    AbandonedAtShutdown,
+
+    /// Shutdown is taking an unusual amount of time to drain.
+    ///
+    /// Reported, throttled, while operations remain outstanding. Draining is
+    /// unbounded by design — it never abandons memory — so a shutdown blocked on
+    /// an operation that neither completes nor responds to cancellation would
+    /// otherwise be indistinguishable from a hang. Informational: the drain is
+    /// still making attempts.
+    ShutdownStalled {
+        /// How many operations are still outstanding.
+        outstanding: usize,
+    },
 
     /// A sequential operation is already outstanding on this file.
     ///
@@ -245,12 +255,15 @@ impl fmt::Display for Error {
                 "registered buffer {index} range {offset}..{} exceeds its extent of {extent}",
                 offset.saturating_add(*length)
             ),
-            Error::BufferRetained => write!(
-                f,
-                "the operation could not complete and its buffer was retained because the kernel may still access it"
-            ),
-            Error::DriverGone => write!(f, "the driver no longer exists"),
             Error::ShuttingDown => write!(f, "the driver is shutting down"),
+            Error::AbandonedAtShutdown => write!(
+                f,
+                "the operation was abandoned at shutdown before the platform ran it"
+            ),
+            Error::ShutdownStalled { outstanding } => write!(
+                f,
+                "shutdown is still draining, with {outstanding} operation(s) outstanding"
+            ),
             Error::OperationOutstanding => {
                 write!(
                     f,
@@ -356,9 +369,9 @@ mod tests {
                 length: 16,
                 extent: 16,
             },
-            Error::BufferRetained,
-            Error::DriverGone,
             Error::ShuttingDown,
+            Error::AbandonedAtShutdown,
+            Error::ShutdownStalled { outstanding: 3 },
             Error::OperationOutstanding,
             Error::RingClosed,
             Error::MissingField { field: "handle" },
@@ -387,9 +400,9 @@ mod tests {
             | Error::BufferTooSmall { .. }
             | Error::UninitializedWriteRange { .. }
             | Error::RegisteredRangeOutOfBounds { .. }
-            | Error::BufferRetained
-            | Error::DriverGone
             | Error::ShuttingDown
+            | Error::AbandonedAtShutdown
+            | Error::ShutdownStalled { .. }
             | Error::OperationOutstanding
             | Error::RingClosed
             | Error::MissingField { .. }

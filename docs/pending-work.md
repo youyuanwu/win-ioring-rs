@@ -20,6 +20,15 @@ Fixing this means threading a `FileTarget` through `Handle::read`,
 `Handle::write` and `Handle::flush`, changing three public signatures. It is the
 most substantial gap in the API surface.
 
+### No `'static` reference buffers
+
+`IoBuf` and `IoBufMut` are implemented only for `Vec<u8>`, `Box<[u8]>` and
+`[u8; N]`. Adding `&'static [u8]` and `&'static mut [u8]` is sound under the
+existing `'static + Unpin` bound and costs nothing, and it closes a gap that
+both tokio-uring and compio have already closed. See
+[buffer-ownership.md](buffer-ownership.md) for the proposed impls and the
+reasoning behind the bound.
+
 ### No `NOP` operation
 
 The host reports `IORING_OP_NOP` as supported, but `windows` 0.62.2 exposes no
@@ -100,26 +109,18 @@ rustdoc.
 `OpFuture::drop` uses `try_borrow_mut` and returns if the driver is already
 borrowed — the right call, since panicking in `Drop` would be far worse. It is
 not a soundness hole: the buffer is still released by the operation's own
-completion.
+completion, and now also by the drain, which no longer abandons anything.
 
-But the operation then runs uncancelled *and* the slot is never marked detached,
-so `detached_submitted_uncancelled()` will not pick it up later either. The
-borrow is held exactly while the driver is inside `reap_completions`/`teardown`,
-which is when a waker may be invoked and a task may drop a future inline — so the
-case is reachable rather than theoretical.
+The hazard is smaller than it was. Wakers and error reports are now delivered
+*outside* the driver's borrow everywhere, so the window in which a task can drop
+a future while the driver is borrowed is much narrower than when this was first
+written. The operation then runs uncancelled, which costs efficiency rather than
+correctness.
 
 Consider recording the token outside the `RefCell` for the driver to process on
 its next pass.
 
 ## API consistency
-
-### `WriteFuture` alone has no poll-after-completion state
-
-`ReadFuture`, `RegisteredOpFuture` and `FlushFuture` each carry a `Done` state
-and panic on re-poll. `WriteFuture` delegates straight to
-`OpFuture::poll_resolution`, so re-polling a completed one returns `Pending`
-**forever** — a hang rather than a panic. Poll-after-`Ready` is caller misuse
-either way, but the four future types should behave alike.
 
 ### SQE flags are not available on every path
 
@@ -128,32 +129,50 @@ either way, but the four future types should behave alike.
 and `File::write_at` do not. A caller needing `DRAIN_PRECEDING_OPS` cannot use the
 registered path at all.
 
-### `Driver::drop` can block for up to ~1 second
+### `Driver::drop` can block indefinitely
 
-`teardown` runs up to `DRAIN_ROUNDS` (4) iterations of
-`submit(waiting, DRAIN_TIMEOUT_MS)` (250 ms), each of which blocks the calling
-thread. A `Drop` that can stall a single-threaded executor for a second is worth
-stating in `Driver`'s rustdoc, and the budget is a reasonable thing to make
-configurable.
+The drain is unbounded by design: it ends when the kernel holds nothing. A
+`Drop` that can stall a single-threaded executor for an unbounded time is worth
+stating in `Driver`'s rustdoc.
 
-### `Error::DriverGone` may be unreachable on the intended path
+Two specific hazards follow, both accepted rather than solved:
 
-`Handle` holds a strong `Rc`, and `Driver::drop` always resolves or marks-retained
-every live slot, so the `Weak` upgrade failure looks dead. The one route found to
-it is misuse: re-polling a `WriteFuture` that was rejected before submission.
-Either the variant should go, or its rustdoc should stop implying it is a normal
-outcome, or there should be a test for the case that reaches it.
+- **An operation that never completes hangs the shutdown.** Cancellation is
+  best-effort, so an operation the platform will not abandon has no exit. The
+  alternative — giving up and freeing memory the kernel may still write into —
+  is a use-after-free, so hanging is the lesser failure. `Error::ShutdownStalled`
+  exists so the caller can at least see it happening.
+- **Registrations cannot be cancelled at all.** A cancellation must name the file
+  its target named, and a registration names none, so one in flight can only be
+  waited for.
+
+A bounded-with-escalation policy, or a caller-supplied deadline after which the
+process aborts rather than hangs, would both be defensible; neither is
+implemented.
+
+### The drain busy-spins while submission is blocked
+
+While any `Built` entry remains, the drain must not issue its waiting submission
+(**INV-NO-WAIT-WITH-BUILT** in [design.md](design.md)), so it retries without
+blocking. In `drive` that is a cooperative yield, but in `Drop` it is a tight
+loop until the queue accepts the entries. Bounded in practice — the entries are
+accepted as soon as there is room — but it is a busy-wait, and the same waitable
+timer that would fix the submission retry above would fix this.
 
 ## Test coverage gaps
 
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and
   `register_buffers`, but not for `register_files`, `read_into_registered` or
   `write_from_registered` — all three implement the check.
-- The headline soundness property — no buffer released before its operation
-  reaches terminal completion — is proved by construction and by review, not by
-  test. `shutdown_with_work_in_flight_settles` asserts settlement but carries no
-  drop instrumentation. `CountingBuf` exists precisely for this; wiring it in
-  would close the gap.
+- **Aborts cannot be provoked in-process.** The two memory-safety aborts — a
+  panic escaping teardown, and `DriverInner` destroyed with the ring open — end
+  the process, so a test cannot observe them without a subprocess harness. They
+  are discharged by enumeration and review instead. A `#[test]` that spawns the
+  test binary with a filter and asserts the exit code would close this.
+- **A completion racing its own cancellation** is not tested. The criterion asks
+  that the natural result win when it gets there first, and no way to make that
+  ordering deterministic has been found. The correlation mechanics either side of
+  it are tested.
 
 ## Minor
 

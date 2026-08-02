@@ -24,10 +24,10 @@ use std::task::{Context, Poll};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::FILE_FLUSH_MODE;
 
-use crate::buf::{IoBuf, IoBufMut};
+use crate::buf::{BufResult, IoBuf, IoBufMut};
 use crate::error::Error;
 use crate::io_ring::ops::SqeFlags;
-use crate::runtime::{FlushFuture, Handle, OperationId, Outcome, ReadFuture, WriteFuture};
+use crate::runtime::{FlushFuture, Handle, OperationId, ReadFuture, WriteFuture};
 
 /// State shared between a [`File`] and any operations naming it.
 ///
@@ -67,9 +67,10 @@ impl FileState {
 /// Clears a file's outstanding-sequential flag when the operation ends.
 ///
 /// The driver keeps this in the operation's payload, so the flag clears on
-/// terminal completion whether or not the future survived to see it. If the
-/// driver has to abandon its payloads, the flag stays set, which is correct: an
-/// operation the kernel may still be running must not be joined by another.
+/// terminal completion whether or not the future survived to see it. Teardown
+/// drains rather than abandoning payloads, so the flag is cleared there too —
+/// by which point the kernel is provably finished with the operation, which is
+/// the condition that made holding the flag necessary in the first place.
 #[derive(Debug)]
 pub(crate) struct SequentialGuard(Rc<FileState>);
 
@@ -306,7 +307,7 @@ impl<B: IoBufMut> SequentialRead<'_, B> {
 }
 
 impl<B: IoBufMut> Future for SequentialRead<'_, B> {
-    type Output = Outcome<u32, B>;
+    type Output = BufResult<u32, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
@@ -334,7 +335,7 @@ impl<B: IoBuf> SequentialWrite<'_, B> {
 }
 
 impl<B: IoBuf> Future for SequentialWrite<'_, B> {
-    type Output = Outcome<u32, B>;
+    type Output = BufResult<u32, B>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
@@ -347,10 +348,8 @@ impl<B: IoBuf> Future for SequentialWrite<'_, B> {
 ///
 /// A failure transfers nothing, so it leaves the cursor alone. So does a
 /// zero-byte transfer, trivially.
-fn advance_on_success<B>(state: &FileState, outcome: &Outcome<u32, B>) {
-    if let Outcome::Completed(result) = outcome
-        && let Ok(transferred) = &result.result
-    {
+fn advance_on_success<B>(state: &FileState, outcome: &BufResult<u32, B>) {
+    if let Ok(transferred) = &outcome.result {
         state
             .cursor
             .set(state.cursor.get().saturating_add(u64::from(*transferred)));

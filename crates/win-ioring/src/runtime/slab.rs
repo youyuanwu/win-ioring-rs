@@ -96,6 +96,22 @@ const KIND_MASK: usize = (1 << KIND_BITS) - 1;
 const INDEX_MASK: usize = (1 << INDEX_BITS) - 1;
 const GENERATION_MASK: usize = (1usize << GENERATION_BITS) - 1;
 
+/// The generation a slot starts at, chosen so that **no issued token is ever
+/// zero**.
+///
+/// This is a platform requirement, not a bookkeeping preference. A cancellation
+/// request names its target by user data, and the platform reads a target of
+/// `0` as "everything on this handle": cancelling an operation whose user data
+/// were zero would abort every other pending operation on the same file —
+/// including operations issued by other rings elsewhere in the process, which
+/// this crate has no business touching.
+///
+/// Zero is only reachable as `Operation` (kind bit `0`) in slot `0` at
+/// generation `0`, so starting every slot one generation higher removes it. The
+/// counter only ever increases — an exhausted slot is retired rather than
+/// wrapped — so no slot returns to generation zero later.
+const FIRST_GENERATION: usize = 1;
+
 /// Identifies a slot, and what sort of completion to expect for it.
 ///
 /// Tokens are handed to the platform as user data and come back on completion.
@@ -217,10 +233,6 @@ pub struct OpSlab {
     slots: Vec<Slot>,
     free_head: Option<usize>,
     occupied: usize,
-    /// Set by [`OpSlab::leak`]. A leaked slab has abandoned buffers the kernel
-    /// may still write into, and its token namespace has been discarded, so it
-    /// must never hand out a token again.
-    poisoned: bool,
 }
 
 impl OpSlab {
@@ -230,13 +242,7 @@ impl OpSlab {
             slots: Vec::new(),
             free_head: None,
             occupied: 0,
-            poisoned: false,
         }
-    }
-
-    /// Returns `true` if this slab has been leaked and is no longer usable.
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
     }
 
     /// Returns the number of slots holding a live operation.
@@ -268,12 +274,8 @@ impl OpSlab {
     /// # Errors
     ///
     /// Returns the payload unchanged if the slab is full, which happens when
-    /// [`MAX_SLOTS`] slots are already in use, or if the slab has been leaked
-    /// and is therefore poisoned.
+    /// [`MAX_SLOTS`] slots are already in use.
     pub fn insert(&mut self, payload: Box<dyn Any>) -> Result<Token, Box<dyn Any>> {
-        if self.poisoned {
-            return Err(payload);
-        }
         let index = match self.free_head {
             Some(index) => {
                 let SlotState::Vacant { next_free } = self.slots[index].state else {
@@ -287,7 +289,7 @@ impl OpSlab {
                     return Err(payload);
                 }
                 self.slots.push(Slot {
-                    generation: 0,
+                    generation: FIRST_GENERATION,
                     state: SlotState::Vacant { next_free: None },
                 });
                 self.slots.len() - 1
@@ -431,6 +433,48 @@ impl OpSlab {
         }
     }
 
+    /// Records that a cancellation request was never actually enqueued.
+    ///
+    /// Restores the slot to a state where cancellation can be requested again.
+    /// This is **not** the same as [`OpSlab::complete_cancel`], which handles a
+    /// cancellation that reached the platform and has now reported: here nothing
+    /// was ever queued, so there is no completion to expect and nothing has been
+    /// duplicated. Treating the two the same is what would otherwise make a
+    /// failed request permanent, since [`OpSlab::register_cancel`] only accepts a
+    /// slot that has never been requested.
+    ///
+    /// Returns `true` if a pending request was withdrawn.
+    pub fn cancel_request_not_enqueued(&mut self, token: Token) -> bool {
+        if token.kind() != TokenKind::Cancel {
+            return false;
+        }
+        let index = token.index();
+        let generation = token.generation();
+        let Some(slot) = self.slots.get_mut(index) else {
+            return false;
+        };
+        if slot.generation != generation {
+            return false;
+        }
+        match slot.state {
+            SlotState::Occupied {
+                cancel: ref mut cancel @ CancelState::Pending,
+                ..
+            } => {
+                *cancel = CancelState::NeverRequested;
+                true
+            }
+            // A tombstone is waiting on a cancellation completion that will now
+            // never arrive, so the slot must be released rather than withheld
+            // forever.
+            SlotState::Tombstone => {
+                self.free_slot(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handles an operation's own terminal completion.
     ///
     /// Returns the payload so the caller can resolve the future and release the
@@ -559,9 +603,7 @@ impl OpSlab {
     }
 
     /// Visits every live payload.
-    ///
-    /// Teardown uses this to resolve waiting futures before abandoning their
-    /// buffers, which must happen in that order or those futures hang forever.
+    #[cfg(test)]
     pub fn for_each_payload(&mut self, mut f: impl FnMut(&mut dyn Any)) {
         for slot in &mut self.slots {
             if let SlotState::Occupied {
@@ -611,29 +653,87 @@ impl OpSlab {
             .collect()
     }
 
-    /// Deliberately leaks every remaining payload and renders the slab unusable.
+    /// Returns every slot for which no queue entry has been built yet.
     ///
-    /// Used at teardown when the kernel may still hold pointers into those
-    /// buffers and quiescence could not be established. Leaking is the correct
-    /// trade against a use-after-free.
+    /// Nothing references such a slot's buffer, so teardown can resolve it
+    /// directly. Believed unreachable in practice, since every insert is
+    /// followed by a build or a cleanup within the same borrow — but a slot left
+    /// in this state would be counted as outstanding while no completion could
+    /// ever arrive for it, so the drain handles it rather than assuming.
+    pub fn described(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Described,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every submitted operation that has never had a cancellation
+    /// requested, whether or not a future is still waiting on it.
     ///
-    /// This is a **terminal** operation. The slab is emptied and poisoned: it
-    /// will refuse to insert anything afterwards. That matters because leaking
-    /// discards the token namespace along with the slots, so a fresh insert
-    /// could otherwise mint a token identical to one the kernel still holds,
-    /// and a late completion would then release an unrelated payload.
-    pub fn leak(&mut self) -> usize {
-        let mut leaked = 0;
-        for slot in self.slots.drain(..) {
-            if let SlotState::Occupied { payload, .. } = slot.state {
-                std::mem::forget(payload);
-                leaked += 1;
-            }
-        }
-        self.free_head = None;
-        self.occupied = 0;
-        self.poisoned = true;
-        leaked
+    /// Teardown uses this to ask the platform to abandon everything the kernel
+    /// currently holds. Unlike
+    /// [`OpSlab::detached_submitted_uncancelled`], operations a caller is still
+    /// awaiting are included: an immediate shutdown cancels those too.
+    pub fn submitted_uncancelled(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Submitted,
+                    cancel: CancelState::NeverRequested,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every slot holding a queue entry the kernel has not taken.
+    ///
+    /// Such an entry cannot be withdrawn and still references the caller's
+    /// buffer, so teardown must submit it rather than resolve it — and must not
+    /// issue a waiting submission while any remains, since that would submit and
+    /// wait in one call and could leave the slot still marked as unsubmitted.
+    pub fn built(&self) -> Vec<Token> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.state {
+                SlotState::Occupied {
+                    lifecycle: Lifecycle::Built,
+                    ..
+                } => Some(Token::new(TokenKind::Operation, index, slot.generation)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every slot the kernel has accepted, or whose cancellation is
+    /// still outstanding.
+    ///
+    /// These are exactly the slots that will eventually report. Teardown may
+    /// only abandon queue entries once this is empty.
+    pub fn awaiting_kernel(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.state,
+                    SlotState::Occupied {
+                        lifecycle: Lifecycle::Submitted,
+                        ..
+                    } | SlotState::Tombstone
+                )
+            })
+            .count()
     }
 }
 
@@ -724,6 +824,38 @@ mod tests {
         assert_eq!(t.kind(), TokenKind::Cancel);
         assert_eq!(t.index(), max_index);
         assert_eq!(t.generation(), max_generation);
+    }
+
+    /// No token the slab issues may be zero, because the platform reads a
+    /// cancellation target of zero as "cancel everything on this handle" — which
+    /// would reach operations this crate never issued. The very first operation
+    /// is the dangerous one: slot 0 at the starting generation, with the kind bit
+    /// clear, is the only combination that could produce zero.
+    #[test]
+    fn no_issued_token_is_ever_zero() {
+        let mut slab = OpSlab::new();
+
+        let first = slab.insert(payload(1)).unwrap();
+        assert_eq!(
+            first.index(),
+            0,
+            "this must be the slot that could hit zero"
+        );
+        assert_ne!(first.as_user_data(), 0);
+        assert_ne!(first.to_cancel().as_user_data(), 0);
+
+        // And it stays true as slots are added and recycled.
+        let mut seen = vec![first];
+        for _ in 0..64 {
+            seen.push(slab.insert(payload(2)).unwrap());
+        }
+        for token in seen {
+            assert_ne!(token.as_user_data(), 0);
+            let _ = slab.complete(token);
+        }
+        for _ in 0..64 {
+            assert_ne!(slab.insert(payload(3)).unwrap().as_user_data(), 0);
+        }
     }
 
     /// A completion for a long-finished operation must never be attributed to
@@ -1040,55 +1172,5 @@ mod tests {
         assert_eq!(drained.len(), 5);
         assert_eq!(slab.occupied(), 0);
         assert_eq!(slab.outstanding(), 0);
-    }
-
-    #[test]
-    fn leak_forgets_payloads_without_dropping_them() {
-        use std::rc::Rc;
-
-        let witness = Rc::new(());
-        let mut slab = OpSlab::new();
-        for _ in 0..3 {
-            slab.insert(Box::new(witness.clone())).unwrap();
-        }
-        assert_eq!(Rc::strong_count(&witness), 4);
-
-        let leaked = slab.leak();
-        assert_eq!(leaked, 3);
-        assert_eq!(slab.occupied(), 0);
-        assert_eq!(slab.outstanding(), 0);
-        // The clones were forgotten rather than dropped, which is exactly what
-        // teardown needs when the kernel may still reach the buffers.
-        assert_eq!(Rc::strong_count(&witness), 4);
-    }
-
-    /// `leak` is terminal. Reusing the slab afterwards would mint tokens
-    /// identical to ones the kernel still holds, so a late completion could
-    /// release an unrelated payload.
-    #[test]
-    fn leak_poisons_the_slab_against_reuse() {
-        let mut slab = OpSlab::new();
-        let a = slab.insert(payload(1)).unwrap();
-        let b = slab.insert(payload(2)).unwrap();
-        // Free one slot so the free list is non-empty before leaking.
-        slab.complete(a).unwrap();
-
-        slab.leak();
-        assert!(slab.is_poisoned());
-        assert_eq!(slab.occupied(), 0);
-        assert_eq!(slab.outstanding(), 0);
-        assert_eq!(slab.lookup(a), Lookup::Unknown);
-        assert_eq!(slab.lookup(b), Lookup::Unknown);
-
-        // A fresh insert would otherwise reuse index 0 generation 0, exactly
-        // the token the kernel still holds for the leaked operation.
-        assert!(
-            slab.insert(payload(3)).is_err(),
-            "a leaked slab must refuse to mint new tokens"
-        );
-        assert_eq!(slab.occupied(), 0);
-
-        // Late completions for the leaked operations are inert.
-        assert!(slab.complete(b).is_none());
     }
 }
