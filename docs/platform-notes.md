@@ -45,6 +45,59 @@ detecting a full submission queue, for instance — must read it back from
 The second row is the surprising one: end-of-file arrives as an *error*, not as a
 zero-byte success, and it is distinct from a short read.
 
+## Cancelling with a target of zero cancels *everything* on the handle
+
+`BuildIoRingCancelRequest` takes the target operation's user data. A target of
+**`0`** does not mean "the operation whose user data is 0" — it behaves like
+`CancelIoEx(handle, NULL)` and aborts every pending operation on that file
+handle, including operations issued by a **different ring**, anywhere in the
+process.
+
+Probed directly. Two reads on one pipe handle, cancelling only the first:
+
+| Reads' user data | Cancellation target | Outcome |
+|---|---|---|
+| `0xAA`, `0xBB` | `0xAA` | only `0xAA` aborted — precise |
+| `0x00`, `0xBB` | `0x00` | **both** aborted |
+
+This caused a real bug. The slab's very first operation — slot 0, generation 0,
+kind bit clear — encoded to exactly `0`, so dropping the first read future on a
+file aborted every other read in flight on it. Generations now start at 1
+(**INV-TOKEN-NONZERO** in [design.md](design.md)).
+
+Assume nothing about user-data values being opaque to the platform: at least one
+of them is reserved.
+
+## Closing the ring neither cancels nor waits
+
+`CloseIoRing` does **not** cancel in-flight operations and does **not** wait for
+them. The documentation is explicit that *"reads from or writes to memory buffers
+may still occur after CloseIoRing returns."*
+
+This is the opposite of Linux, where closing the `io_uring` descriptor blocks
+in-kernel until the ring is drained. Code ported from an `io_uring` mental model
+— "closing the ring is enough" — is **unsound** here.
+
+Microsoft's suggested remedy is `CancelIoEx(handle, NULL)` before closing. This
+crate rejects that: it would cancel operations on a shared handle that the driver
+never issued. It cancels its own operations individually instead, which is why
+the entry above matters so much.
+
+## `SubmitIoRing` submits and waits in one call
+
+There is no way to wait without also submitting. Two consequences:
+
+- A wait timeout is reported as an **error** return, not as a distinct status.
+  It is ordinary progress, not a failure, and treating it as one makes a slow
+  shutdown look like a stuck queue.
+- The wrapper discards the submitted-entry count when the call returns an error,
+  so a *timed-out* waiting submission may have handed entries to the kernel while
+  the caller still believes it did not. Never issue a waiting submission while
+  holding entries whose bookkeeping depends on knowing whether they were taken.
+
+A waiting call with nothing in flight returns immediately rather than blocking
+for its timeout, so an empty drain costs nothing even if it asks to wait.
+
 ## There is no unregister
 
 The platform exposes no `Unregister*` entry point at all. Registering an
@@ -53,7 +106,9 @@ accepts it, and it then fails at **completion** time with `E_INVALIDARG`.
 
 A registration can therefore only be superseded by a different non-empty set, or
 released by closing the ring. This is why registration in this crate is a
-permanent transfer of ownership.
+permanent transfer of ownership — and why a registration in flight at an
+immediate shutdown can only be waited for, never cancelled: a cancellation must
+name the file its target named, and a registration names none.
 
 Note the asymmetry: a zero-**extent** buffer descriptor *is* accepted. Only a
 zero-**count** registration fails.

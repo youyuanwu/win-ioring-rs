@@ -67,9 +67,10 @@ impl FileState {
 /// Clears a file's outstanding-sequential flag when the operation ends.
 ///
 /// The driver keeps this in the operation's payload, so the flag clears on
-/// terminal completion whether or not the future survived to see it. If the
-/// driver has to abandon its payloads, the flag stays set, which is correct: an
-/// operation the kernel may still be running must not be joined by another.
+/// terminal completion whether or not the future survived to see it. Teardown
+/// drains rather than abandoning payloads, so the flag is cleared there too —
+/// by which point the kernel is provably finished with the operation, which is
+/// the condition that made holding the flag necessary in the first place.
 #[derive(Debug)]
 pub(crate) struct SequentialGuard(Rc<FileState>);
 

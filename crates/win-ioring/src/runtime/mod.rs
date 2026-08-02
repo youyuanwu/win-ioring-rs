@@ -1023,6 +1023,19 @@ fn yield_now() -> YieldNow {
 /// Spawn [`Driver::drive`] on your executor and issue operations through
 /// [`Driver::handle`]. The driver, its handles, and its futures are all
 /// single-threaded by design and cannot be sent between threads.
+///
+/// # Dropping blocks
+///
+/// Dropping a `Driver` tears the ring down synchronously, and that drain is
+/// unbounded: it ends when the kernel holds nothing. Closing the ring neither
+/// cancels in-flight work nor waits for it, and the platform may keep writing
+/// into buffers afterwards, so giving up early would mean freeing memory the
+/// kernel is still using.
+///
+/// In practice this is brief, but an operation that never completes and cannot
+/// be cancelled has no exit, and dropping the driver will not return. Prefer
+/// awaiting [`Driver::drive`], which drains cooperatively and can be escalated
+/// with [`Handle::shutdown_now`] while it runs.
 pub struct Driver {
     inner: Rc<RefCell<DriverInner>>,
     /// Held outside `DriverInner` so it is never invoked under the driver's

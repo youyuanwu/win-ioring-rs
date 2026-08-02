@@ -67,6 +67,15 @@ completions and cancellation completions in disjoint halves of the user-data
 space — the platform gives a cancellation its *own* user data rather than
 echoing its target's.
 
+Generations start at **1**, not 0, and that is a safety property rather than
+bookkeeping taste (**INV-TOKEN-NONZERO**). A cancellation names its target by
+user data, and the platform reads a target of `0` as *"everything on this
+handle"* — see [platform-notes.md](platform-notes.md). Zero is reachable only as
+an operation (kind bit clear) in slot 0 at generation 0, so starting a generation
+higher removes it. `issue_cancel` re-checks the value before use, because the
+consequence of the invariant lapsing is silent damage to code outside this crate
+rather than a failure inside it.
+
 ### Cancellation is a correlated state, not a counter
 
 A cancellation is its own submission with its own completion, and may complete
@@ -133,19 +142,89 @@ watermark — but only if the read started at or before it, because a read landi
 past the watermark would otherwise vouch for a gap of genuinely uninitialized
 bytes in front of it.
 
-### Teardown leaks rather than frees
+### Shutdown drains to quiescence
 
-The driver makes a bounded drain attempt (`DRAIN_ROUNDS` × `DRAIN_TIMEOUT_MS`,
-using `SubmitIoRing`'s own wait so the crate needs no timer of its own).
+Closing the ring neither cancels in-flight work nor waits for it, and the kernel
+may keep writing into buffers afterwards
+([platform-notes.md](platform-notes.md)). Linux's `io_uring` blocks in-kernel
+when its descriptor closes, which is why the strategy other crates use — just
+close it — is unsound here. Nothing else releases registrations either: there is
+no unregister entry point at all.
 
-- If the ring settles, everything is released normally.
-- If it does not, the driver resolves every waiting future **first** — the
-  payloads hold the wakers, so leaking first would hang them — then leaks the
-  slab, the cancellation handle holds, and every registration.
+So the driver **drains**, and the drain is unbounded. It ends when the kernel
+holds nothing, however long that takes. A shutdown can therefore hang on an
+operation that never completes and cannot be cancelled; that is a deliberate
+trade against the alternative, which is freeing memory the kernel is still
+writing into.
 
-Freeing memory the kernel may still write into would be a use-after-free.
-Leaking is the only sound alternative, so it is a deliberate policy rather than a
-bug. `OpSlab::leak()` also poisons the slab so no further token can be minted.
+Four invariants carry it:
+
+- **INV-DRAIN-TERMINATES** — `outstanding()` counts slots for which no completion
+  can ever arrive on their own. Each step must therefore resolve `Described`
+  slots and submit `Built` ones *before* waiting, or the drain waits forever for
+  a report nothing will send.
+- **INV-BUILT-NEVER-DISCARDED** — a `Built` entry is queued, still references the
+  caller's buffer, and cannot be withdrawn. It must be submitted, never resolved
+  locally — even under an immediate shutdown. The one carve-out is an entry the
+  kernel has *repeatedly refused*: it was never accepted, so closing the ring
+  discards it, and only then may it be abandoned.
+- **INV-NO-WAIT-WITH-BUILT** — the drain never issues its waiting submission
+  while any `Built` slot remains. `SubmitIoRing` submits *and* waits in one call,
+  and the wrapper discards the submitted-entry count on error, so a waiting call
+  that times out can hand entries to the kernel while leaving them still marked
+  unsubmitted. Residue detection would then conclude the kernel held nothing and
+  release buffers it is actively writing into.
+- **INV-RING-CLOSED-FIRST** — nothing the kernel can reach is released until the
+  ring is closed, and the ring is closed before any `Driver` field is dropped.
+
+#### Two flags, and two loops
+
+Teardown tracks `teardown_started` and `torn_down` separately. Re-entry is
+guarded on `torn_down` — *finished* — because a drain abandoned part-way must
+resume rather than skip to releasing. Guarding on "started" would let a second
+call return as though teardown were done, leaving the ring open and everything in
+it stranded.
+
+There are two drain loops, not one: a cooperative one in `drive` that yields
+between steps, and a synchronous one in `Drop for Driver`. Sharing a single
+blocking loop would make escalation impossible. Everything here is `!Send`, so
+`Handle::shutdown_now` can only be called from the driver's own thread; a graceful
+drain that blocked that thread outright could never be escalated, and a graceful
+drain never cancels, so escalation is the only way out of a stalled one. The mode
+is re-read every step.
+
+Their unwind handling is deliberately **asymmetric**. `drive`'s loop needs no
+guard: a panic unwinds out, the `Driver` drops, and `Drop for Driver` re-enters
+and finishes — which works *only* because re-entry is guarded on `torn_down`.
+`Drop`'s loop does need `AbortOnUnwind`, because a panic there means `Drop for
+Driver` will not run again while the remaining fields still drop in declaration
+order, including the completion event, whose handle must not close while the ring
+can still signal it.
+
+#### Where it aborts, and why
+
+Two categories, both reached only where every alternative is worse:
+
+- **Ring failure** — the ring cannot be closed after `CLOSE_ATTEMPTS`. It can
+  neither be drained nor safely released from.
+- **Memory safety** — a panic escapes teardown, or `DriverInner` is destroyed,
+  with the ring still open. Both would otherwise release memory the kernel can
+  still reach.
+
+A **wait timeout is not a failure** and never feeds either. `submit` reports one
+as an error, which is a trap: counting it would make an ordinary slow shutdown
+look like a stuck queue, and the drain would eventually abandon live entries.
+Only the non-waiting `submit(0, 0)` feeds the submission-failure count.
+
+#### What callers see
+
+Every future resolves, with its buffer, either with its own outcome or with
+`Error::AbandonedAtShutdown`. A drain that is not converging reports
+`Error::ShutdownStalled { outstanding }` to the error observer, throttled, so a
+stalled shutdown is distinguishable from a hang.
+
+Each individual wait blocks its thread for up to `DRAIN_TIMEOUT_MS`, which
+callers sharing that thread see for the whole of a prolonged shutdown.
 
 ### Buffers are owned, and the traits are `unsafe`
 
@@ -158,9 +237,11 @@ They also forbid interior mutability of the buffer contents outright: a
 `Cell<u8>`-backed buffer could mutate under a live `&[u8]` already handed to the
 kernel.
 
-`Outcome<T, B>` is `Completed(BufResult)` or `Retained(Error)`. `Retained` is the
-one documented case where the buffer does not come back — it means teardown
-abandoned it.
+`Outcome<T, B>` no longer exists. Operations resolve to `BufResult<T, B>`
+unconditionally, because there is no longer a case in which the buffer does not
+come back: the drain waits until the kernel is finished with it. An operation the
+driver ended itself reports `Error::AbandonedAtShutdown` — a named teardown
+error, not a fabricated I/O failure — and still returns the buffer alongside it.
 
 Why ownership rather than a borrowed slice, and what it would take to accept one,
 is worked through in [buffer-ownership.md](buffer-ownership.md).

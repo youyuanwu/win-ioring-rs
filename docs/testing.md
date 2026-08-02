@@ -61,16 +61,52 @@ dependency differently. A third test runs the collector over a synthetic manifes
 containing every form, so the collector losing one is caught rather than silently
 weakening the policy.
 
+### Getting a genuinely long-running operation
+
+A read from a small local file completes almost immediately, so any test
+asserting that an operation is *still in flight* is asserting a timing accident.
+That is why the older shutdown tests all accepted either outcome.
+
+`Pipe` (in `crates/win-ioring/src/runtime/mod.rs`, test module) creates a
+connected named-pipe pair opened for overlapped I/O. A read on the server end
+stays in the kernel until the client writes, which makes "still in flight at
+shutdown" a fact and lets the test choose the moment it reports. Use it for
+anything about ordering with respect to shutdown.
+
+Its own premise is tested by `a_read_on_an_empty_pipe_stays_in_flight`, so a
+platform change that made pipe reads complete eagerly would show up as that test
+failing rather than as several others quietly going vacuous.
+
+### Test seams in the driver
+
+All `#[cfg(test)]` fields on `DriverInner`. Each exists because the path it
+reaches has no reproducible natural failure mode:
+
+| Seam | Reaches |
+|---|---|
+| `fail_next_submits: u32` | submission retry, and the unsubmittable-residue carve-out |
+| `fail_next_cancels: u32` | the cancellation retry path |
+| `cancel_attempts: u32` | *observes* — how many cancellations were attempted |
+| `withhold_reaps: u32` | an operation that stays outstanding for a known number of drain steps |
+| `fail_next_registration: bool` | a registration that fails at completion time |
+
+**Counted, not boolean, and that matters.** The drain is unbounded, so a seam
+that withheld reaping or refused cancellations *unconditionally* produces a test
+that hangs forever rather than one that fails — a CI timeout instead of an
+assertion. Give every such seam a budget the test outlives.
+
 ### Proving that memory is *not* freed
 
 Several guarantees are about something not happening: a superseded registration
-stays alive, an unquiet teardown abandons rather than releases. Nothing
+stays alive, and a buffer is *not* released before its operation reports. Nothing
 observable occurs in those cases, so a test can otherwise only assert that no
 call returned an error — which is exactly the kind of test that passes while
 proving nothing.
 
 `win_ioring_tests::counting::CountingBuf` is a buffer that increments a shared
 counter when dropped. Use it whenever the property under test is an absence.
+`win-ioring`'s own test module defines an equivalent locally, since it cannot
+depend on the test crate.
 
 ### Observing handle release
 
@@ -94,6 +130,38 @@ This came up often enough to be worth stating:
 - **Verify a new test fails against the old behaviour.** Several tests in this
   suite were confirmed load-bearing by temporarily reverting the fix; the
   closed-ring guard test dies with `STATUS_ACCESS_VIOLATION` without it.
+
+### Vacuity traps caught in this suite
+
+Every one of these was written, looked right, and **passed against a
+deliberately broken variant** until it was tightened. They are recorded because
+the pattern recurs, not because the specific tests matter.
+
+- **The seam budget ran out before the interesting moment.** A test withheld
+  reaping for exactly as many rounds as its own loop consumed, so by the time
+  teardown started, reaping was no longer withheld and a teardown that gave up
+  and leaked passed anyway. Set the budget *higher* than the loop consumes.
+- **"Everything resolved" is satisfied by everything simply finishing.** A test
+  meant to prove that refused cancellations are retried passed because the
+  operations completed naturally. It needs a second assertion — that more
+  cancellations were *attempted* than there are operations — and operations that
+  cannot finish on their own, which is what `Pipe` is for.
+- **The throttling bound was drawn against the wrong quantity.** A test asserted
+  that stall reports numbered fewer than the rounds observed, and passed against
+  a variant reporting on *every* round, because reporting only starts after a
+  threshold. Draw the bound against the interval: `rounds / INTERVAL`.
+- **After a read, `buf.len()` is the transferred count, not the original
+  length.** Assert `capacity()` to prove the caller's own allocation came back;
+  asserting `len()` proves only that a read happened.
+
+### What cannot be tested here
+
+Say so in the test module rather than writing something that passes vacuously:
+
+- **Aborts.** They end the process. Enumerated and reviewed instead; see
+  [pending-work.md](pending-work.md).
+- **A completion racing its own cancellation.** No deterministic ordering has
+  been found.
 
 ## Fixtures
 

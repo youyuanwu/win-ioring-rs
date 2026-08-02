@@ -79,7 +79,7 @@ Any type implementing `IoBuf`/`IoBufMut` works; `Vec<u8>`, `Box<[u8]>` and
 because they promise the kernel a stable address and an honest initialized
 length that the compiler cannot check for you.
 
-## Cancellation, shutdown, and the leak policy
+## Cancellation and shutdown
 
 **Dropping a future is always safe and never blocks.** It detaches and, where the
 platform can act on one, requests cancellation. The buffer and the file handle
@@ -107,8 +107,13 @@ blocked on an operation that neither completes nor responds to cancellation will
 not finish. That case is reported, throttled, through the error observer, and a
 graceful shutdown can be escalated with `Handle::shutdown_now` while it drains.
 
-Await `Driver::drive` to know when shutdown has finished; `Handle::shutdown_complete`
-does the same for code holding a handle but not the driver.
+**To know when shutdown has finished, await `Driver::drive`.** That is the
+recommended path and the one to reach for by default. `Handle::shutdown_complete`
+exists for code that holds a handle but not the driver; it resolves on the same
+event but cannot itself make progress, so awaiting it on a thread where nothing
+is driving the ring waits forever. Having two ways to await the same thing with
+different failure modes is the sharpest edge in this API — prefer the first
+unless you cannot reach the driver.
 
 Registration follows the same logic. A registered buffer cannot be withdrawn —
 the platform offers no unregister call — so registering is a permanent transfer
