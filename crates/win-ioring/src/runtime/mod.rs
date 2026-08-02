@@ -308,6 +308,23 @@ impl<T> Registered<T> {
     }
 }
 
+/// How far along shutdown is.
+///
+/// Ordered so that escalation is a maximum and downgrade is impossible: a
+/// graceful shutdown may become immediate, but an immediate one never relaxes
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShutdownMode {
+    /// Accepting work normally.
+    Running,
+    /// No longer accepting work; operations already in flight are left to
+    /// finish on their own.
+    Graceful,
+    /// No longer accepting work; cancellation is requested for everything in
+    /// flight that the platform will accept one for.
+    Immediate,
+}
+
 /// Shared driver state, reached by handles and futures.
 struct DriverInner {
     ring: IoRing,
@@ -348,7 +365,23 @@ struct DriverInner {
     /// While set, a retry is owed and no completion can arrive to prompt it, so
     /// the driver must schedule its own wake.
     pending_submit: bool,
-    shutting_down: bool,
+    /// How far along shutdown is. Escalation is monotonic: a graceful shutdown
+    /// can become immediate, never the reverse.
+    shutdown: ShutdownMode,
+    /// Set when teardown is entered, before any draining has happened.
+    ///
+    /// Distinct from [`DriverInner::torn_down`], which is set only once the ring
+    /// is closed and every resource released. Teardown must be re-enterable
+    /// while this is set but that is not: a drain abandoned part-way — because
+    /// the future driving it was dropped, or because a caller's waker panicked —
+    /// has to be resumed, not skipped. Guarding re-entry on this flag instead
+    /// would let a half-torn-down driver release memory the kernel can still
+    /// reach.
+    teardown_started: bool,
+    /// Set only once the ring is closed and every resource has been released.
+    ///
+    /// Gates cancellation and submission, and resolves shutdown-completion
+    /// waiters.
     torn_down: bool,
     /// Errors awaiting delivery to the observer.
     ///
@@ -370,7 +403,8 @@ struct DriverInner {
     /// Test seam: skip the quiescence drain at teardown.
     ///
     /// A ring that refuses to settle cannot be produced on demand, so the
-    /// retain-and-leak path needs injecting too.
+    /// retain-and-leak path needs injecting too. Replaced in a later phase by a
+    /// counted withhold-reaping seam.
     #[cfg(test)]
     force_unquiet_teardown: bool,
     /// Test seam: build the next buffer registration with no descriptors.
@@ -554,7 +588,11 @@ impl DriverInner {
     ///
     /// Cancelling twice, or cancelling something already finished, is a no-op.
     fn request_cancel(&mut self, token: Token) {
-        if self.shutting_down || self.torn_down {
+        // Only a completed teardown refuses. A shutdown in progress is exactly
+        // when cancellation matters most: the drain issues its requests through
+        // here, and refusing them would leave the drain waiting for operations
+        // nobody has asked to stop.
+        if self.torn_down {
             return;
         }
         match self.slab.state(token).map(|(lifecycle, _)| lifecycle) {
@@ -575,7 +613,10 @@ impl DriverInner {
     ///
     /// Does nothing if the operation is not, or is no longer, submitted.
     fn issue_cancel(&mut self, token: Token) {
-        if self.shutting_down || self.torn_down {
+        // As in `request_cancel`: only a completed teardown refuses. Gating this
+        // on "a shutdown is in progress" is what previously made teardown unable
+        // to cancel anything, since teardown set that flag before draining.
+        if self.torn_down {
             return;
         }
         // Only submitted operations can be cancelled. A described one has
@@ -746,8 +787,11 @@ impl DriverInner {
         if self.torn_down {
             return Vec::new();
         }
-        self.torn_down = true;
-        self.shutting_down = true;
+        self.teardown_started = true;
+        // A teardown nobody requested is an abrupt one: there is no longer
+        // anyone to observe the results, so waiting for work to finish on its
+        // own would be waiting for nothing.
+        self.shutdown = self.shutdown.max(ShutdownMode::Immediate);
 
         // Try to reach quiescence before deciding anything. Each round hands
         // any queued entries to the kernel and then waits, briefly, for the
@@ -787,6 +831,7 @@ impl DriverInner {
             self.retired_buffer_registrations.clear();
             self.file_registration = None;
             self.retired_file_registrations.clear();
+            self.torn_down = true;
             return wakers;
         }
 
@@ -819,6 +864,7 @@ impl DriverInner {
         std::mem::forget(self.file_registration.take());
         std::mem::forget(std::mem::take(&mut self.retired_file_registrations));
 
+        self.torn_down = true;
         wakers
     }
 }
@@ -925,7 +971,8 @@ impl Driver {
                 deferred_cancels: Vec::new(),
                 wake: Rc::clone(&wake),
                 pending_submit: false,
-                shutting_down: false,
+                shutdown: ShutdownMode::Running,
+                teardown_started: false,
                 torn_down: false,
                 deferred_reports: Vec::new(),
                 submit_failures: 0,
@@ -974,7 +1021,12 @@ impl Driver {
                 inner.submit_pending();
                 let wakers = inner.reap_completions();
                 let reports = inner.take_reports();
-                (inner.shutting_down, inner.pending_submit, wakers, reports)
+                (
+                    inner.shutdown != ShutdownMode::Running,
+                    inner.pending_submit,
+                    wakers,
+                    reports,
+                )
             };
 
             // Wake and report only after the borrow is released: an executor may
@@ -1058,17 +1110,48 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Requests shutdown.
+    /// Requests a graceful shutdown.
     ///
-    /// The driver stops accepting new work and closes the ring.
+    /// The driver stops accepting new work, lets operations already in flight
+    /// finish on their own, and closes the ring once they have. Returns
+    /// immediately; see [`Handle::shutdown_complete`] to await the result.
+    ///
+    /// Because a graceful shutdown never cancels, it waits for as long as its
+    /// slowest outstanding operation takes. Escalate with
+    /// [`Handle::shutdown_now`] if that is not acceptable.
     pub fn shutdown(&self) {
-        self.strong.borrow_mut().shutting_down = true;
+        self.escalate(ShutdownMode::Graceful);
+    }
+
+    /// Requests an immediate shutdown.
+    ///
+    /// The driver stops accepting new work and asks the platform to cancel
+    /// everything in flight that it will accept a cancellation for, then closes
+    /// the ring once every operation has reported. Returns immediately; see
+    /// [`Handle::shutdown_complete`] to await the result.
+    ///
+    /// Cancellation is a request, not a revocation: an operation may still
+    /// complete normally, and registrations cannot be cancelled at all.
+    pub fn shutdown_now(&self) {
+        self.escalate(ShutdownMode::Immediate);
+    }
+
+    /// Raises the shutdown mode, never lowers it.
+    fn escalate(&self, mode: ShutdownMode) {
+        {
+            let mut inner = self.strong.borrow_mut();
+            if inner.shutdown >= mode {
+                return;
+            }
+            inner.shutdown = mode;
+        }
         let _ = self.wake.signal();
     }
 
-    /// Returns `true` if the driver has been asked to shut down.
+    /// Returns `true` if the driver has been asked to shut down, by either
+    /// [`Handle::shutdown`] or [`Handle::shutdown_now`].
     pub fn is_shutting_down(&self) -> bool {
-        self.strong.borrow().shutting_down
+        self.strong.borrow().shutdown != ShutdownMode::Running
     }
 
     /// Returns the number of operations the driver is still tracking.
@@ -1122,7 +1205,7 @@ impl Handle {
     ) -> std::result::Result<ReadFuture<B>, (Error, B)> {
         {
             let inner = self.strong.borrow();
-            if inner.shutting_down {
+            if inner.shutdown != ShutdownMode::Running {
                 return Err((Error::ShuttingDown, buffer));
             }
             if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_READ) {
@@ -1267,7 +1350,7 @@ impl Handle {
         } = options;
         {
             let inner = self.strong.borrow();
-            if inner.shutting_down {
+            if inner.shutdown != ShutdownMode::Running {
                 return Err((Error::ShuttingDown, buffer));
             }
             if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_WRITE) {
@@ -1419,7 +1502,7 @@ impl Handle {
     ) -> Result<FlushFuture> {
         {
             let inner = self.strong.borrow();
-            if inner.shutting_down {
+            if inner.shutdown != ShutdownMode::Running {
                 return Err(Error::ShuttingDown);
             }
             inner.ring.ensure_op_supported(IORING_OP_FLUSH)?;
@@ -1520,7 +1603,7 @@ impl Handle {
         }
 
         let mut inner = self.strong.borrow_mut();
-        if inner.shutting_down {
+        if inner.shutdown != ShutdownMode::Running {
             return Err((Error::ShuttingDown, buffers));
         }
         if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_REGISTER_BUFFERS) {
@@ -1642,7 +1725,7 @@ impl Handle {
         }
 
         let mut inner = self.strong.borrow_mut();
-        if inner.shutting_down {
+        if inner.shutdown != ShutdownMode::Running {
             return Err(Error::ShuttingDown);
         }
         inner.ring.ensure_op_supported(IORING_OP_REGISTER_FILES)?;
@@ -1753,7 +1836,7 @@ impl Handle {
         };
         {
             let inner = self.strong.borrow();
-            if inner.shutting_down {
+            if inner.shutdown != ShutdownMode::Running {
                 return Err(Error::ShuttingDown);
             }
             inner.ring.ensure_op_supported(op_code)?;
@@ -2689,6 +2772,117 @@ mod tests {
         handle.shutdown();
     }
 
+    /// SC-018: shutdown is idempotent, and requesting it from several handles
+    /// is indistinguishable from requesting it once.
+    #[test]
+    fn shutdown_requests_are_idempotent_across_handles() {
+        let driver = test_driver();
+        let a = driver.handle();
+        let b = driver.handle();
+
+        assert!(!a.is_shutting_down());
+        a.shutdown();
+        assert!(a.is_shutting_down());
+        assert!(b.is_shutting_down(), "handles share one driver state");
+
+        b.shutdown();
+        a.shutdown();
+        assert_eq!(
+            driver.inner.borrow().shutdown,
+            ShutdownMode::Graceful,
+            "repeating a graceful request must not change the mode"
+        );
+    }
+
+    /// SC-019 (first clause): a graceful shutdown escalates to immediate, and
+    /// SC-011 in part: the escalation is not suppressed by a shutdown already
+    /// being in progress.
+    #[test]
+    fn shutdown_escalates_but_never_downgrades() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        handle.shutdown();
+        assert_eq!(driver.inner.borrow().shutdown, ShutdownMode::Graceful);
+
+        handle.shutdown_now();
+        assert_eq!(
+            driver.inner.borrow().shutdown,
+            ShutdownMode::Immediate,
+            "graceful must escalate to immediate"
+        );
+
+        // The reverse must not happen: an immediate shutdown has already asked
+        // the platform to abandon work, and pretending otherwise would leave
+        // callers expecting results that are not coming.
+        handle.shutdown();
+        assert_eq!(
+            driver.inner.borrow().shutdown,
+            ShutdownMode::Immediate,
+            "immediate must not downgrade to graceful"
+        );
+    }
+
+    /// SC-016: once shutdown is requested, submissions fail immediately rather
+    /// than being accepted and abandoned later. Checked for both modes, since
+    /// they are separate gates.
+    #[test]
+    fn submissions_are_refused_once_shutdown_is_requested() {
+        for escalate in [false, true] {
+            let driver = test_driver();
+            let handle = driver.handle();
+            let file = readme();
+
+            if escalate {
+                handle.shutdown_now();
+            } else {
+                handle.shutdown();
+            }
+
+            let mut fut = Box::pin(handle.read(&file, vec![0_u8; 32], 32, 0));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => assert!(
+                    out.err().is_some(),
+                    "a post-shutdown submission must fail, not succeed"
+                ),
+                Poll::Pending => panic!("a post-shutdown submission must not pend"),
+            }
+        }
+    }
+
+    /// The defect this work exists to fix: teardown used to set its
+    /// shutting-down flag first, and cancellation refused whenever that flag was
+    /// set, so teardown could never cancel anything. Cancellation must now be
+    /// refused only once teardown has actually finished.
+    #[test]
+    fn cancellation_is_not_suppressed_by_a_shutdown_in_progress() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let fut = handle.read(&file, vec![0_u8; 128], 64, 0);
+        let token = fut.operation_id().expect("read was built").0;
+        driver.inner.borrow_mut().submit_pending();
+        assert_eq!(
+            driver.inner.borrow().slab.state(token).map(|s| s.0),
+            Some(Lifecycle::Submitted),
+            "the operation must be submitted for this test to mean anything"
+        );
+
+        // Shutdown is under way but teardown has not completed.
+        handle.shutdown_now();
+        assert!(!driver.inner.borrow().torn_down);
+
+        drop(fut);
+        assert!(
+            !driver.inner.borrow().cancel_holds.is_empty(),
+            "a shutdown in progress must not suppress cancellation"
+        );
+
+        drain(&driver);
+    }
     /// Dropping a future before its operation reaches the kernel leaves nothing
     /// to cancel at the time. The cancellation must therefore be deferred until
     /// submission promotes the operation, or an abandoned read would run to

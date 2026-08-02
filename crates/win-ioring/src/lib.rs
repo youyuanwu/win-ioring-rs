@@ -174,3 +174,4 @@ pub mod runtime;
 
 pub use buf::{BufResult, IoBuf, IoBufMut};
 pub use error::{Error, Result};
+pub use runtime::ShutdownMode;
