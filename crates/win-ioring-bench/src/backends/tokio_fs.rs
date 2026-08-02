@@ -17,6 +17,7 @@
 //! what actually determines how much of this backend's I/O can proceed at once,
 //! so that is what the two configurations differ in, and it is reported.
 
+use std::cell::RefCell;
 use std::io;
 use std::os::windows::fs::FileExt;
 use std::path::Path;
@@ -42,6 +43,46 @@ impl Buffer for Vec<u8> {
     }
 }
 
+/// A pool of reusable buffers.
+///
+/// Every backend allocates its buffers once, at construction, and hands the same
+/// ones out for the life of the run. Without this the backends using owned
+/// buffers would pay an `alloc_zeroed` and a `free` *per operation* while the
+/// registered backend paid neither — a systematic, one-sided cost confounded
+/// with the exact thing being compared.
+pub struct BufferPool {
+    free: RefCell<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    /// Allocates `count` buffers of `capacity` bytes.
+    pub fn new(count: usize, capacity: usize) -> Self {
+        Self {
+            free: RefCell::new((0..count).map(|_| vec![0_u8; capacity]).collect()),
+        }
+    }
+
+    /// Takes a buffer, growing it if the caller needs more than it holds.
+    ///
+    /// Growth happens on the first operation of a run and not again, so it does
+    /// not reintroduce per-operation allocation.
+    pub fn take(&self, capacity: usize) -> io::Result<Vec<u8>> {
+        let mut buffer = self.free.borrow_mut().pop().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
+        })?;
+        if buffer.capacity() < capacity {
+            buffer.reserve(capacity - buffer.capacity());
+        }
+        buffer.resize(capacity, 0);
+        Ok(buffer)
+    }
+
+    /// Returns a buffer to the pool.
+    pub fn put(&self, buffer: Vec<u8>) {
+        self.free.borrow_mut().push(buffer);
+    }
+}
+
 /// A file shared with the blocking pool.
 ///
 /// `Arc` because each operation moves a reference onto a pool thread.
@@ -51,6 +92,7 @@ pub struct PoolFile(Arc<std::fs::File>);
 pub struct TokioFs {
     runtime: tokio::runtime::Runtime,
     blocking_threads: usize,
+    buffers: BufferPool,
 }
 
 impl TokioFs {
@@ -58,7 +100,10 @@ impl TokioFs {
     ///
     /// One thread is the like-for-like comparison against a backend that can use
     /// only one; the default width is this backend at its realistic best.
-    pub fn new(blocking_threads: usize) -> io::Result<Self> {
+    ///
+    /// `pool` is how many buffers to pre-allocate — at least the in-flight depth
+    /// the caller intends to reach.
+    pub fn new(blocking_threads: usize, pool: usize, capacity: usize) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .max_blocking_threads(blocking_threads)
             .enable_all()
@@ -66,6 +111,7 @@ impl TokioFs {
         Ok(Self {
             runtime,
             blocking_threads,
+            buffers: BufferPool::new(pool, capacity),
         })
     }
 
@@ -113,10 +159,12 @@ impl Backend for TokioFs {
     }
 
     fn take_buffer(&self, capacity: usize) -> io::Result<Self::Buf> {
-        Ok(vec![0_u8; capacity])
+        self.buffers.take(capacity)
     }
 
-    fn put_buffer(&self, _buffer: Self::Buf) {}
+    fn put_buffer(&self, buffer: Self::Buf) {
+        self.buffers.put(buffer);
+    }
 
     async fn read_at(
         &self,

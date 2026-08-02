@@ -10,7 +10,7 @@ use win_ioring_bench::backends::ioring;
 use win_ioring_bench::config::Config;
 use win_ioring_bench::harness::{Job, Which, run_one};
 use win_ioring_bench::scenario::{Rng, Scenario};
-use win_ioring_bench::verify::Trace;
+use win_ioring_bench::verify::{Phase, Trace};
 use win_ioring_bench::workload;
 
 /// Prepares a small working set for the tests.
@@ -163,10 +163,10 @@ fn a_backend_that_does_less_work_is_rejected() {
         lazy.issued(i * 64, 64);
     }
     for i in 0..8_u64 {
-        honest.delivered(i * 64, 64, &[7_u8; 64]);
+        honest.delivered(Phase::Read, i * 64, 64, &[7_u8; 64]);
         // Skips the last two: fewer completions, less delivered.
         if i < 6 {
-            lazy.delivered(i * 64, 64, &[7_u8; 64]);
+            lazy.delivered(Phase::Read, i * 64, 64, &[7_u8; 64]);
         }
     }
 
@@ -186,9 +186,9 @@ fn a_backend_that_delivers_nothing_readable_is_rejected() {
     for i in 0..4_u64 {
         honest.issued(i * 64, 64);
         hollow.issued(i * 64, 64);
-        honest.delivered(i * 64, 64, &[3_u8; 64]);
+        honest.delivered(Phase::Read, i * 64, 64, &[3_u8; 64]);
         // Reports the same transfer count, but the application sees nothing.
-        hollow.delivered(i * 64, 64, &[]);
+        hollow.delivered(Phase::Read, i * 64, 64, &[]);
     }
 
     assert!(

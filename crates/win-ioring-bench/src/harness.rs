@@ -123,10 +123,14 @@ pub struct Run {
 /// backend that must build a ring be compared with one that need not.
 pub fn run_one(which: Which, config: &Config, job: &Job<'_>) -> Run {
     let depth = job.depth;
+    // Every backend pre-allocates the same number of buffers of the same size,
+    // so none is charged a per-operation allocation another avoids.
+    let pool = depth.max(1);
+    let capacity = job.block as usize;
     match which {
         Which::TokioOne | Which::TokioMany => {
             let width = if which == Which::TokioOne { 1 } else { 512 };
-            match tokio_fs::TokioFs::new(width) {
+            match tokio_fs::TokioFs::new(width, pool, capacity) {
                 Ok(backend) => {
                     let measured = backend.block_on(repeats(&backend, config, job));
                     Run {
@@ -142,7 +146,7 @@ pub fn run_one(which: Which, config: &Config, job: &Job<'_>) -> Run {
                 },
             }
         }
-        Which::RingPlain => match ioring::IoRingPlain::new(depth) {
+        Which::RingPlain => match ioring::IoRingPlain::new(depth, pool, capacity) {
             Ok(mut backend) => {
                 let driver = backend.take_driver().expect("taken once");
                 let handle = backend.handle();
@@ -170,9 +174,11 @@ pub fn run_one(which: Which, config: &Config, job: &Job<'_>) -> Run {
                 let name = backend.name();
                 let configuration = backend.configuration();
                 let measured = drive_local(driver, &handle, async {
-                    // Registration is established outside every timed region and
-                    // reported separately, so the registered backend is neither
-                    // charged for it per operation nor let off it entirely.
+                    // Registration happens once, before any timed region, so
+                    // none of the figures below contains its cost. That is a
+                    // deliberate choice and the report says so: a registration
+                    // is a one-off whose cost belongs to the decision to
+                    // register, not to any single transfer.
                     backend
                         .register(config.registered_buffers, job.block as usize)
                         .await?;

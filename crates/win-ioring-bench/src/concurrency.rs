@@ -84,6 +84,7 @@ impl<'a, B: Backend> Runner<'a, B> {
     pub async fn run<F, Fut>(
         &mut self,
         count: usize,
+        phase: crate::verify::Phase,
         trace: &mut Trace,
         mut make: F,
     ) -> io::Result<()>
@@ -121,7 +122,7 @@ impl<'a, B: Backend> Runner<'a, B> {
             self.weighted += outstanding as u64;
             self.samples += 1;
             let (transferred, buffer) = outcome?;
-            trace.delivered(offset, transferred, buffer.bytes());
+            trace.delivered(phase, offset, transferred, buffer.bytes());
             self.backend.put_buffer(buffer);
         }
         Ok(())

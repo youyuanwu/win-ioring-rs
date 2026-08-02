@@ -16,6 +16,19 @@
 
 use std::fmt;
 
+/// Which part of a scenario an operation belongs to.
+///
+/// Two operations that differ only in *when* they happened would otherwise be
+/// indistinguishable to the digest, and the write-then-read scenario produces
+/// exactly that pairing for every operation it issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// A read.
+    Read = 1,
+    /// A write.
+    Write = 2,
+}
+
 /// One issued operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Issued {
@@ -48,16 +61,26 @@ impl Trace {
     /// `bytes` is what the application can actually read — not what the backend
     /// claims it transferred — so a backend that reports a count without putting
     /// the data anywhere reachable produces a different digest.
-    pub fn delivered(&mut self, offset: u64, transferred: u32, bytes: &[u8]) {
+    ///
+    /// `phase` distinguishes otherwise identical operations. It has to: the
+    /// write-then-read scenario issues the same `(offset, length)` twice and the
+    /// read observes exactly the bytes the write sent, so without it every
+    /// operation would have an identical twin.
+    pub fn delivered(&mut self, phase: Phase, offset: u64, transferred: u32, bytes: &[u8]) {
         let mut h = fnv1a(0xcbf2_9ce4_8422_2325);
-        h = h.feed_u64(offset).feed_u64(transferred as u64);
+        h = h
+            .feed_u64(phase as u64)
+            .feed_u64(offset)
+            .feed_u64(transferred as u64);
         // Only the bytes this operation actually transferred: a backend whose
         // buffer carries stale trailing content must not be charged for it.
         let take = (transferred as usize).min(bytes.len());
         h = h.feed(&bytes[..take]);
-        // Exclusive-or, so the order completions arrive in cannot change the
-        // result.
-        self.digest ^= h.0;
+        // Wrapping addition, not exclusive-or. Both are commutative, so neither
+        // depends on the order completions arrive in — but exclusive-or is its
+        // own inverse, so two operations with identical hashes would cancel and
+        // contribute nothing. Addition does not.
+        self.digest = self.digest.wrapping_add(h.0);
         self.delivered_bytes += take as u64;
         self.completions += 1;
     }
@@ -97,6 +120,15 @@ impl Trace {
                 right: other.completions,
             });
         }
+        // Checked separately from the digest, and before it: this is the figure
+        // that catches a backend delivering nothing readable even in the case
+        // where its per-operation hashes happen to collide.
+        if self.delivered_bytes != other.delivered_bytes {
+            return Err(Mismatch::DeliveredBytes {
+                left: self.delivered_bytes,
+                right: other.delivered_bytes,
+            });
+        }
         if self.digest != other.digest {
             return Err(Mismatch::Delivered {
                 left: self.digest,
@@ -120,6 +152,8 @@ pub enum Mismatch {
     },
     /// One run completed a different number of operations.
     CompletionCount { left: usize, right: usize },
+    /// One run put a different number of bytes into readable memory.
+    DeliveredBytes { left: u64, right: u64 },
     /// The two runs delivered different bytes.
     Delivered { left: u64, right: u64 },
 }
@@ -135,6 +169,9 @@ impl fmt::Display for Mismatch {
             }
             Mismatch::CompletionCount { left, right } => {
                 write!(f, "completed {left} operations against {right}")
+            }
+            Mismatch::DeliveredBytes { left, right } => {
+                write!(f, "delivered {left} readable bytes against {right}")
             }
             Mismatch::Delivered { left, right } => {
                 write!(f, "delivered digest {left:#x} against {right:#x}")
@@ -177,12 +214,59 @@ mod tests {
             t.issued(0, 4);
             t.issued(4, 4);
         }
-        a.delivered(0, 4, b"abcd");
-        a.delivered(4, 4, b"efgh");
+        a.delivered(Phase::Read, 0, 4, b"abcd");
+        a.delivered(Phase::Read, 4, 4, b"efgh");
         // Delivered in the opposite order: the digest must not care.
-        b.delivered(4, 4, b"efgh");
-        b.delivered(0, 4, b"abcd");
+        b.delivered(Phase::Read, 4, 4, b"efgh");
+        b.delivered(Phase::Read, 0, 4, b"abcd");
         assert!(a.agrees_with(&b).is_ok());
+    }
+
+    /// The fold must be commutative but **not** self-inverse.
+    ///
+    /// The write-then-read scenario issues the same `(offset, length)` twice and
+    /// the read observes exactly what the write sent, so with an exclusive-or
+    /// fold every operation had an identical twin and the whole digest collapsed
+    /// to zero — for a correct backend and a hollow one alike. That defeated the
+    /// one check the harness exists to perform.
+    #[test]
+    fn a_write_and_its_read_back_do_not_cancel() {
+        let mut trace = Trace::new();
+        trace.issued(0, 4);
+        trace.issued(0, 4);
+        trace.delivered(Phase::Write, 0, 4, b"abcd");
+        trace.delivered(Phase::Read, 0, 4, b"abcd");
+        assert_ne!(
+            trace.digest, 0,
+            "a write and the read that observes it must not annihilate"
+        );
+
+        // And the same pair with nothing readable behind it must differ.
+        let mut hollow = Trace::new();
+        hollow.issued(0, 4);
+        hollow.issued(0, 4);
+        hollow.delivered(Phase::Write, 0, 4, b"abcd");
+        hollow.delivered(Phase::Read, 0, 4, b"");
+        assert!(
+            trace.agrees_with(&hollow).is_err(),
+            "a hollow read-back must not match an honest one"
+        );
+    }
+
+    /// Even if two per-operation hashes collided, the byte count would catch a
+    /// backend that delivered nothing.
+    #[test]
+    fn the_readable_byte_count_is_compared_in_its_own_right() {
+        let mut honest = Trace::new();
+        let mut hollow = Trace::new();
+        honest.issued(0, 4);
+        hollow.issued(0, 4);
+        honest.delivered(Phase::Read, 0, 4, b"abcd");
+        hollow.delivered(Phase::Read, 0, 4, b"");
+        assert!(matches!(
+            honest.agrees_with(&hollow),
+            Err(Mismatch::DeliveredBytes { left: 4, right: 0 })
+        ));
     }
 
     #[test]
@@ -218,8 +302,8 @@ mod tests {
         let mut b = Trace::new();
         a.issued(0, 4);
         b.issued(0, 4);
-        a.delivered(0, 4, b"abcd");
-        b.delivered(0, 4, b"abcX");
+        a.delivered(Phase::Read, 0, 4, b"abcd");
+        b.delivered(Phase::Read, 0, 4, b"abcX");
         assert!(matches!(a.agrees_with(&b), Err(Mismatch::Delivered { .. })));
     }
 
@@ -231,8 +315,8 @@ mod tests {
         let mut b = Trace::new();
         a.issued(0, 4);
         b.issued(0, 4);
-        a.delivered(0, 4, b"abcd");
-        b.delivered(0, 4, b"");
+        a.delivered(Phase::Read, 0, 4, b"abcd");
+        b.delivered(Phase::Read, 0, 4, b"");
         assert!(a.agrees_with(&b).is_err());
     }
 }

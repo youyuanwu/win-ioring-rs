@@ -167,8 +167,9 @@ impl Report {
         .unwrap();
         writeln!(
             out,
-            "- rings, registrations, runtimes and open files are rebuilt per repeat, so \
-             registration cost is not amortised away"
+            "- setup — ring, runtime, registration and buffer pool — is built once per scenario \
+             and depth, and is outside every timed region. Files are reopened per repeat. \
+             Registration cost is therefore **not** included in any figure below."
         )
         .unwrap();
         writeln!(out, "- working files on: {}", self.volume).unwrap();

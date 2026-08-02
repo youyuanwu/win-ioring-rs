@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::backend::{Backend, Buffer};
 use crate::concurrency::{Achieved, Depth, Runner};
-use crate::verify::Trace;
+use crate::verify::{Phase, Trace};
 
 /// A deterministic generator, so a randomised scenario issues the same sequence
 /// every run and for every backend.
@@ -146,7 +146,7 @@ where
 
     let mut runner = Runner::new(backend, depth);
     runner
-        .run(operations, &mut trace, |i| {
+        .run(operations, Phase::Read, &mut trace, |i| {
             let offset = offset_of(i, block);
             let buffer = backend.take_buffer(block as usize)?;
             Ok(async move {
@@ -181,7 +181,7 @@ async fn write_then_read<B: Backend>(
         let file = &file;
         let mut runner = Runner::new(backend, depth);
         runner
-            .run(operations, &mut trace, |i| {
+            .run(operations, Phase::Write, &mut trace, |i| {
                 let offset = (i as u64) * block as u64;
                 let mut buffer = backend.take_buffer(block as usize)?;
                 buffer.fill(&pattern)?;
@@ -200,7 +200,7 @@ async fn write_then_read<B: Backend>(
     let file = &file;
     let mut runner = Runner::new(backend, depth);
     runner
-        .run(operations, &mut trace, |i| {
+        .run(operations, Phase::Read, &mut trace, |i| {
             let offset = (i as u64) * block as u64;
             let buffer = backend.take_buffer(block as usize)?;
             Ok(async move {

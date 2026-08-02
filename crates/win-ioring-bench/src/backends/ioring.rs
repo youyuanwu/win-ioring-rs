@@ -57,6 +57,9 @@ pub struct IoRingPlain {
     handle: Handle,
     /// Held so the driver outlives every operation; dropped at teardown.
     driver: Option<Driver>,
+    /// Pre-allocated so this backend is not charged a per-operation allocation
+    /// the registered one avoids.
+    buffers: crate::backends::tokio_fs::BufferPool,
 }
 
 impl IoRingPlain {
@@ -67,7 +70,7 @@ impl IoRingPlain {
     /// working. Sized generously above the depth because the queue also carries
     /// cancellations and because the platform rounds the request up to a power
     /// of two anyway.
-    pub fn new(depth: usize) -> io::Result<Self> {
+    pub fn new(depth: usize, pool: usize, capacity: usize) -> io::Result<Self> {
         let queue = queue_size(depth);
         let ring = IoRing::builder()
             .with_submission_queue_size(queue)
@@ -79,6 +82,7 @@ impl IoRingPlain {
         Ok(Self {
             handle,
             driver: Some(driver),
+            buffers: crate::backends::tokio_fs::BufferPool::new(pool, capacity),
         })
     }
 
@@ -114,10 +118,12 @@ impl Backend for IoRingPlain {
     }
 
     fn take_buffer(&self, capacity: usize) -> io::Result<Self::Buf> {
-        Ok(vec![0_u8; capacity])
+        self.buffers.take(capacity)
     }
 
-    fn put_buffer(&self, _buffer: Self::Buf) {}
+    fn put_buffer(&self, buffer: Self::Buf) {
+        self.buffers.put(buffer);
+    }
 
     async fn read_at(
         &self,
