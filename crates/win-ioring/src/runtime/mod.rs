@@ -50,7 +50,10 @@ use windows::Win32::Storage::FileSystem::{
     IORING_OP_READ, IORING_OP_REGISTER_BUFFERS, IORING_OP_REGISTER_FILES, IORING_OP_WRITE,
 };
 
+pub mod registry;
 pub mod slab;
+
+pub use registry::{RegisteredBuf, RegisteredBuffers};
 
 use slab::{Lifecycle, OpSlab, Token, TokenKind};
 
