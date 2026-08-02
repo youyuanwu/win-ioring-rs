@@ -751,7 +751,22 @@ impl Handle {
         len: u32,
         offset: u64,
     ) -> ReadFuture<B> {
-        match self.try_read(file, buffer, len, offset) {
+        self.read_with_flags(file, buffer, len, offset, SqeFlags::NONE)
+    }
+
+    /// Reads with explicit submission queue entry flags.
+    ///
+    /// Use this to order an operation against those already queued, with
+    /// [SqeFlags::DRAIN_PRECEDING_OPS].
+    pub fn read_with_flags<B: IoBufMut>(
+        &self,
+        file: &File,
+        buffer: B,
+        len: u32,
+        offset: u64,
+        sqe_flags: SqeFlags,
+    ) -> ReadFuture<B> {
+        match self.try_read(file, buffer, len, offset, sqe_flags) {
             Ok(fut) => fut,
             Err((error, buffer)) => ReadFuture::failed(error, buffer),
         }
@@ -764,6 +779,7 @@ impl Handle {
         buffer: B,
         len: u32,
         offset: u64,
+        sqe_flags: SqeFlags,
     ) -> std::result::Result<ReadFuture<B>, (Error, B)> {
         {
             let inner = self.strong.borrow();
@@ -814,7 +830,7 @@ impl Handle {
             .with_num_of_bytes_to_read(len)
             .with_offset(offset)
             .with_user_data(token.as_user_data())
-            .with_sqe_flags(SqeFlags::NONE)
+            .with_sqe_flags(sqe_flags)
             .build();
 
         let op = match op {
@@ -851,22 +867,30 @@ impl Handle {
     /// The write is bounded by the buffer's *initialized* length, not its
     /// capacity, so uninitialized memory is never handed to the kernel.
     pub fn write<B: IoBuf>(&self, file: &File, buffer: B, len: u32, offset: u64) -> WriteFuture<B> {
-        self.write_with_flags(file, buffer, len, offset, FILE_WRITE_FLAGS_NONE)
+        self.write_with_options(
+            file,
+            buffer,
+            len,
+            offset,
+            FILE_WRITE_FLAGS_NONE,
+            SqeFlags::NONE,
+        )
     }
 
     /// Writes `buffer` to `file` at `offset` with explicit platform write flags.
     ///
     /// Use this for write-through and similar behaviour; [`Handle::write`] is
     /// the same thing with no flags set.
-    pub fn write_with_flags<B: IoBuf>(
+    pub fn write_with_options<B: IoBuf>(
         &self,
         file: &File,
         buffer: B,
         len: u32,
         offset: u64,
         flags: FILE_WRITE_FLAGS,
+        sqe_flags: SqeFlags,
     ) -> WriteFuture<B> {
-        match self.try_write(file, buffer, len, offset, flags) {
+        match self.try_write(file, buffer, len, offset, flags, sqe_flags) {
             Ok(fut) => fut,
             Err((error, buffer)) => WriteFuture::failed(error, buffer),
         }
@@ -879,6 +903,7 @@ impl Handle {
         len: u32,
         offset: u64,
         flags: FILE_WRITE_FLAGS,
+        sqe_flags: SqeFlags,
     ) -> std::result::Result<WriteFuture<B>, (Error, B)> {
         {
             let inner = self.strong.borrow();
@@ -930,7 +955,7 @@ impl Handle {
             .with_offset(offset)
             .with_write_flags(flags)
             .with_user_data(token.as_user_data())
-            .with_sqe_flags(SqeFlags::NONE)
+            .with_sqe_flags(sqe_flags)
             .build();
 
         let op = match op {
@@ -960,12 +985,17 @@ impl Handle {
 
     /// Flushes `file`, using the platform's default flush mode.
     pub fn flush(&self, file: &File) -> FlushFuture {
-        self.flush_with_mode(file, FILE_FLUSH_DEFAULT)
+        self.flush_with_options(file, FILE_FLUSH_DEFAULT, SqeFlags::NONE)
     }
 
     /// Flushes `file` with an explicit flush mode.
-    pub fn flush_with_mode(&self, file: &File, mode: FILE_FLUSH_MODE) -> FlushFuture {
-        match self.try_flush(file, mode) {
+    pub fn flush_with_options(
+        &self,
+        file: &File,
+        mode: FILE_FLUSH_MODE,
+        sqe_flags: SqeFlags,
+    ) -> FlushFuture {
+        match self.try_flush(file, mode, sqe_flags) {
             Ok(fut) => fut,
             Err(e) => FlushFuture {
                 state: FlushState::Failed(Some(e)),
@@ -973,7 +1003,12 @@ impl Handle {
         }
     }
 
-    fn try_flush(&self, file: &File, mode: FILE_FLUSH_MODE) -> Result<FlushFuture> {
+    fn try_flush(
+        &self,
+        file: &File,
+        mode: FILE_FLUSH_MODE,
+        sqe_flags: SqeFlags,
+    ) -> Result<FlushFuture> {
         {
             let inner = self.strong.borrow();
             if inner.shutting_down {
@@ -998,7 +1033,7 @@ impl Handle {
             .with_raw_handle(file.as_raw_handle())
             .with_flush_mode(mode)
             .with_user_data(token.as_user_data())
-            .with_sqe_flags(SqeFlags::NONE)
+            .with_sqe_flags(sqe_flags)
             .build();
 
         let op = match op {

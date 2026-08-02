@@ -629,7 +629,14 @@ async fn write_flags_reach_the_platform() {
             assert_eq!(written, 7, "the unflagged write should succeed");
 
             let outcome = handle
-                .write_with_flags(&out, payload, 7, 0, FILE_WRITE_FLAGS_WRITE_THROUGH)
+                .write_with_options(
+                    &out,
+                    payload,
+                    7,
+                    0,
+                    FILE_WRITE_FLAGS_WRITE_THROUGH,
+                    win_ioring::io_ring::ops::SqeFlags::NONE,
+                )
                 .await;
             let result = outcome.expect_completed();
             let (err, buffer) = result.into_parts();
@@ -682,7 +689,7 @@ async fn flush_modes_are_selectable() {
                 FILE_FLUSH_NO_SYNC,
             ] {
                 handle
-                    .flush_with_mode(&out, mode)
+                    .flush_with_options(&out, mode, win_ioring::io_ring::ops::SqeFlags::NONE)
                     .await
                     .unwrap_or_else(|e| panic!("flush mode {mode:?} failed: {e}"));
             }
@@ -764,6 +771,194 @@ async fn dropping_writes_in_flight_is_safe() {
             driver_task.await.unwrap();
             drop(out);
             let _ = std::fs::remove_file(&path);
+        })
+        .await;
+}
+
+/// Removes a temporary file even if the test panics.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(tag: &str) -> Self {
+        Self(temp_path(tag))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// SC-009: a completed read must report exactly the bytes transferred, and a
+/// length-tracking buffer's initialized length must agree — for a partial read
+/// and a zero-length read, not just a full one.
+#[tokio::test(flavor = "current_thread")]
+async fn read_transfer_accounting_covers_partial_and_empty() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("accounting");
+            std::fs::write(temp.path(), b"0123456789").unwrap();
+            let file = win_ioring::file::File::open(temp.path()).unwrap();
+
+            // Full read.
+            let (read, buffer) = handle
+                .read(&file, vec![0_u8; 32], 10, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read, 10);
+            assert_eq!(buffer.len(), 10);
+            assert_eq!(&buffer[..], b"0123456789");
+
+            // Asking for more than remains is a short read, not an error.
+            let (read, buffer) = handle
+                .read(&file, vec![0_u8; 32], 32, 6)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read, 4, "only four bytes remain past offset six");
+            assert_eq!(
+                buffer.len(),
+                4,
+                "the initialized length must track the partial transfer"
+            );
+            assert_eq!(&buffer[..], b"6789");
+
+            // Zero-length read at a valid offset: legal, transfers nothing.
+            let (read, buffer) = handle
+                .read(&file, vec![0_u8; 32], 0, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read, 0);
+            assert_eq!(buffer.len(), 0);
+
+            // A read with nothing at all available reports end-of-file as an
+            // error rather than a zero-byte success. That is the platform's
+            // behaviour, and differs from a short read.
+            let outcome = handle.read(&file, vec![0_u8; 32], 8, 100).await;
+            let (result, buffer) = outcome.expect_completed().into_parts();
+            let err = result.expect_err("reading past the end should report EOF");
+            assert!(
+                matches!(err, win_ioring::Error::Os(_)),
+                "expected the platform's EOF error, got {err:?}"
+            );
+            assert_eq!(buffer.capacity(), 32, "the buffer came back");
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(file);
+        })
+        .await;
+}
+
+/// A write sourced from an inline buffer guards the same pointer-before-boxing
+/// mistake that was caught on the read path: a heap-backed buffer would survive
+/// it, an array would not.
+#[tokio::test(flavor = "current_thread")]
+async fn inline_array_writes_reach_the_kernel_correctly() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("inlinewrite");
+            let out = win_ioring::file::File::create(temp.path()).unwrap();
+
+            let payload: [u8; 8] = *b"inlined!";
+            let (written, returned) = handle
+                .write(&out, payload, 8, 0)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written, 8);
+            assert_eq!(returned, payload);
+
+            let boxed: Box<[u8]> = b"boxedsli".to_vec().into_boxed_slice();
+            let (written, _) = handle
+                .write(&out, boxed, 8, 8)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written, 8);
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(out);
+
+            assert_eq!(std::fs::read(temp.path()).unwrap(), b"inlined!boxedsli");
+        })
+        .await;
+}
+
+/// SQE flags must be selectable on every operation whose platform builder takes
+/// them, which is read, write and flush.
+#[tokio::test(flavor = "current_thread")]
+async fn sqe_flags_are_selectable_on_read_write_and_flush() {
+    use win_ioring::io_ring::ops::SqeFlags;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ring = IoRing::builder().build().unwrap();
+            let driver = Driver::new(ring).unwrap();
+            let handle = driver.handle();
+            let driver_task = tokio::task::spawn_local(async move { driver.drive().await });
+
+            let temp = TempFile::new("sqeflags");
+            let out = win_ioring::file::File::create(temp.path()).unwrap();
+
+            let (written, _) = handle
+                .write_with_options(
+                    &out,
+                    b"drained".to_vec(),
+                    7,
+                    0,
+                    windows::Win32::Storage::FileSystem::FILE_WRITE_FLAGS_NONE,
+                    SqeFlags::DRAIN_PRECEDING_OPS,
+                )
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(written, 7);
+
+            handle
+                .flush_with_options(
+                    &out,
+                    windows::Win32::Storage::FileSystem::FILE_FLUSH_DEFAULT,
+                    SqeFlags::DRAIN_PRECEDING_OPS,
+                )
+                .await
+                .unwrap();
+
+            drop(out);
+
+            // `File::create` opens write-only, so reading needs its own handle.
+            let input = win_ioring::file::File::open(temp.path()).unwrap();
+            let (read, buffer) = handle
+                .read_with_flags(&input, vec![0_u8; 16], 7, 0, SqeFlags::DRAIN_PRECEDING_OPS)
+                .await
+                .expect_completed()
+                .unwrap();
+            assert_eq!(read, 7);
+            assert_eq!(&buffer[..], b"drained");
+
+            handle.shutdown();
+            driver_task.await.unwrap();
+            drop(input);
         })
         .await;
 }
