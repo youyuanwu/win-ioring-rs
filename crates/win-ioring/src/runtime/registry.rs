@@ -32,7 +32,7 @@
 
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::error::{Error, Result};
 
@@ -77,6 +77,12 @@ pub struct RegistryInner {
     pointers: Vec<*mut u8>,
     /// Per-buffer bookkeeping.
     slots: RefCell<Vec<Slot>>,
+    /// The driver this registration belongs to.
+    ///
+    /// Weak on purpose: a strong reference from a leaked handle would make the
+    /// driver unreachable but alive, silently disabling the abort in
+    /// `Drop for DriverInner` that catches a ring left open.
+    driver: Weak<RefCell<super::DriverInner>>,
     /// The descriptor array handed to the platform, kept at a stable address for
     /// as long as the registration can be reached.
     _descriptors: Box<[crate::io_ring::BufferInfo]>,
@@ -102,6 +108,7 @@ impl RegistryInner {
         extents: Vec<usize>,
         initialized: Vec<usize>,
         descriptors: Box<[crate::io_ring::BufferInfo]>,
+        driver: Weak<RefCell<super::DriverInner>>,
     ) -> Rc<Self> {
         debug_assert_eq!(buffers.len(), pointers.len());
         debug_assert_eq!(buffers.len(), extents.len());
@@ -119,8 +126,22 @@ impl RegistryInner {
             _buffers: buffers,
             pointers,
             slots: RefCell::new(slots),
+            driver,
             _descriptors: descriptors,
         })
+    }
+
+    /// Returns whether any buffer is currently checked out, and which.
+    ///
+    /// The driver consults this before accepting a new registration: a handle
+    /// outstanding when one is adopted would be left naming a set the platform
+    /// no longer resolves against.
+    pub(crate) fn any_checked_out(&self) -> Option<u32> {
+        self.slots
+            .borrow()
+            .iter()
+            .position(|s| s.checked_out)
+            .map(|i| i as u32)
     }
 
     /// Returns how many buffers the registration holds.
@@ -249,12 +270,36 @@ impl RegisteredBuffers {
     ///
     /// # Errors
     ///
+    /// Refusals are checked in this order, because more than one can hold at
+    /// once and each names a different situation:
+    ///
+    /// - [`Error::ShuttingDown`] if the driver is gone or shutting down.
+    /// - [`Error::RegistrationPending`] if a registration request is in flight.
+    ///   One is adopted when it completes rather than when it is requested, so a
+    ///   handle taken in that window would name a set about to be superseded.
+    /// - [`Error::RegistrationSuperseded`] if this collection's registration is
+    ///   no longer the driver's current one. Its buffers stay valid for any
+    ///   handle still holding them, but it yields no more.
     /// - [`Error::InvalidRegisteredIndex`] if the registration has no such
     ///   buffer.
     /// - [`Error::BufferCheckedOut`] if a handle to it already exists. A buffer
     ///   held by an operation returns when that operation reports, which may be
     ///   later than the point its future was dropped.
     pub fn check_out(&self, index: u32) -> Result<RegisteredBuf> {
+        let driver = self.inner.driver.upgrade().ok_or(Error::ShuttingDown)?;
+        {
+            let driver = driver.borrow();
+            if driver.torn_down || driver.shutdown != super::ShutdownMode::Running {
+                return Err(Error::ShuttingDown);
+            }
+            if driver.registration_in_flight {
+                return Err(Error::RegistrationPending);
+            }
+            match driver.buffer_registration.as_ref() {
+                Some(current) if Rc::ptr_eq(current, &self.inner) => {}
+                _ => return Err(Error::RegistrationSuperseded),
+            }
+        }
         self.inner.claim(index)
     }
 }
@@ -438,8 +483,9 @@ mod tests {
 
     /// Builds a standalone registration for tests, bypassing the driver.
     ///
-    /// Phase 1 exercises only the registry-local half of checkout, which needs
-    /// no driver; the guards that consult one wrap it later.
+    /// Its driver reference is dangling, so only the registry-local half of
+    /// checkout — index range and the checked-out flag — is exercised here.
+    /// The guards that consult a driver are tested against a real one.
     fn registry(sizes: &[usize]) -> RegisteredBuffers {
         let mut buffers: Vec<Box<dyn std::any::Any>> = Vec::new();
         let mut pointers = Vec::new();
@@ -458,7 +504,13 @@ mod tests {
             extents,
             initialized,
             Vec::new().into_boxed_slice(),
+            Weak::new(),
         ))
+    }
+
+    /// Claims a buffer without the driver-consulting guards.
+    fn claim(buffers: &RegisteredBuffers, index: u32) -> Result<RegisteredBuf> {
+        buffers.inner().claim(index)
     }
 
     #[test]
@@ -466,7 +518,7 @@ mod tests {
         let buffers = registry(&[64, 128]);
         assert_eq!(buffers.len(), 2);
 
-        let buf = buffers.check_out(1).expect("index 1 exists");
+        let buf = claim(&buffers, 1).expect("index 1 exists");
         assert_eq!(buf.index(), 1);
         assert_eq!(buf.capacity(), 128);
         assert_eq!(buf.buf_capacity(), 128);
@@ -477,9 +529,9 @@ mod tests {
     #[test]
     fn a_buffer_cannot_be_checked_out_twice() {
         let buffers = registry(&[64]);
-        let _first = buffers.check_out(0).expect("index 0 exists");
+        let _first = claim(&buffers, 0).expect("index 0 exists");
 
-        match buffers.check_out(0) {
+        match claim(&buffers, 0) {
             Err(Error::BufferCheckedOut { index }) => assert_eq!(index, 0),
             other => panic!("expected BufferCheckedOut, got {other:?}"),
         }
@@ -488,7 +540,7 @@ mod tests {
     #[test]
     fn an_unknown_index_is_refused() {
         let buffers = registry(&[64]);
-        match buffers.check_out(7) {
+        match claim(&buffers, 7) {
             Err(Error::InvalidRegisteredIndex { index }) => assert_eq!(index, 7),
             other => panic!("expected InvalidRegisteredIndex, got {other:?}"),
         }
@@ -498,13 +550,11 @@ mod tests {
     #[test]
     fn dropping_a_handle_returns_its_buffer() {
         let buffers = registry(&[64]);
-        let first = buffers.check_out(0).expect("index 0 exists");
-        assert!(buffers.check_out(0).is_err());
+        let first = claim(&buffers, 0).expect("index 0 exists");
+        assert!(claim(&buffers, 0).is_err());
         drop(first);
 
-        buffers
-            .check_out(0)
-            .expect("the buffer must be available once its handle is dropped");
+        claim(&buffers, 0).expect("the buffer must be available once its handle is dropped");
     }
 
     /// FR-002 and FR-003: the application can write bytes into a registered
@@ -512,7 +562,7 @@ mod tests {
     #[test]
     fn fill_then_read_round_trips_through_the_handle() {
         let buffers = registry(&[64]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
 
         assert!(buf.is_empty(), "a fresh buffer holds nothing");
         assert_eq!(buf.buf_len(), 0);
@@ -529,7 +579,7 @@ mod tests {
     #[test]
     fn filling_past_the_extent_is_refused() {
         let buffers = registry(&[4]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
 
         match buf.fill(b"too long") {
             Err(Error::BufferTooSmall {
@@ -552,11 +602,11 @@ mod tests {
     #[test]
     fn the_initialized_count_survives_check_in_and_check_out() {
         let buffers = registry(&[64]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
         buf.fill(b"kept").expect("room enough");
         drop(buf);
 
-        let buf = buffers.check_out(0).expect("index 0 exists");
+        let buf = claim(&buffers, 0).expect("index 0 exists");
         assert_eq!(&*buf, b"kept", "the bytes and the count must both survive");
     }
 
@@ -565,7 +615,7 @@ mod tests {
     #[test]
     fn set_buf_init_assigns_in_both_directions() {
         let buffers = registry(&[64]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
         buf.fill(b"0123456789").expect("room enough");
         assert_eq!(buf.buf_len(), 10);
 
@@ -582,7 +632,7 @@ mod tests {
     #[test]
     fn set_buf_init_is_clamped_to_the_extent() {
         let buffers = registry(&[8]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
 
         // SAFETY: the clamp is what keeps this within the extent; the bytes
         // below it are zero-initialized by the constructor above.
@@ -627,7 +677,7 @@ mod tests {
     #[test]
     fn a_handle_keeps_its_buffer_alive_on_its_own() {
         let buffers = registry(&[16]);
-        let mut buf = buffers.check_out(0).expect("index 0 exists");
+        let mut buf = claim(&buffers, 0).expect("index 0 exists");
         buf.fill(b"alive").expect("room enough");
 
         drop(buffers);

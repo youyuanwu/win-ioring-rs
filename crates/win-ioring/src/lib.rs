@@ -78,6 +78,61 @@
 //! accepts_anything(&handle);
 //! ```
 //!
+//! ## A registered buffer in flight is unreachable
+//!
+//! A registered operation takes the buffer's handle **by value**, so while the
+//! kernel may be writing into it the application has no way to name it. This is
+//! what makes registration safe without a runtime check: the exclusion is
+//! ordinary move semantics.
+//!
+//! ```compile_fail
+//! use win_ioring::file::File;
+//! use win_ioring::io_ring::IoRing;
+//! use win_ioring::runtime::{Driver, FileTarget};
+//!
+//! # async fn demo() {
+//! let ring = IoRing::builder().build().unwrap();
+//! let driver = Driver::new(ring).unwrap();
+//! let handle = driver.handle();
+//! let file = File::open("Cargo.toml").unwrap();
+//!
+//! let buffers = handle.register_buffers(vec![vec![0_u8; 64]]).await.unwrap();
+//! let buffer = buffers.check_out(0).unwrap();
+//!
+//! let op = handle.read_registered(FileTarget::Owned(&file), buffer, 0, 8, 0);
+//! // The handle moved into the operation, so reading it here is a use after
+//! // move — `E0382`, which is exactly the race this design prevents.
+//! let _peek = buffer[0];
+//! let _ = op.await;
+//! # }
+//! ```
+//!
+//! Reading it *after* the operation returns it is how the bytes are meant to be
+//! reached, and that compiles:
+//!
+//! ```
+//! use win_ioring::file::File;
+//! use win_ioring::io_ring::IoRing;
+//! use win_ioring::runtime::{Driver, FileTarget};
+//!
+//! # async fn demo() {
+//! let ring = IoRing::builder().build().unwrap();
+//! let driver = Driver::new(ring).unwrap();
+//! let handle = driver.handle();
+//! let file = File::open("Cargo.toml").unwrap();
+//!
+//! let buffers = handle.register_buffers(vec![vec![0_u8; 64]]).await.unwrap();
+//! let buffer = buffers.check_out(0).unwrap();
+//!
+//! let (result, buffer) = handle
+//!     .read_registered(FileTarget::Owned(&file), buffer, 0, 8, 0)
+//!     .await
+//!     .into_parts();
+//! let _read = result.unwrap();
+//! let _peek = buffer[0];
+//! # }
+//! ```
+//!
 //! ## Two sequential operations cannot coexist
 //!
 //! [`file::File::read`] and [`file::File::write`] borrow the file exclusively

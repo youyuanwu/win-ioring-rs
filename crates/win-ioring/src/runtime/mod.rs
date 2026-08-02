@@ -238,7 +238,7 @@ pub enum ShutdownMode {
 }
 
 /// Shared driver state, reached by handles and futures.
-struct DriverInner {
+pub(crate) struct DriverInner {
     ring: IoRing,
     slab: OpSlab,
     /// The active buffer registration, if any.
@@ -252,6 +252,18 @@ struct DriverInner {
     /// Retained until the ring closes: the platform offers no way to withdraw a
     /// registration, so its pointers may still be live.
     retired_buffer_registrations: Vec<Rc<registry::RegistryInner>>,
+    /// Set while a *buffer* registration is in flight.
+    ///
+    /// A registration is adopted when it completes, not when it is requested, so
+    /// this covers the window between. Deliberately scoped to buffer
+    /// registrations: `register_files` shares this payload field, the slab and
+    /// the future, so a variant-blind flag would let a file registration
+    /// completing first clear it while a buffer registration was still pending —
+    /// reopening the very window it exists to close.
+    registration_in_flight: bool,
+    /// A weak reference to the enclosing `Rc`, so a registration can ask the
+    /// driver about its own state without keeping the driver alive.
+    self_weak: Weak<RefCell<DriverInner>>,
     /// The active file handle registration, if any.
     file_registration: Option<FileRegistration>,
     /// Superseded file registrations still referenced by in-flight operations.
@@ -438,6 +450,7 @@ impl DriverInner {
                     extents,
                     watermarks,
                     descriptors,
+                    self.self_weak.clone(),
                 );
                 let previous = self.buffer_registration.replace(Rc::clone(&registry));
                 if let Some(previous) = previous {
@@ -739,6 +752,13 @@ impl DriverInner {
             // collection goes to the caller through the result slot; on failure
             // the resources do.
             if let Some(pending) = payload.pending_registration.take() {
+                // Scoped to buffer registrations: `register_files` shares this
+                // field and this fork, so clearing on a file completion would
+                // reopen the window while a buffer registration was still
+                // pending.
+                if matches!(pending, PendingRegistration::Buffers { .. }) {
+                    self.registration_in_flight = false;
+                }
                 if result.is_ok() {
                     if let Some(registered) = self.adopt_registration(pending) {
                         buffer = Some(
@@ -895,6 +915,7 @@ impl DriverInner {
         self.cancel_holds.clear();
         self.buffer_registration = None;
         self.retired_buffer_registrations.clear();
+        self.registration_in_flight = false;
         self.file_registration = None;
         self.retired_file_registrations.clear();
         self.torn_down = true;
@@ -1102,36 +1123,45 @@ impl Driver {
         }
 
         Ok(Self {
-            inner: Rc::new(RefCell::new(DriverInner {
-                ring,
-                slab: OpSlab::new(),
-                buffer_registration: None,
-                retired_buffer_registrations: Vec::new(),
-                file_registration: None,
-                retired_file_registrations: Vec::new(),
-                cancel_holds: Vec::new(),
-                deferred_cancels: Vec::new(),
-                wake: Rc::clone(&wake),
-                pending_submit: false,
-                shutdown: ShutdownMode::Running,
-                #[cfg(test)]
-                teardown_started: false,
-                shutdown_waiters: Vec::new(),
-                next_waiter_id: 0,
-                torn_down: false,
-                deferred_reports: Vec::new(),
-                submit_failures: 0,
-                #[cfg(test)]
-                fail_next_submits: 0,
-                #[cfg(test)]
-                withhold_reaps: 0,
-                #[cfg(test)]
-                fail_next_cancels: 0,
-                #[cfg(test)]
-                cancel_attempts: 0,
-                #[cfg(test)]
-                fail_next_registration: false,
-            })),
+            // `new_cyclic` rather than `new` so the driver can hand a weak
+            // reference to itself to each registration, which needs to ask about
+            // shutdown and supersession without keeping the driver alive.
+            // Deliberately not a `move` closure: `wake` is borrowed for the
+            // clone below and is still needed for the `Driver`'s own field.
+            inner: Rc::new_cyclic(|self_weak| {
+                RefCell::new(DriverInner {
+                    ring,
+                    slab: OpSlab::new(),
+                    buffer_registration: None,
+                    retired_buffer_registrations: Vec::new(),
+                    registration_in_flight: false,
+                    self_weak: self_weak.clone(),
+                    file_registration: None,
+                    retired_file_registrations: Vec::new(),
+                    cancel_holds: Vec::new(),
+                    deferred_cancels: Vec::new(),
+                    wake: Rc::clone(&wake),
+                    pending_submit: false,
+                    shutdown: ShutdownMode::Running,
+                    #[cfg(test)]
+                    teardown_started: false,
+                    shutdown_waiters: Vec::new(),
+                    next_waiter_id: 0,
+                    torn_down: false,
+                    deferred_reports: Vec::new(),
+                    submit_failures: 0,
+                    #[cfg(test)]
+                    fail_next_submits: 0,
+                    #[cfg(test)]
+                    withhold_reaps: 0,
+                    #[cfg(test)]
+                    fail_next_cancels: 0,
+                    #[cfg(test)]
+                    cancel_attempts: 0,
+                    #[cfg(test)]
+                    fail_next_registration: false,
+                })
+            }),
             on_error: observer,
             completion_event,
             wake,
@@ -1921,6 +1951,21 @@ impl Handle {
         if inner.shutdown != ShutdownMode::Running {
             return Err((Error::ShuttingDown, buffers));
         }
+        // Route 5: two registrations in flight at once would let the first adopt,
+        // a handle be checked out of it, and the second retire that registration
+        // underneath the handle.
+        if inner.registration_in_flight {
+            return Err((Error::RegistrationPending, buffers));
+        }
+        // Route 1: a handle outstanding when a new registration is adopted would
+        // be left naming a set the platform no longer resolves against. Refusing
+        // the request is what makes a stale handle unreachable rather than
+        // merely detectable.
+        if let Some(current) = inner.buffer_registration.as_ref()
+            && let Some(index) = current.any_checked_out()
+        {
+            return Err((Error::BufferCheckedOut { index }, buffers));
+        }
         if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_REGISTER_BUFFERS) {
             return Err((e, buffers));
         }
@@ -2008,6 +2053,10 @@ impl Handle {
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
         inner.pending_submit = true;
+        // Set only once every fallible step above has succeeded, so a rejected
+        // request never leaves it stuck. Cleared when the completion is reaped,
+        // on either arm, and at teardown.
+        inner.registration_in_flight = true;
         Ok((token, slot))
     }
 
@@ -2937,6 +2986,297 @@ mod tests {
         let mut fut = Box::pin(handle.read_registered(FileTarget::Owned(&file), buffer, 0, 99, 0));
         assert!(fut.as_mut().poll(&mut cx).is_ready());
         let _ = fut.as_mut().poll(&mut cx);
+    }
+
+    /// Drives a registration to completion and returns its collection.
+    fn register(driver: &Driver, handle: &Handle, sizes: &[usize]) -> RegisteredBuffers {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let buffers: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![0_u8; n]).collect();
+        let mut fut = Box::pin(handle.register_buffers(buffers));
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if let Poll::Ready(registered) = fut.as_mut().poll(&mut cx) {
+                return registered.unwrap();
+            }
+            std::thread::yield_now();
+        }
+        panic!("the registration never completed");
+    }
+
+    /// Route 1 (FR-011): a handle outstanding when a new registration is
+    /// requested would be left naming a set the platform no longer resolves
+    /// against, so the request is refused rather than the handle staled.
+    #[test]
+    fn re_registering_is_refused_while_a_handle_is_checked_out() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let collection = register(&driver, &handle, &[64]);
+
+        let held = collection.check_out(0).expect("index 0 exists");
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = Box::pin(handle.register_buffers(vec![vec![0_u8; 32]]));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Registered::Failed(Error::BufferCheckedOut { index }, returned)) => {
+                assert_eq!(index, 0);
+                assert_eq!(returned.len(), 1, "the caller's buffers must come back");
+            }
+            other => panic!("expected BufferCheckedOut, got {:?}", other.is_ready()),
+        }
+
+        // Returning the handle lifts the refusal.
+        drop(held);
+        drop(fut);
+        let second = register(&driver, &handle, &[32]);
+        assert_eq!(second.len(), 1);
+
+        handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// Route 5 (FR-011a): two registrations in flight at once would let the
+    /// first adopt, a handle be taken from it, and the second retire that
+    /// registration underneath the handle. A per-registration flag cannot see
+    /// this, because the registration the handle came from did not exist when
+    /// the second request was made.
+    #[test]
+    fn a_second_registration_is_refused_while_one_is_in_flight() {
+        let driver = test_driver();
+        let handle = driver.handle();
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut first = Box::pin(handle.register_buffers(vec![vec![0_u8; 64]]));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            driver.inner.borrow().registration_in_flight,
+            "the first request must be recorded as in flight"
+        );
+
+        let mut second = Box::pin(handle.register_buffers(vec![vec![0_u8; 32]]));
+        match second.as_mut().poll(&mut cx) {
+            Poll::Ready(Registered::Failed(Error::RegistrationPending, returned)) => {
+                assert_eq!(returned.len(), 1, "the caller's buffers must come back");
+            }
+            other => panic!("expected RegistrationPending, got {:?}", other.is_ready()),
+        }
+
+        handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// Route 2 (FR-011a): a registration is adopted when it completes, not when
+    /// it is requested, so a handle taken in that window would name a set about
+    /// to be superseded.
+    #[test]
+    fn checkout_is_refused_while_a_registration_is_in_flight() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let collection = register(&driver, &handle, &[64]);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = Box::pin(handle.register_buffers(vec![vec![0_u8; 32]]));
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        assert!(
+            matches!(collection.check_out(0), Err(Error::RegistrationPending)),
+            "no handle may be taken while a registration is in flight"
+        );
+
+        handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// Route 3 (FR-011b): a collection retained across a successful
+    /// re-registration must stop yielding, or it would hand out handles naming
+    /// buffers the current registration does not contain.
+    #[test]
+    fn a_superseded_collection_stops_yielding_handles() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let first = register(&driver, &handle, &[64]);
+        let second = register(&driver, &handle, &[32]);
+
+        assert!(
+            matches!(first.check_out(0), Err(Error::RegistrationSuperseded)),
+            "the superseded collection must refuse"
+        );
+        second
+            .check_out(0)
+            .expect("the current collection still yields");
+
+        handle.shutdown_now();
+        drop(driver);
+    }
+
+    /// Route 4: once the driver is gone, no operation can be issued, so a handle
+    /// taken from a collection would be useless — but the bytes any *existing*
+    /// handle holds must stay readable (FR-009).
+    #[test]
+    fn checkout_is_refused_once_the_driver_is_gone_but_held_bytes_survive() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let collection = register(&driver, &handle, &[16]);
+
+        let mut held = collection.check_out(0).expect("index 0 exists");
+        held.fill(b"survives").expect("room enough");
+
+        handle.shutdown_now();
+        drop(driver);
+
+        assert!(
+            matches!(collection.check_out(1), Err(Error::ShuttingDown)),
+            "a dead driver can issue no operation, so it yields no handle"
+        );
+        assert_eq!(
+            &held[..8],
+            b"survives",
+            "an outstanding handle must keep its bytes readable"
+        );
+    }
+
+    /// FR-009 from the other side: a retired registration's memory is not
+    /// released while the platform may still hold pointers into it, which on
+    /// this platform means until the ring closes.
+    #[test]
+    fn a_retired_registration_survives_until_nothing_holds_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingBuf(Vec<u8>);
+        impl Drop for CountingBuf {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // SAFETY: the pointer and lengths come from the inner `Vec`, which
+        // nothing here grows, and the buffer has no interior mutability.
+        unsafe impl crate::buf::IoBuf for CountingBuf {
+            fn buf_ptr(&self) -> *const u8 {
+                self.0.as_ptr()
+            }
+            fn buf_len(&self) -> usize {
+                self.0.len()
+            }
+        }
+        // SAFETY: as above; `set_buf_init` only reports bytes the kernel wrote.
+        unsafe impl crate::buf::IoBufMut for CountingBuf {
+            fn buf_mut_ptr(&mut self) -> *mut u8 {
+                self.0.as_mut_ptr()
+            }
+            fn buf_capacity(&self) -> usize {
+                self.0.capacity()
+            }
+            unsafe fn set_buf_init(&mut self, len: usize) {
+                // SAFETY: the caller guarantees `len` bytes are initialized.
+                unsafe { self.0.set_len(len) }
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut fut = Box::pin(handle.register_buffers(vec![CountingBuf(vec![0_u8; 32])]));
+        let first = loop {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if let Poll::Ready(registered) = fut.as_mut().poll(&mut cx) {
+                break registered.unwrap();
+            }
+        };
+
+        // Supersede it, then let the driver go.
+        let _second = register(&driver, &handle, &[16]);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+        handle.shutdown_now();
+        drop(driver);
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            0,
+            "a collection still held must keep its buffers alive"
+        );
+
+        drop(first);
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            1,
+            "releasing the last reference is what frees it"
+        );
+    }
+
+    /// A **file** registration completing must not clear the flag a **buffer**
+    /// registration set.
+    ///
+    /// The two share a payload field, the slab, and the completion fork, so a
+    /// variant-blind clear would let a file registration finishing first reopen
+    /// the window Route 2 exists to close — and a handle taken in it would name
+    /// a set the pending buffer registration is about to retire.
+    ///
+    /// Asserted against the flag directly rather than by racing two
+    /// registrations, because which completes first is the kernel's choice and a
+    /// test that only sometimes observes the window would prove nothing.
+    #[test]
+    fn a_file_registration_does_not_clear_the_buffer_registration_flag() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // Stand in for a buffer registration in flight.
+        driver.inner.borrow_mut().registration_in_flight = true;
+
+        let mut files = Box::pin(handle.register_files(std::slice::from_ref(&file)));
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            if files.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            driver.inner.borrow().file_registration.is_some(),
+            "the file registration must have completed for this test to mean anything"
+        );
+
+        assert!(
+            driver.inner.borrow().registration_in_flight,
+            "a file registration must leave a pending buffer registration's flag alone"
+        );
+
+        // Restore, so teardown is not left believing a registration is pending.
+        driver.inner.borrow_mut().registration_in_flight = false;
+        handle.shutdown_now();
+        drop(driver);
     }
 
     fn test_driver() -> Driver {
