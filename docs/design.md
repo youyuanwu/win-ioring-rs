@@ -162,6 +162,9 @@ kernel.
 one documented case where the buffer does not come back — it means teardown
 abandoned it.
 
+Why ownership rather than a borrowed slice, and what it would take to accept one,
+is worked through in [buffer-ownership.md](buffer-ownership.md).
+
 ### Single-threaded by construction
 
 `Driver` and `Handle` share state through `Rc` and `RefCell` and are `!Send`. The

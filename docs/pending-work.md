@@ -20,6 +20,15 @@ Fixing this means threading a `FileTarget` through `Handle::read`,
 `Handle::write` and `Handle::flush`, changing three public signatures. It is the
 most substantial gap in the API surface.
 
+### No `'static` reference buffers
+
+`IoBuf` and `IoBufMut` are implemented only for `Vec<u8>`, `Box<[u8]>` and
+`[u8; N]`. Adding `&'static [u8]` and `&'static mut [u8]` is sound under the
+existing `'static + Unpin` bound and costs nothing, and it closes a gap that
+both tokio-uring and compio have already closed. See
+[buffer-ownership.md](buffer-ownership.md) for the proposed impls and the
+reasoning behind the bound.
+
 ### No `NOP` operation
 
 The host reports `IORING_OP_NOP` as supported, but `windows` 0.62.2 exposes no
