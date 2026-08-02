@@ -861,26 +861,32 @@ impl Driver {
     /// Submission failures are the main thing reported this way; see the module
     /// documentation for why they cannot be delivered to a future.
     pub fn with_error_observer(mut ring: IoRing, observer: Option<ErrorObserver>) -> Result<Self> {
-        // Each fallible step must close the ring on the way out, since nothing
-        // else owns it yet.
-        let mut build = || -> Result<(AsyncEvent, Rc<AsyncEvent>)> {
-            let completion_event = AsyncEvent::new_manual_reset()?;
-            // SAFETY: `completion_event` becomes a field of the `Driver`, whose
-            // `Drop` impl runs `teardown` — closing the ring — before any field
-            // is dropped, so the ring can no longer signal the event by the time
-            // its handle closes. On the failure paths below the ring is closed
-            // explicitly before the event goes out of scope.
-            unsafe { ring.set_io_ring_completion_event(completion_event.handle())? };
-            let wake = Rc::new(AsyncEvent::new_manual_reset()?);
-            Ok((completion_event, wake))
-        };
-        let (completion_event, wake) = match build() {
-            Ok(parts) => parts,
-            Err(e) => {
+        // Allocate everything that can fail *before* handing the ring its
+        // completion event. Registering the event first would mean a later
+        // failure dropped the event's handle while the ring still referred to
+        // it, which is exactly what `set_io_ring_completion_event` forbids.
+        let (completion_event, wake) = match (
+            AsyncEvent::new_manual_reset(),
+            AsyncEvent::new_manual_reset(),
+        ) {
+            (Ok(completion_event), Ok(wake)) => (completion_event, Rc::new(wake)),
+            (Err(e), _) | (_, Err(e)) => {
+                // Nothing else owns the ring yet, and it has no `Drop`.
                 let _ = ring.close();
-                return Err(e);
+                return Err(e.into());
             }
         };
+
+        // SAFETY: `completion_event` becomes a field of the `Driver` built
+        // below, whose `Drop` impl runs `teardown` — closing the ring — before
+        // any field is dropped, so the ring can no longer signal the event by
+        // the time its handle closes. Nothing fallible remains between here and
+        // that `Driver`, so there is no path on which the event is dropped
+        // first.
+        if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_event.handle()) } {
+            let _ = ring.close();
+            return Err(e);
+        }
 
         Ok(Self {
             inner: Rc::new(RefCell::new(DriverInner {
