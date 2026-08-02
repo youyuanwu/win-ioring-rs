@@ -1136,10 +1136,17 @@ async fn a_failed_registration_returns_the_buffers() {
 
 /// SC-017: superseding a registration leaves an operation issued against the
 /// old one able to complete normally, and the superseded buffers stay alive
-/// rather than coming back to the caller.
+/// until the ring is closed rather than coming back to the caller.
+///
+/// The liveness half needs a drop counter. Asserting only that neither call
+/// returned an error would pass whether the superseded buffer was still alive
+/// or had been freed under the kernel.
 #[tokio::test(flavor = "current_thread")]
 async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use win_ioring::runtime::FileTarget;
+    use win_ioring_tests::counting::CountingBuf;
 
     let local = tokio::task::LocalSet::new();
     local
@@ -1153,8 +1160,10 @@ async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
             std::fs::write(temp.path(), b"0123456789").unwrap();
             let input = win_ioring::file::File::open(temp.path()).unwrap();
 
-            let first: Vec<Vec<u8>> = vec![Vec::with_capacity(64)];
+            let drops = Arc::new(AtomicUsize::new(0));
+            let first = vec![CountingBuf::new(64, &drops)];
             assert!(handle.register_buffers(first).await.is_ok());
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
 
             // Issue a read against the first registration and, without awaiting
             // it, register a second set. Both futures are driven together, so
@@ -1167,15 +1176,31 @@ async fn superseding_a_registration_does_not_disturb_operations_in_flight() {
             assert_eq!(read.unwrap(), 10, "the in-flight read must complete");
             assert!(register.is_ok());
 
+            // The superseded buffer must still be alive: the platform offers no
+            // way to withdraw a registration, so it may still hold pointers.
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "a superseded registration must not be freed while the ring lives"
+            );
+
             // The new registration is the one now in force: its larger extent is
             // addressable, which the superseded 64-byte buffer would refuse.
             let read = handle
                 .read_into_registered(FileTarget::Owned(&input), 0, 100, 10, 0)
                 .await;
             assert!(read.is_ok(), "got {read:?}");
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
 
             handle.shutdown();
             driver_task.await.unwrap();
+
+            // Closing the ring is what finally releases it.
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "the superseded buffer must be released once the ring is closed"
+            );
             drop(input);
         })
         .await;

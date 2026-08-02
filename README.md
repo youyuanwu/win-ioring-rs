@@ -82,13 +82,16 @@ length that the compiler cannot check for you.
 
 ## Cancellation, shutdown, and the leak policy
 
-**Dropping a future is always safe and never blocks.** It requests cancellation
-of the operation and detaches: the buffer and the file handle stay owned by the
-driver until the kernel reports the operation finished, and are released then.
-You will not get the buffer back, because nobody is waiting for it.
+**Dropping a future is always safe and never blocks.** It detaches and, where the
+platform can act on one, requests cancellation. The buffer and the file handle
+stay owned by the driver until the kernel reports the operation finished, and
+are released then. You will not get the buffer back, because nobody is waiting
+for it.
 
-Cancellation is a *request*. An operation may well complete normally after being
-cancelled, and the crate does not pretend otherwise.
+Cancellation is a *request*, and a best-effort one. An operation may well
+complete normally after being cancelled, and an operation the kernel has not yet
+seen is cancelled when it reaches the kernel rather than at drop time. The crate
+does not pretend otherwise.
 
 `Handle::shutdown` asks the driver to stop once outstanding work has drained.
 The driver makes a bounded attempt to drain, and:

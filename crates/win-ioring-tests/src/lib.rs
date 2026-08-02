@@ -1,6 +1,7 @@
 //! Test-only helpers and a custom single-threaded async runtime used to
 //! exercise the `win-ioring` crate. Nothing here is io_ring specific.
 
+pub mod counting;
 pub mod rt;
 pub mod scenario;
 pub mod temp;

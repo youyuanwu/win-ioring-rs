@@ -167,12 +167,12 @@ struct OpPayload {
     /// a completion belonging to a superseded registration cannot disturb the
     /// current one's watermarks.
     registered_buffer: Option<(u64, u32, u32)>,
-    /// Whether this operation names a registered file handle.
+    /// The registered file index this operation names, if it named one instead
+    /// of an owned file.
     ///
-    /// Recorded for diagnostics and to make the registered path explicit at the
-    /// point of submission.
-    #[allow(dead_code)]
-    uses_registered_file: bool,
+    /// Cancelling an operation requires naming the same file it named, so a
+    /// cancellation for a registered-handle operation needs the index back.
+    registered_file: Option<u32>,
     /// Resources for a registration that has not yet completed.
     ///
     /// Held here rather than in the awaiting future so that dropping that
@@ -271,7 +271,14 @@ pub enum FileTarget<'a> {
 pub enum Registered<T> {
     /// The registration succeeded and the driver now owns the resources.
     Ok,
-    /// The registration failed; the caller's resources are returned.
+    /// The registration failed and the caller's resources are returned.
+    ///
+    /// The one exception is [`Error::BufferRetained`]: the driver was torn down
+    /// while the registration was still outstanding, so the buffers were
+    /// abandoned rather than freed — the kernel may still hold pointers to them
+    /// — and this vector is empty. That is the same leak policy operations
+    /// follow, and it is the only case where a failure does not hand the
+    /// resources back.
     Failed(Error, Vec<T>),
 }
 
@@ -579,14 +586,22 @@ impl DriverInner {
             return;
         }
 
-        // The cancellation must name the same file the target named.
-        let Some(file) = self
-            .slab
-            .payload_mut(token)
-            .and_then(|p| p.downcast_mut::<OpPayload>())
-            .and_then(|p| p.file.clone())
-        else {
-            return;
+        // The cancellation must name the same file the target named — an owned
+        // file by handle, or a registered one by index. An operation with
+        // neither is a registration, which has nothing to cancel.
+        let target = {
+            let payload = self
+                .slab
+                .payload_mut(token)
+                .and_then(|p| p.downcast_mut::<OpPayload>());
+            match payload {
+                Some(p) => match (p.file.clone(), p.registered_file) {
+                    (Some(file), _) => CancelTarget::Owned(file),
+                    (None, Some(index)) => CancelTarget::Registered(index),
+                    (None, None) => return,
+                },
+                None => return,
+            }
         };
 
         // Refused if a cancellation has ever been issued for this operation,
@@ -595,11 +610,14 @@ impl DriverInner {
             return;
         };
 
-        let op = crate::io_ring::ops::CancelOp::builder()
-            .with_raw_handle(file.raw_handle())
+        let builder = crate::io_ring::ops::CancelOp::builder()
             .with_op_to_cancel(token.as_user_data())
-            .with_user_data(cancel_token.as_user_data())
-            .build();
+            .with_user_data(cancel_token.as_user_data());
+        let op = match &target {
+            CancelTarget::Owned(file) => builder.with_raw_handle(file.raw_handle()),
+            CancelTarget::Registered(index) => builder.with_registered_handle_index(*index),
+        }
+        .build();
         let Ok(op) = op else {
             // Nothing was queued, so retire the bookkeeping we just took.
             self.slab.complete_cancel(cancel_token);
@@ -607,11 +625,17 @@ impl DriverInner {
         };
 
         // Hold the file open until the cancellation's own completion arrives.
-        // Do this before building, so the hold is in place no matter what.
-        self.cancel_holds.push((cancel_token, file));
+        // Do this before building, so the hold is in place no matter what. A
+        // registered handle needs no hold: the driver owns it for the life of
+        // the ring.
+        if let CancelTarget::Owned(file) = target {
+            self.cancel_holds.push((cancel_token, file));
+        }
 
-        // SAFETY: the file handle is kept open by the hold just pushed, which
-        // is released only when this cancellation's own completion is dequeued.
+        // SAFETY: an owned file's handle is kept open by the hold just pushed,
+        // which is released only when this cancellation's own completion is
+        // dequeued; a registered handle is owned by the driver until the ring
+        // closes.
         if unsafe { self.ring.build_cancel_request(op) }.is_err() {
             // Failing to enqueue a cancellation is explicitly not an error: the
             // target simply runs to completion. Undo the bookkeeping so the
@@ -1101,6 +1125,9 @@ impl Handle {
             if inner.shutting_down {
                 return Err((Error::ShuttingDown, buffer));
             }
+            if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_READ) {
+                return Err((e, buffer));
+            }
         }
         if let Err(e) = check_read_capacity(&buffer, len as u64) {
             return Err((e, buffer));
@@ -1117,7 +1144,7 @@ impl Handle {
             file: Some(file.state()),
             slot: Rc::clone(&slot),
             registered_buffer: None,
-            uses_registered_file: false,
+            registered_file: None,
             pending_registration: None,
             _sequential: sequential,
         });
@@ -1262,7 +1289,7 @@ impl Handle {
             file: Some(file.state()),
             slot: Rc::clone(&slot),
             registered_buffer: None,
-            uses_registered_file: false,
+            registered_file: None,
             pending_registration: None,
             _sequential: sequential,
         });
@@ -1408,7 +1435,7 @@ impl Handle {
             file: Some(file.state()),
             slot: Rc::clone(&slot),
             registered_buffer: None,
-            uses_registered_file: false,
+            registered_file: None,
             pending_registration: None,
             _sequential: None,
         });
@@ -1536,7 +1563,7 @@ impl Handle {
             file: None,
             slot: Rc::clone(&slot),
             registered_buffer: None,
-            uses_registered_file: false,
+            registered_file: None,
             pending_registration: Some(PendingRegistration::Buffers {
                 buffers: boxed.into_iter().map(|b| b as Box<dyn Any>).collect(),
                 extents,
@@ -1631,7 +1658,7 @@ impl Handle {
             file: None,
             slot: Rc::clone(&slot),
             registered_buffer: None,
-            uses_registered_file: false,
+            registered_file: None,
             pending_registration: Some(PendingRegistration::Files { files: states }),
             _sequential: None,
         });
@@ -1741,9 +1768,9 @@ impl Handle {
         let slot = Rc::new(RefCell::new(ResultSlot::new()));
         let mut inner = self.strong.borrow_mut();
 
-        let (file_state, uses_registered_file) = match target {
-            FileTarget::Owned(file) => (Some(file.state()), false),
-            FileTarget::Registered { .. } => (None, true),
+        let (file_state, registered_file) = match target {
+            FileTarget::Owned(file) => (Some(file.state()), None),
+            FileTarget::Registered { index } => (None, Some(index)),
         };
 
         let payload = Box::new(OpPayload {
@@ -1759,7 +1786,7 @@ impl Handle {
                 buffer_index,
                 buffer_offset,
             )),
-            uses_registered_file,
+            registered_file,
             pending_registration: None,
             _sequential: None,
         });
@@ -1895,6 +1922,18 @@ fn unbox_pending<B: 'static>(pending: Option<PendingRegistration>) -> Vec<B> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// How a cancellation names the file its target named.
+///
+/// The platform requires the cancellation to name the same file as the
+/// operation it cancels, and a registered-handle operation named its file by
+/// index rather than by handle.
+enum CancelTarget {
+    /// An owned file, held open until the cancellation reports.
+    Owned(Rc<FileState>),
+    /// A registered handle, owned by the driver for the life of the ring.
+    Registered(u32),
 }
 
 /// What varies between the write entry points, kept together so `try_write`
@@ -2337,6 +2376,74 @@ mod tests {
         drop(held);
         handle.shutdown();
         drain(&driver);
+    }
+
+    /// An operation naming a registered file handle must be cancellable.
+    ///
+    /// A cancellation has to name the same file its target named, and a
+    /// registered-handle operation named its file by index rather than by
+    /// handle. Reaching for the handle alone silently skipped these, so
+    /// dropping such a future left it uncancelled — contradicting the drop
+    /// policy the whole crate is documented around.
+    #[test]
+    fn registered_handle_operations_can_be_cancelled() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        // The driver only advances when this test pumps it, so registrations
+        // have to be driven by hand rather than blocked on.
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut register_files = Box::pin(handle.register_files(std::slice::from_ref(&file)));
+        let mut register_buffers = Box::pin(handle.register_buffers(vec![vec![0_u8; 64]]));
+        for _ in 0..1000 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            let files_done =
+                matches!(register_files.as_mut().poll(&mut cx), Poll::Ready(r) if r.is_ok());
+            let buffers_done =
+                matches!(register_buffers.as_mut().poll(&mut cx), Poll::Ready(r) if r.is_ok());
+            if files_done && buffers_done {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(driver.inner.borrow().file_registration.is_some());
+        assert!(driver.inner.borrow().buffer_registration.is_some());
+
+        let fut = handle.read_into_registered(FileTarget::Registered { index: 0 }, 0, 0, 8, 0);
+        let id = fut
+            .operation_id()
+            .expect("the registered read must have been built");
+
+        // Reach the submitted state, which is the only one a cancellation can
+        // act on, and clear the submit flag so the next one is attributable.
+        driver.inner.borrow_mut().submit_pending();
+        driver.inner.borrow_mut().pending_submit = false;
+
+        handle.cancel(id);
+        assert!(
+            driver.inner.borrow().pending_submit,
+            "a registered-handle operation must accept a cancellation"
+        );
+        assert!(
+            driver.inner.borrow().cancel_holds.is_empty(),
+            "a registered handle needs no hold: the driver owns it already"
+        );
+
+        // Everything must settle, which is what proves the cancellation is a
+        // real entry the platform completes rather than one that strands the
+        // operation's slot in a tombstone forever.
+        drop(fut);
+        drain(&driver);
+        handle.shutdown();
     }
 
     /// Runs the driver by hand until nothing is outstanding.
