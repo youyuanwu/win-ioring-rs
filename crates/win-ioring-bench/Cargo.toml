@@ -8,9 +8,6 @@ publish = false
 [dependencies]
 futures.workspace = true
 win-ioring.workspace = true
-# The workspace's own single-threaded executor, so this crate's `!Send` work can
-# be driven without depending on a particular runtime for it.
-win-ioring-tests = { path = "../win-ioring-tests" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 # Only for the available-physical-memory query the report needs. Declared here
 # rather than widened into the workspace `windows` entry so the feature never
