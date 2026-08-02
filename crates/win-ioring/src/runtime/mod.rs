@@ -225,14 +225,22 @@ impl DriverInner {
     }
 
     /// Drains the completion queue.
-    fn reap_completions(&mut self) {
+    ///
+    /// Returns the wakers of any futures that were resolved, **without** waking
+    /// them. The caller must release its borrow of the driver before waking: a
+    /// valid executor may poll the woken task inline, and that task can call
+    /// straight back into the driver, which would panic on the still-active
+    /// borrow.
+    #[must_use = "the returned wakers must be woken after releasing the borrow"]
+    fn reap_completions(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
         loop {
             let cqe = match self.ring.pop_completion() {
                 Ok(Some(cqe)) => cqe,
-                Ok(None) => return,
+                Ok(None) => return wakers,
                 Err(e) => {
                     self.report(&e);
-                    return;
+                    return wakers;
                 }
             };
 
@@ -260,39 +268,39 @@ impl DriverInner {
             };
 
             let buffer = payload.buffer.take().expect("payload lost its buffer");
-            let waker = {
-                let mut slot = payload.slot.borrow_mut();
-                slot.completed = Some((result, buffer));
-                slot.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
+            let mut slot = payload.slot.borrow_mut();
+            slot.completed = Some((result, buffer));
+            if let Some(waker) = slot.waker.take() {
+                wakers.push(waker);
             }
         }
     }
 
     /// Closes the ring, releasing what is safe to release and leaking the rest.
-    fn teardown(&mut self) {
+    ///
+    /// Returns the wakers of any futures left waiting, for the caller to wake
+    /// after releasing its borrow.
+    #[must_use = "the returned wakers must be woken after releasing the borrow"]
+    fn teardown(&mut self) -> Vec<Waker> {
         if self.torn_down {
-            return;
+            return Vec::new();
         }
         self.torn_down = true;
         self.shutting_down = true;
 
         // One last sweep: anything already finished can be delivered normally.
-        self.reap_completions();
+        let mut wakers = self.reap_completions();
 
         if self.slab.outstanding() == 0 {
             let _ = self.ring.close();
             drop(self.slab.drain());
-            return;
+            return wakers;
         }
 
         // Work is still outstanding and quiescence cannot be established.
-        // Resolve every waiting future *before* abandoning the buffers: the
-        // payloads hold the wakers, so leaking first would hang those futures
-        // forever rather than reporting to them.
-        let mut wakers = Vec::new();
+        // Record the outcome for every waiting future *before* abandoning the
+        // buffers: the payloads hold the wakers, so leaking first would hang
+        // those futures forever rather than reporting to them.
         self.slab.for_each_payload(|payload| {
             if let Some(payload) = payload.downcast_mut::<OpPayload>() {
                 let mut slot = payload.slot.borrow_mut();
@@ -306,9 +314,7 @@ impl DriverInner {
         let _ = self.ring.close();
         self.slab.leak();
 
-        for waker in wakers {
-            waker.wake();
-        }
+        wakers
     }
 }
 
@@ -414,12 +420,18 @@ impl Driver {
         use futures::FutureExt;
 
         loop {
-            let (shutting_down, retry_owed) = {
+            let (shutting_down, retry_owed, wakers) = {
                 let mut inner = self.inner.borrow_mut();
                 inner.submit_pending();
-                inner.reap_completions();
-                (inner.shutting_down, inner.pending_submit)
+                let wakers = inner.reap_completions();
+                (inner.shutting_down, inner.pending_submit, wakers)
             };
+
+            // Wake only after the borrow is released: an executor may poll the
+            // woken task inline, and that task may call back into the driver.
+            for waker in wakers {
+                waker.wake();
+            }
 
             if shutting_down {
                 break;
@@ -453,7 +465,10 @@ impl Driver {
             }
         }
 
-        self.inner.borrow_mut().teardown();
+        let wakers = self.inner.borrow_mut().teardown();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -461,7 +476,10 @@ impl Drop for Driver {
     fn drop(&mut self) {
         // An abrupt drop gets the same treatment as a requested shutdown: no
         // memory the kernel might still reach is freed.
-        self.inner.borrow_mut().teardown();
+        let wakers = self.inner.borrow_mut().teardown();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -840,7 +858,9 @@ mod tests {
 
         // Drain the completion so nothing is left in flight.
         loop {
-            driver.inner.borrow_mut().reap_completions();
+            for waker in driver.inner.borrow_mut().reap_completions() {
+                waker.wake();
+            }
             if driver.inner.borrow().slab.outstanding() == 0 {
                 break;
             }
@@ -963,7 +983,9 @@ mod tests {
             "a successful retry after a long failure streak must still land"
         );
         loop {
-            driver.inner.borrow_mut().reap_completions();
+            for waker in driver.inner.borrow_mut().reap_completions() {
+                waker.wake();
+            }
             if driver.inner.borrow().slab.outstanding() == 0 {
                 break;
             }
@@ -1019,7 +1041,9 @@ mod tests {
 
         // Only the completion releases it.
         loop {
-            driver.inner.borrow_mut().reap_completions();
+            for waker in driver.inner.borrow_mut().reap_completions() {
+                waker.wake();
+            }
             if driver.inner.borrow().slab.outstanding() == 0 {
                 break;
             }
