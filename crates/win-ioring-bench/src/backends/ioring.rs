@@ -15,12 +15,35 @@
 use std::cell::RefCell;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use win_ioring::file::File;
 use win_ioring::io_ring::IoRing;
 use win_ioring::runtime::{Driver, FileTarget, Handle, RegisteredBuf, RegisteredBuffers};
 
 use crate::backend::{Availability, Backend, Buffer, OpResult};
+
+/// How many drivers this process has built.
+///
+/// An observation seam rather than a test fixture, which is why it is not
+/// `#[cfg(test)]`: SC-014 asks a full release run to report the figure, and the
+/// property it settles — one driver per measured combination, not one per
+/// iteration — is only interesting about a real run.
+static DRIVERS_BUILT: AtomicUsize = AtomicUsize::new(0);
+
+/// How many drivers have been built since this process started.
+///
+/// Process-global and monotonic. A caller comparing two readings gets the number
+/// built between them *by every thread*, which is why the test that reads it
+/// asserts a lower bound rather than an exact delta.
+pub fn drivers_built() -> usize {
+    DRIVERS_BUILT.load(Ordering::Relaxed)
+}
+
+/// Records that a driver was built.
+fn count_driver() {
+    DRIVERS_BUILT.fetch_add(1, Ordering::Relaxed);
+}
 
 impl Buffer for RegisteredBuf {
     fn bytes(&self) -> &[u8] {
@@ -78,6 +101,7 @@ impl IoRingPlain {
             .build()
             .map_err(io::Error::other)?;
         let driver = Driver::new(ring).map_err(io::Error::other)?;
+        count_driver();
         let handle = driver.handle();
         Ok(Self {
             handle,
@@ -192,6 +216,7 @@ impl IoRingRegistered {
             .build()
             .map_err(io::Error::other)?;
         let driver = Driver::new(ring).map_err(io::Error::other)?;
+        count_driver();
         let handle = driver.handle();
         Ok(Self {
             handle,

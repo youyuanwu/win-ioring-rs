@@ -15,7 +15,6 @@ use std::path::Path;
 use crate::concurrency::{Achieved, Depth};
 use crate::config::Config;
 use crate::fairness::{FairnessFailure, Ledger};
-use crate::measure::{Measured, Repeats};
 use crate::scenario::{Outcome, Scenario};
 use crate::session::{self, Prepared};
 use crate::verify::Trace;
@@ -63,6 +62,31 @@ impl Which {
             Which::RingPlain,
             Which::RingRegistered,
         ]
+    }
+
+    /// A short, stable, filesystem-safe identifier.
+    ///
+    /// Not the display name: `tokio::fs (blocking pool 1)` contains a colon,
+    /// which is not a legal Windows path character, and a benchmark identifier
+    /// becomes a directory name under `target/criterion`. These are also the
+    /// keys a stored baseline is matched on, so they must not drift. The full
+    /// name and configuration appear in the fairness account, where a reader
+    /// wants them.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Which::TokioOne => "tokio-pool-1",
+            Which::TokioMany => "tokio-pool-512",
+            Which::RingPlain => "ioring-owned",
+            Which::RingRegistered => "ioring-registered",
+        }
+    }
+
+    /// Whether this backend builds a driver.
+    ///
+    /// The thread-pool backends do not, which is why the driver count of SC-014
+    /// is read against the ring combinations rather than against all of them.
+    pub fn builds_a_driver(self) -> bool {
+        matches!(self, Which::RingPlain | Which::RingRegistered)
     }
 }
 
@@ -349,72 +373,6 @@ impl Timer for Untimed {
                 one().await;
             }
         });
-    }
-}
-
-/// What one backend's run produced, alongside how it was configured.
-pub struct Run {
-    /// The backend's name.
-    pub name: String,
-    /// Its configuration, for the report.
-    pub configuration: String,
-    /// The measurement, or why there is none.
-    pub measured: io::Result<Measured>,
-    /// The comparator's verdict for this backend against the reference already
-    /// in the caller's ledger for this (scenario, depth).
-    pub fairness: Result<(), FairnessFailure>,
-}
-
-/// Runs one backend end to end with the repeat timer, for the command-line
-/// entry point.
-///
-/// A thin caller of [`measure_combination`]: setup, warm-up, verification and
-/// teardown are all its, and this only chooses the timer and assembles the
-/// [`Measured`] the report expects.
-///
-/// The `ledger` is the caller's, one per (scenario, depth), passed to all four
-/// backends of that combination.
-pub fn run_one(which: Which, config: &Config, job: &Job<'_>, ledger: &mut Ledger) -> Run {
-    let mut timer = Repeats::new(config.repeats);
-    match measure_combination(which, Weakness::None, config, job, ledger, &mut timer) {
-        Ok(Record::Measured {
-            name,
-            configuration,
-            achieved,
-            trace,
-            ..
-        }) => Run {
-            name,
-            configuration,
-            measured: Ok(Measured {
-                samples: timer.into_samples(),
-                achieved,
-                trace,
-            }),
-            fairness: Ok(()),
-        },
-        Ok(Record::Unavailable { name, reason }) => Run {
-            name,
-            configuration: "failed to build".to_owned(),
-            measured: Err(io::Error::other(reason)),
-            fairness: Ok(()),
-        },
-        Ok(Record::Failed {
-            name,
-            configuration,
-            error,
-        }) => Run {
-            name,
-            configuration,
-            measured: Err(error),
-            fairness: Ok(()),
-        },
-        Err(failure) => Run {
-            name: failure.backend.clone(),
-            configuration: "rejected".to_owned(),
-            measured: Err(io::Error::other(failure.to_string())),
-            fairness: Err(failure),
-        },
     }
 }
 

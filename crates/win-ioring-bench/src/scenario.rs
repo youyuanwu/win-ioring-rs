@@ -66,6 +66,20 @@ impl Scenario {
         }
     }
 
+    /// A short, filesystem-safe identifier.
+    ///
+    /// Criterion turns a group name into a directory name under
+    /// `target/criterion` and matches stored baselines on it, so it must contain
+    /// nothing a path cannot and must not drift. [`Scenario::name`] is what a
+    /// reader sees in the account.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Scenario::SequentialRead => "sequential-read",
+            Scenario::RandomRead => "random-read",
+            Scenario::WriteThenRead => "write-then-read",
+        }
+    }
+
     /// Every scenario, in report order.
     pub fn all() -> [Scenario; 3] {
         [

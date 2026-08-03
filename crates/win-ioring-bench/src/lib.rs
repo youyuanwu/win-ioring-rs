@@ -31,16 +31,28 @@
 //! [`harness::measure_combination`] — the same function a measurement calls —
 //! and watches the run fail.
 //!
+//! # One entry point
+//!
+//! This crate has no binary. Its measurements run under Criterion, through
+//! `benches/comparison.rs`, invoked as `cargo bench -p win-ioring-bench`. That
+//! is deliberate: a second entry point of our own would be a second timing
+//! implementation to keep honest, and the reason to adopt a measurement
+//! framework at all is to stop maintaining one. Criterion supplies the
+//! statistics — warm-up, sampling, outlier classification, intervals, and
+//! comparison against a stored baseline — and this crate supplies what a timing
+//! cannot carry: [`account::Account`] records the achieved concurrency, the
+//! cache premise, the run order, the backend availability and the fairness
+//! verdict beside every figure, and writes them to `target/bench-data/`.
+//!
 //! See `docs/performance.md` for what the measurements do and do not tell you.
 
+pub mod account;
 pub mod backend;
 pub mod backends;
 pub mod concurrency;
 pub mod config;
 pub mod fairness;
 pub mod harness;
-pub mod measure;
-pub mod report;
 pub mod scenario;
 pub mod session;
 pub mod verify;

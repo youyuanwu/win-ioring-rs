@@ -15,5 +15,14 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 # compiles it — the same reasoning as the `Win32_System_Pipes` dev-dependency.
 windows = { workspace = true, features = ["Win32_System_SystemInformation"] }
 
+[dev-dependencies]
+criterion = { workspace = true, features = ["async"] }
+
+# The one entry point. `harness = false` because Criterion writes `main`
+# itself; there is no `[[bin]]` and no second way to run this.
+[[bench]]
+name = "comparison"
+harness = false
+
 [lints]
 workspace = true
