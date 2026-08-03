@@ -18,6 +18,15 @@ windows = { workspace = true, features = ["Win32_System_SystemInformation"] }
 [dev-dependencies]
 criterion = { workspace = true, features = ["async"] }
 
+# The library carries the measurement path but is not itself a benchmark target.
+# Left benchable, libtest's own harness would be run first by `cargo bench` and
+# would reject Criterion's arguments — `-- --save-baseline pre` dies on
+# "Unrecognized option" before the comparison ever starts, which would force
+# every documented command to name `--bench comparison` to route around a target
+# that measures nothing.
+[lib]
+bench = false
+
 # The one entry point. `harness = false` because Criterion writes `main`
 # itself; there is no `[[bin]]` and no second way to run this.
 [[bench]]

@@ -59,9 +59,23 @@ const WARM_UP: Duration = Duration::from_secs(1);
 /// How long each benchmark is sampled over.
 ///
 /// Thirty-six benchmarks share five minutes, which leaves each about eight
-/// seconds all-in; three of sampling on top of one of warm-up leaves room for
-/// preparation, for the untimed warm-ups and for teardown.
-const MEASUREMENT: Duration = Duration::from_secs(3);
+/// seconds all-in. Two seconds of sampling on top of one of warm-up leaves room
+/// for preparation, for the untimed warm-ups and for teardown.
+///
+/// Reduced from three seconds after measurement, not before it. This value is a
+/// *floor* on what a benchmark costs, not a cap: a benchmark cheap enough to fit
+/// a hundred samples inside the window is padded back up to fill it, while one
+/// too expensive to fit overruns it and takes as long as a hundred samples take.
+/// Two thirds of the matrix is in the first regime and pays this number
+/// directly; the rest is in the second and is unaffected by it. Lowering it from
+/// three seconds to two therefore bought roughly twenty-four seconds — one per
+/// padded benchmark — and lowering it further would buy less each time while
+/// gathering every padded estimate over a shorter window.
+///
+/// The statistical configuration is untouched: a hundred samples still drive
+/// every estimate. What changes is how many iterations each of those samples
+/// averages over, not how many samples there are.
+const MEASUREMENT: Duration = Duration::from_secs(2);
 
 /// How many samples Criterion gathers per estimate.
 ///
