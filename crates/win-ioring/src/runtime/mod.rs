@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::file::{File, FileState, SequentialGuard};
 use crate::io_ring::IoRing;
 use crate::io_ring::ops::{ReadOp, SqeFlags};
-use crate::sys::AsyncEvent;
+use crate::sys::ArmedEvent;
 
 use windows::Win32::Storage::FileSystem::{
     FILE_FLUSH_DEFAULT, FILE_FLUSH_MODE, FILE_WRITE_FLAGS, FILE_WRITE_FLAGS_NONE, IORING_OP_FLUSH,
@@ -1153,15 +1153,16 @@ pub struct Driver {
     /// Held outside `DriverInner` so it is never invoked under the driver's
     /// borrow; an observer may call back into the driver.
     on_error: Option<ErrorObserver>,
-    /// Signalled by the kernel when completions are available.
+    /// Signalled by the kernel when completions are available, and waited on
+    /// through one thread-pool registration armed for the driver's whole life.
     ///
-    /// The driver's only waited object. What used to be a second event —
-    /// carrying "the application queued work for you" — is now a flag and a
-    /// waker inside `DriverInner`, because every type that could raise it holds
-    /// `Rc`s and so lives on the driver's own thread. Routing a same-thread
-    /// signal through a kernel object and an operating-system thread pool cost
-    /// more than the I/O it was announcing.
-    completion_event: AsyncEvent,
+    /// The driver's only waited object, and the crate's only thread boundary.
+    /// What used to be a second event — carrying "the application queued work
+    /// for you" — is now a flag and a waker inside `DriverInner`, because every
+    /// type that could raise it holds `Rc`s and so lives on the driver's own
+    /// thread. Routing a same-thread signal through a kernel object and an
+    /// operating-system thread pool cost more than the I/O it was announcing.
+    completion_wait: ArmedEvent,
 }
 
 impl Driver {
@@ -1182,32 +1183,38 @@ impl Driver {
         // completion event. Registering the event first would mean a later
         // failure dropped the event's handle while the ring still referred to
         // it, which is exactly what `set_io_ring_completion_event` forbids.
-        let completion_event = match AsyncEvent::new_manual_reset() {
-            Ok(completion_event) => completion_event,
+        // Arming the wait is part of that: it can fail too, and must fail here
+        // rather than leaving a driver that can never be woken.
+        let completion_wait = match ArmedEvent::new() {
+            Ok(completion_wait) => completion_wait,
             Err(e) => {
                 // Nothing else owns the ring yet, and it has no `Drop`.
                 let _ = ring.close();
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        // SAFETY: `completion_event` becomes a field of the `Driver` built
-        // below, and the ring is always closed before that handle is. Three
-        // things uphold that, and all three are load-bearing:
+        // SAFETY: `completion_wait` becomes a field of the `Driver` built below,
+        // and the ring is always closed before that handle is. Four things
+        // uphold that, and all four are load-bearing:
         //
         // - `Drop for Driver` drains and then calls `close_and_release`, which
         //   closes the ring. It runs to completion before any `Driver` field —
-        //   `completion_event` among them — is dropped.
+        //   `completion_wait` among them — is dropped.
         // - that loop is fenced by `AbortOnUnwind`, because a panic escaping it
         //   would start dropping those fields with the ring still open, and
         //   `Drop for Driver` would not run again to fix it.
         // - `close_and_release` aborts rather than returning if the ring cannot
         //   be closed, and `Drop for DriverInner` aborts if it is ever reached
         //   with the ring still open.
+        // - `ArmedEvent` owns both the thread-pool registration and the handle,
+        //   and drops them in that order, so the wait is never left pending on a
+        //   closed handle. Because the ring is closed first, no new signal can
+        //   arrive while that unregister runs.
         //
         // Nothing fallible remains between here and that `Driver`, so there is
         // no path on which the event is dropped first.
-        if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_event.handle()) } {
+        if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_wait.handle()) } {
             let _ = ring.close();
             return Err(e);
         }
@@ -1256,7 +1263,7 @@ impl Driver {
                 })
             }),
             on_error: observer,
-            completion_event,
+            completion_wait,
         })
     }
 
@@ -1341,10 +1348,7 @@ impl Driver {
     ///
     /// The whole wakeup guarantee lives in [`Park::poll`]; see its comment.
     fn park(&self) -> Park<'_> {
-        Park {
-            driver: self,
-            wait: None,
-        }
+        Park { driver: self }
     }
 
     /// Drains cooperatively, yielding between steps.
@@ -1474,9 +1478,6 @@ impl Drop for AbortOnUnwind {
 /// does not.
 struct Park<'a> {
     driver: &'a Driver,
-    /// Held across polls rather than rebuilt, so a spurious poll does not
-    /// register a second platform wait.
-    wait: Option<crate::sys::EventWaitFuture<'a>>,
 }
 
 impl Future for Park<'_> {
@@ -1511,10 +1512,11 @@ impl Future for Park<'_> {
             if inner.take_nudge() {
                 inner.driver_waker = None;
                 drop(inner);
-                // Drop any platform wait this park had armed. Nothing is lost:
-                // the completion event is manual-reset, so a completion
-                // signalled meanwhile leaves it signalled for the next park.
-                this.wait = None;
+                // Give up the waker the armed wait may be holding for us. No
+                // completion can be lost by doing so: its signal is sticky, so
+                // one raised with no waker recorded is still seen by the next
+                // poll.
+                this.driver.completion_wait.release_waker();
                 return Poll::Ready(());
             }
             // Record who is driving *before* arming, so a nudge raised from here
@@ -1522,15 +1524,8 @@ impl Future for Park<'_> {
             inner.driver_waker = Some(cx.waker().clone());
         }
 
-        let wait = this
-            .wait
-            .get_or_insert_with(|| this.driver.completion_event.wait());
-        // SAFETY: `wait` is owned by this future, which is pinned, and is never
-        // moved out of the `Option` — only replaced or dropped in place.
-        match Pin::new(wait).poll(cx) {
-            Poll::Ready(_) => {
-                this.driver.completion_event.reset().ok();
-                this.wait = None;
+        match this.driver.completion_wait.poll_signalled(cx) {
+            Poll::Ready(()) => {
                 if let Ok(mut inner) = this.driver.inner.try_borrow_mut() {
                     inner.driver_waker = None;
                 }
@@ -1559,6 +1554,7 @@ impl Drop for Park<'_> {
         if let Ok(mut inner) = self.driver.inner.try_borrow_mut() {
             inner.driver_waker = None;
         }
+        self.driver.completion_wait.release_waker();
     }
 }
 
@@ -5769,5 +5765,129 @@ mod tests {
                 break;
             }
         }
+    }
+
+    // ---- the armed completion wait ---------------------------------------
+
+    #[test]
+    fn a_completion_signalled_mid_pass_is_not_lost() {
+        // Withhold reaping so a completion is signalled while the driver is
+        // between its last look and its park. The armed wait's signal is
+        // sticky, so the next park must resolve rather than suspend on work the
+        // platform has already finished.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        driver.inner.borrow_mut().withhold_reaps = 1;
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 64], 20, 0));
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        let mut resolved = false;
+        for _ in 0..500 {
+            let _ = drive.as_mut().poll(&mut cx);
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                resolved = true;
+                break;
+            }
+        }
+        assert!(
+            resolved,
+            "a completion signalled while the driver was mid-pass was lost"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_polled_by_a_new_task_is_still_woken_by_a_completion() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        let first = CountingWake::new();
+        let second = CountingWake::new();
+        let w1 = std::task::Waker::from(std::sync::Arc::clone(&first));
+        let w2 = std::task::Waker::from(std::sync::Arc::clone(&second));
+
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // Park under the first waker with nothing outstanding, then re-poll
+        // under the second, as an executor moving the task would.
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending()
+        );
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_pending()
+        );
+
+        let first_before = first.count();
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 64], 20, 0));
+
+        let mut resolved = false;
+        for _ in 0..500 {
+            let _ = drive.as_mut().poll(&mut Context::from_waker(&w2));
+            if fut.as_mut().poll(&mut Context::from_waker(&w2)).is_ready() {
+                resolved = true;
+                break;
+            }
+        }
+        assert!(resolved, "the read should have completed");
+        assert_eq!(
+            first.count(),
+            first_before,
+            "the waker from the earlier park must not be used"
+        );
+        assert!(
+            second.count() > 0,
+            "the wake must reach whichever task is driving now"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_ready()
+            {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_whose_wait_cannot_be_armed_reports_it() {
+        // A driver that silently could not be woken would hang rather than
+        // fail, so this must surface through the constructor.
+        crate::sys::ArmedEvent::fail_next_arm();
+        let ring = IoRing::builder().build().unwrap();
+        let result = Driver::new(ring);
+        assert!(
+            result.is_err(),
+            "a wait that cannot be armed must fail construction"
+        );
+        // The seam is consumed, so a driver built afterwards works normally.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        drop(driver);
     }
 }
