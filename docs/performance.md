@@ -79,9 +79,10 @@ under two labels.
 ## Reading the numbers
 
 Each cell reports median, min and max across five repeats after a discarded
-warm-up, and a figure relative to the first backend. **Look at the spread before
-believing a difference**: several of the gaps here are within run-to-run
-variation.
+warm-up, and a figure relative to the first backend. Every figure is the **total**
+for the scenario run, not a per-operation cost; the harness prints the operation
+count in each scenario heading. **Look at the spread before believing a
+difference**: several of the gaps here are within run-to-run variation.
 
 Achieved depth is measured by the harness, because one backend's outstanding
 count includes work its kernel has not accepted and the other exposes nothing
@@ -95,20 +96,33 @@ document showed four, and changing which four are shown in the same revision tha
 reports an improvement invites exactly the question it should not have to answer.
 
 Taken on a 16-logical-processor Windows host, working files on an NVMe volume.
-Times in microseconds, median of five repeats; `relative` is against
+
+**Each figure is the total elapsed time for the whole scenario run, in
+microseconds — not per operation.** The operation count differs by scenario, so
+it is given its own column: divide by it for a per-operation cost. Median of five
+repeats after a discarded warm-up; `relative` is against
 `tokio::fs (blocking pool 1)`.
 
-| scenario | depth | tokio pool 1 | tokio pool 512 | ioring owned | ioring registered |
-|---|---|---|---|---|---|
-| sequential read | 1 | 371299 (1.00x) | 782990 (2.11x) | 704885 (1.90x) | 714631 (1.92x) |
-| sequential read | 8 | 540395 (1.00x) | 550783 (1.02x) | 662333 (1.23x) | 675810 (1.25x) |
-| sequential read | 64 | 532716 (1.00x) | 553542 (1.04x) | 629880 (1.18x) | 660018 (1.24x) |
-| random read | 1 | 54711 (1.00x) | 55040 (1.01x) | **35222 (0.64x)** | **37775 (0.69x)** |
-| random read | 8 | 13320 (1.00x) | 26356 (1.98x) | 22279 (1.67x) | 23973 (1.80x) |
-| random read | 64 | 11769 (1.00x) | 25973 (2.21x) | 22246 (1.89x) | 24013 (2.04x) |
-| write then read | 1 | 467846 (1.00x) | 478465 (1.02x) | **434025 (0.93x)** | **437992 (0.94x)** |
-| write then read | 8 | 349972 (1.00x) | 356850 (1.02x) | 412561 (1.18x) | 414994 (1.19x) |
-| write then read | 64 | 332308 (1.00x) | 350838 (1.06x) | 416179 (1.25x) | 419489 (1.26x) |
+| scenario | depth | I/Os | tokio pool 1 | tokio pool 512 | ioring owned | ioring registered |
+|---|---|---|---|---|---|---|
+| sequential read (64 KiB) | 1 | 4096 | 371299 (1.00x) | 782990 (2.11x) | 704885 (1.90x) | 714631 (1.92x) |
+| sequential read (64 KiB) | 8 | 4096 | 540395 (1.00x) | 550783 (1.02x) | 662333 (1.23x) | 675810 (1.25x) |
+| sequential read (64 KiB) | 64 | 4096 | 532716 (1.00x) | 553542 (1.04x) | 629880 (1.18x) | 660018 (1.24x) |
+| random read (4 KiB) | 1 | 1024 | 54711 (1.00x) | 55040 (1.01x) | **35222 (0.64x)** | **37775 (0.69x)** |
+| random read (4 KiB) | 8 | 1024 | 13320 (1.00x) | 26356 (1.98x) | 22279 (1.67x) | 23973 (1.80x) |
+| random read (4 KiB) | 64 | 1024 | 11769 (1.00x) | 25973 (2.21x) | 22246 (1.89x) | 24013 (2.04x) |
+| write then read (64 KiB) | 1 | 2048 † | 467846 (1.00x) | 478465 (1.02x) | **434025 (0.93x)** | **437992 (0.94x)** |
+| write then read (64 KiB) | 8 | 2048 † | 349972 (1.00x) | 356850 (1.02x) | 412561 (1.18x) | 414994 (1.19x) |
+| write then read (64 KiB) | 64 | 2048 † | 332308 (1.00x) | 350838 (1.06x) | 416179 (1.25x) | 419489 (1.26x) |
+
+† The harness labels this scenario "1024 operations", meaning 1024 *in each
+direction* — 1024 writes followed by 1024 reads, so 2048 I/Os. The column above
+counts I/Os, because that is what a reader dividing by it wants.
+
+So the first cell is 371299 µs across 4096 operations — about 90.6 µs per 64 KiB
+read. The random-read rows move far less data per operation (4 KiB) and their
+totals are correspondingly smaller; **do not compare totals across scenarios**,
+only down a column within one row.
 
 Bold marks the cells where this crate is ahead. Min and max for every cell are in
 the harness's own output; run it to see the spreads before reading much into any
