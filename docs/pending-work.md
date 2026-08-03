@@ -125,6 +125,24 @@ its next pass.
 
 ## API consistency
 
+### The comparison's registered backend reports a registration it never made
+
+`IoRingRegistered::configuration()` prints "single-threaded driver; registered
+buffers and file handle; registration-naming operations", and the fairness
+account and `docs/performance.md` both quote it. The middle clause is false:
+`IoRingRegistered::register_file` exists and is never called, so
+`registered_file` stays `false`, `target()` always yields `FileTarget::Owned`,
+and the backend runs registered buffers against an owned handle.
+
+Harmless to the measurement — every backend in the comparison passes an owned
+handle, so the four are alike in exactly the way a comparison needs — but the
+printed configuration overstates what was measured, which is the one thing a
+fairness account exists not to do. Either call `register_file` during
+preparation, and accept that the registered backend then differs from its peers
+in two ways rather than one, or correct the string. It is listed here rather than
+fixed inside the Criterion migration because it changes what is measured, and
+that migration's whole premise is that what is measured did not change.
+
 ### SQE flags are not available on every path
 
 `read_with_flags` / `write_with_options` / `flush_with_options` expose
@@ -164,20 +182,37 @@ timer that would fix the submission retry above would fix this.
 
 ## Wake path
 
-### There is no committed guard on park cost
+### The guard on park cost is indirect, and is not wired to CI
 
 The driver's park machinery was measured at **13.99 µs per operation above the
 synchronous ring floor** at one operation in flight, and rewritten down to
 **2.46 µs**. Both figures came from a probe that was deleted afterwards, by
 decision: a benchmark nobody runs is a benchmark nobody maintains.
 
-The consequence is that nothing in this repository would catch a regression in
-that path. The comparison harness would notice a large one, but it cannot
-separate park cost from ring cost, so a small regression disappears into the
-difference between backends. Restoring the probe as a test with a threshold was
-considered and rejected as too brittle to be worth its maintenance; a
-lower-variance measurement of the same quantity would be the thing to build if
-this becomes a recurring worry.
+What now exists, which did not before: the comparison benchmark stores and
+compares against a **baseline**, so `cargo bench -p win-ioring-bench --
+--save-baseline pre` followed by the same command with `-- --baseline pre`
+reports, per benchmark, a change interval and a verdict. That is a committed
+guard on **end-to-end per-operation cost**, and a regression in the park path
+large enough to move the depth-1 figures would show up in it — the wake-path work
+moved random read at depth 1 by 38%, and a change of that order is far outside
+the ±17% this host's own run-to-run noise produces.
+
+Three things it still does not do, and all three matter:
+
+- It **cannot attribute** a change to the park path. It measures the whole
+  per-operation cost, so a park regression and a ring regression look identical.
+- It is **not wired to CI**. `cargo test --benches` runs the target in test mode,
+  one iteration per benchmark against a small configuration, which proves the
+  measurement path works but times nothing. Nobody's build fails on a
+  performance change.
+- Its **baselines are local**. They live under `target/criterion` and are lost
+  with the `target` directory, so the comparison is between two runs somebody
+  chose to make on one machine, not against a recorded history.
+
+Restoring the probe as a test with a threshold was considered and rejected as too
+brittle to be worth its maintenance; a lower-variance measurement of the same
+quantity would be the thing to build if this becomes a recurring worry.
 
 ### Two faster dispatch mechanisms were measured and not taken
 
@@ -205,16 +240,23 @@ and sixty-four operations in flight — per-operation cost fell at both — but 
 a real cost that a workload with very high completion rates and a rarely-parked
 driver would pay.
 
-### The harness and a direct probe disagree by about 4 µs per operation
+### The comparison and a direct probe disagree by about 4 µs per operation
 
-At sixty-four operations in flight on random reads, the comparison harness
-reports roughly 9.3 µs per operation for this crate where a direct probe over the
-same shape of work measures roughly 5.1 µs. Both were measured on the same host.
-The difference belongs to something in the harness — trace recording, the
+At sixty-four operations in flight on random reads, the comparison benchmark
+reported roughly 9.3 µs per operation for this crate where a direct probe over
+the same shape of work measured roughly 5.1 µs. Both were measured on the same
+host, by the harness that has since been replaced.
+
+The difference belongs to something in the measurement — trace recording, the
 verification digest, the work loop's own bookkeeping — and has not been chased
-down. It does not affect the harness's *comparisons*, since every backend pays
-it, but it means the harness's absolute figures are not a measurement of the
-crate alone.
+down. It does not affect the *comparisons*, since every backend pays it, but it
+means the absolute figures are not a measurement of the crate alone.
+
+The move to Criterion did not resolve this and was not expected to: the same
+recording and digesting happen inside the timed closure, by design, because a
+comparison that verified outside the timed region would not be verifying what it
+timed. The current figure for that cell is 10.1 µs per I/O, which is the same
+quantity under a different instrument and not a new datum on this question.
 
 ## Test coverage gaps
 
