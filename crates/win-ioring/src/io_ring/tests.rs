@@ -108,10 +108,16 @@ fn readme_register_test() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn readme_test_async() {
-    let event = AsyncEvent::new().unwrap();
+    // `Rc` so the wait can be shared with the task that awaits it while this
+    // scope keeps it alive until after `ring.close()`. Moving it into that task
+    // would close the handle while the ring could still signal it, which the
+    // platform calls undefined. `ArmedEvent` is `!Send`, and this test is
+    // single-threaded (`current_thread` plus `spawn_local`), so sharing it by
+    // `Rc` is exactly right.
+    let event = Rc::new(crate::sys::ArmedEvent::new().unwrap());
     let ring = Rc::new(RefCell::new(IoRing::builder().build().unwrap()));
-    // SAFETY: `event` is declared before `ring`, so it is dropped after it and
-    // outlives the ring's use of it.
+    // SAFETY: `event` outlives `ring`'s use of it — it is dropped at the end of
+    // this function, after the explicit `close()` below.
     unsafe {
         ring.borrow_mut()
             .set_io_ring_completion_event(event.handle())
@@ -145,9 +151,15 @@ async fn readme_test_async() {
     let local = tokio::task::LocalSet::new();
 
     let ring_cp = ring.clone();
+    // Clone *before* the `async move` below, or that block captures `event`
+    // itself and the handle closes when the block finishes — before
+    // `ring.close()`, which is exactly the ordering the SAFETY comment above
+    // forbids. The clone is what goes in; `event` stays owned by this function.
+    let event_cp = Rc::clone(&event);
     local
         .run_until(async move {
             let ring_cp2 = ring_cp.clone();
+            let event = event_cp;
             // spawn read task.
             let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let t1 = tokio::task::spawn_local(async move {
@@ -173,9 +185,10 @@ async fn readme_test_async() {
                     }
                 }
 
-                // Wait for completion using the event
-                event.wait().await.unwrap();
-                event.reset().unwrap();
+                // Wait for completion using the event. The armed wait's signal
+                // is sticky, so a completion raised before this point is not
+                // lost and no explicit reset is needed — resolving consumes it.
+                std::future::poll_fn(|cx| event.poll_signalled(cx)).await;
 
                 while let Some(cp) = ring_cp2.borrow_mut().pop_completion().unwrap() {
                     cp.ResultCode.unwrap();
@@ -197,6 +210,11 @@ async fn readme_test_async() {
 
     ring.borrow_mut().close().unwrap();
     println!("ring closed");
+    // Only now may `event` drop: while the ring was open the platform could
+    // still signal the handle, and closing a handle with a wait pending on it is
+    // undefined. Naming it here keeps that ordering visible rather than relying
+    // on declaration order alone.
+    drop(event);
 
     println!("data read: [{}]", String::from_utf8_lossy(&buffer));
 }

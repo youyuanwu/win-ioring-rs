@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::file::{File, FileState, SequentialGuard};
 use crate::io_ring::IoRing;
 use crate::io_ring::ops::{ReadOp, SqeFlags};
-use crate::sys::AsyncEvent;
+use crate::sys::ArmedEvent;
 
 use windows::Win32::Storage::FileSystem::{
     FILE_FLUSH_DEFAULT, FILE_FLUSH_MODE, FILE_WRITE_FLAGS, FILE_WRITE_FLAGS_NONE, IORING_OP_FLUSH,
@@ -282,13 +282,37 @@ pub(crate) struct DriverInner {
     /// while the operation is still described or built is remembered here and
     /// issued once submission promotes it.
     deferred_cancels: Vec<Token>,
-    /// Signalled to nudge the driver; held here so a dropped future can reach
-    /// it to prompt submission of the cancellation it just queued.
-    wake: Rc<AsyncEvent>,
+    /// Durable record that work was queued or shutdown was requested.
+    ///
+    /// A flag rather than an edge on purpose. Within one pass the driver
+    /// releases its borrow and calls back into caller code twice — waking
+    /// futures and delivering reports — and either can queue work, *after* the
+    /// pass has already read whether it should keep going. A signal that had to
+    /// be caught in flight could be raised in that window and missed; a flag
+    /// raised there is still set when the park consults it.
+    ///
+    /// Set by [`DriverInner::mark_nudged`], consumed only by the park.
+    nudged: bool,
+    /// The waker of whichever task is currently parked in [`Driver::drive`].
+    ///
+    /// Occupied **only while the driver is parked**. That is what makes it safe
+    /// for code reached from inside the driver's own pass to raise a nudge
+    /// without waking anything: there is no waker to take, and the running
+    /// driver consults `nudged` before it parks.
+    driver_waker: Option<Waker>,
     /// Set when entries are queued but not yet accepted by the kernel.
     ///
     /// While set, a retry is owed and no completion can arrive to prompt it, so
     /// the driver must schedule its own wake.
+    ///
+    /// Deliberately *not* the same state as `nudged`, though the two are raised
+    /// at the same moments. This one means "entries are queued and the kernel
+    /// has not taken them" and is cleared by a successful `submit_pending` at
+    /// the head of every pass, before the park decision is reached; it is also
+    /// never set by `Handle::escalate`. Reusing it as the wakeup record would
+    /// leave a shutdown request with no record at all, and would tie the wakeup
+    /// guarantee to submission-retry state, so a later change to when
+    /// submission is retried would silently change when the driver can be woken.
     pending_submit: bool,
     /// How far along shutdown is. Escalation is monotonic: a graceful shutdown
     /// can become immediate, never the reverse.
@@ -364,6 +388,21 @@ pub(crate) struct DriverInner {
     /// resolved" without a single retry having happened.
     #[cfg(test)]
     cancel_attempts: u32,
+    /// Test seam: how many times the driver actually suspended.
+    ///
+    /// Counted rather than a flag because the park tests need both "did this
+    /// pass park at all" and "how many times", and a boolean answers neither.
+    #[cfg(test)]
+    parks: u32,
+    /// Test seam: how many passes of the driver loop have run.
+    ///
+    /// Distinct from `parks`, and the distinction is load-bearing. A driver
+    /// whose park ignored the nudge entirely would still park once per poll, so
+    /// `parks` alone cannot tell "the nudge caused another pass" from "the poll
+    /// re-armed the wait and suspended again". Only a pass counter separates
+    /// them, and that is exactly what the wakeup tests must assert on.
+    #[cfg(test)]
+    passes: u32,
     /// Test seam: build the next buffer registration with no descriptors.
     ///
     /// The platform accepts a zero-*extent* descriptor but rejects a
@@ -385,6 +424,47 @@ impl DriverInner {
     #[must_use = "the returned errors must be reported after releasing the borrow"]
     fn take_reports(&mut self) -> Vec<Error> {
         std::mem::take(&mut self.deferred_reports)
+    }
+
+    /// Records that the driver owes a pass.
+    ///
+    /// Safe to call from anywhere, including from inside the driver's own pass:
+    /// it touches only durable state and wakes nothing. Code reached from
+    /// within a pass may call this alone, because no waker can be stored while
+    /// the driver is running and the running driver consults the flag before it
+    /// parks. Code entering from outside a pass must also take the waker — see
+    /// [`DriverInner::nudge`].
+    fn mark_nudged(&mut self) {
+        self.nudged = true;
+    }
+
+    /// Takes the parked driver's waker, for the caller to wake after releasing
+    /// its borrow.
+    ///
+    /// Returns `None` when the driver is not parked, which is the common case
+    /// for anything called from inside a pass.
+    #[must_use = "the returned waker must be woken after releasing the borrow"]
+    fn take_driver_waker(&mut self) -> Option<Waker> {
+        self.driver_waker.take()
+    }
+
+    /// Records that the driver owes a pass and takes its waker if it is parked.
+    ///
+    /// The form every external entry point uses: raise the durable record, then
+    /// wake whoever is waiting on it, once the borrow is gone.
+    #[must_use = "the returned waker must be woken after releasing the borrow"]
+    fn nudge(&mut self) -> Option<Waker> {
+        self.mark_nudged();
+        self.take_driver_waker()
+    }
+
+    /// Consumes the nudge, reporting whether one was outstanding.
+    ///
+    /// Called only from the park. Consuming anywhere else would let the driver
+    /// park on work it has been told about and never told about again.
+    #[must_use = "consuming the nudge without acting on it loses the wakeup"]
+    fn take_nudge(&mut self) -> bool {
+        std::mem::take(&mut self.nudged)
     }
 
     /// Hands queued entries to the kernel.
@@ -691,7 +771,11 @@ impl DriverInner {
         }
 
         self.pending_submit = true;
-        let _ = self.wake.signal();
+        // Only mark. This is reached from inside the driver's own pass — via
+        // `submit_pending` and `drain_step` — where no waker can be stored, and
+        // from `request_cancel`, whose external callers take the waker
+        // themselves once their borrow is gone.
+        self.mark_nudged();
     }
 
     /// Drains the completion queue.
@@ -918,6 +1002,13 @@ impl DriverInner {
         self.registration_in_flight = false;
         self.file_registration = None;
         self.retired_file_registrations.clear();
+        // Not needed for correctness — a resolved park leaves the slot empty,
+        // and nothing consumes a nudge after teardown — but both fields are
+        // documented as transient, and leaving either set on a torn-down driver
+        // reads as an oversight. A waker surviving here would additionally keep
+        // the driving task's allocation alive through a reference cycle.
+        self.driver_waker = None;
+        self.nudged = false;
         self.torn_down = true;
         // Everything is released, so anyone awaiting the end of teardown can be
         // told. Collected rather than woken here, like every other waker: an
@@ -1065,10 +1156,16 @@ pub struct Driver {
     /// Held outside `DriverInner` so it is never invoked under the driver's
     /// borrow; an observer may call back into the driver.
     on_error: Option<ErrorObserver>,
-    /// Signalled by the kernel when completions are available.
-    completion_event: AsyncEvent,
-    /// Signalled when work is queued or shutdown is requested.
-    wake: Rc<AsyncEvent>,
+    /// Signalled by the kernel when completions are available, and waited on
+    /// through one thread-pool registration armed for the driver's whole life.
+    ///
+    /// The driver's only waited object, and the crate's only thread boundary.
+    /// What used to be a second event — carrying "the application queued work
+    /// for you" — is now a flag and a waker inside `DriverInner`, because every
+    /// type that could raise it holds `Rc`s and so lives on the driver's own
+    /// thread. Routing a same-thread signal through a kernel object and an
+    /// operating-system thread pool cost more than the I/O it was announcing.
+    completion_wait: ArmedEvent,
 }
 
 impl Driver {
@@ -1089,35 +1186,38 @@ impl Driver {
         // completion event. Registering the event first would mean a later
         // failure dropped the event's handle while the ring still referred to
         // it, which is exactly what `set_io_ring_completion_event` forbids.
-        let (completion_event, wake) = match (
-            AsyncEvent::new_manual_reset(),
-            AsyncEvent::new_manual_reset(),
-        ) {
-            (Ok(completion_event), Ok(wake)) => (completion_event, Rc::new(wake)),
-            (Err(e), _) | (_, Err(e)) => {
+        // Arming the wait is part of that: it can fail too, and must fail here
+        // rather than leaving a driver that can never be woken.
+        let completion_wait = match ArmedEvent::new() {
+            Ok(completion_wait) => completion_wait,
+            Err(e) => {
                 // Nothing else owns the ring yet, and it has no `Drop`.
                 let _ = ring.close();
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        // SAFETY: `completion_event` becomes a field of the `Driver` built
-        // below, and the ring is always closed before that handle is. Three
-        // things uphold that, and all three are load-bearing:
+        // SAFETY: `completion_wait` becomes a field of the `Driver` built below,
+        // and the ring is always closed before that handle is. Four things
+        // uphold that, and all four are load-bearing:
         //
         // - `Drop for Driver` drains and then calls `close_and_release`, which
         //   closes the ring. It runs to completion before any `Driver` field —
-        //   `completion_event` among them — is dropped.
+        //   `completion_wait` among them — is dropped.
         // - that loop is fenced by `AbortOnUnwind`, because a panic escaping it
         //   would start dropping those fields with the ring still open, and
         //   `Drop for Driver` would not run again to fix it.
         // - `close_and_release` aborts rather than returning if the ring cannot
         //   be closed, and `Drop for DriverInner` aborts if it is ever reached
         //   with the ring still open.
+        // - `ArmedEvent` owns both the thread-pool registration and the handle,
+        //   and drops them in that order, so the wait is never left pending on a
+        //   closed handle. Because the ring is closed first, no new signal can
+        //   arrive while that unregister runs.
         //
         // Nothing fallible remains between here and that `Driver`, so there is
         // no path on which the event is dropped first.
-        if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_event.handle()) } {
+        if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_wait.handle()) } {
             let _ = ring.close();
             return Err(e);
         }
@@ -1126,8 +1226,6 @@ impl Driver {
             // `new_cyclic` rather than `new` so the driver can hand a weak
             // reference to itself to each registration, which needs to ask about
             // shutdown and supersession without keeping the driver alive.
-            // Deliberately not a `move` closure: `wake` is borrowed for the
-            // clone below and is still needed for the `Driver`'s own field.
             inner: Rc::new_cyclic(|self_weak| {
                 RefCell::new(DriverInner {
                     ring,
@@ -1140,7 +1238,8 @@ impl Driver {
                     retired_file_registrations: Vec::new(),
                     cancel_holds: Vec::new(),
                     deferred_cancels: Vec::new(),
-                    wake: Rc::clone(&wake),
+                    nudged: false,
+                    driver_waker: None,
                     pending_submit: false,
                     shutdown: ShutdownMode::Running,
                     #[cfg(test)]
@@ -1159,12 +1258,15 @@ impl Driver {
                     #[cfg(test)]
                     cancel_attempts: 0,
                     #[cfg(test)]
+                    parks: 0,
+                    #[cfg(test)]
+                    passes: 0,
+                    #[cfg(test)]
                     fail_next_registration: false,
                 })
             }),
             on_error: observer,
-            completion_event,
-            wake,
+            completion_wait,
         })
     }
 
@@ -1184,19 +1286,28 @@ impl Driver {
         Handle {
             inner: Rc::downgrade(&self.inner),
             strong: Rc::clone(&self.inner),
-            wake: Rc::clone(&self.wake),
         }
     }
 
     /// Runs the driver until shutdown is requested, then closes the ring.
     ///
     /// Spawn this on your executor.
+    ///
+    /// # Poll exactly one of these per driver
+    ///
+    /// The driver records the waker of whichever task is parked in a single
+    /// slot. Two `drive` futures polled concurrently against one `Driver` would
+    /// each overwrite the other's waker, and the one whose waker was evicted
+    /// would not be re-polled by a completion. Nothing enforces this — `&self`
+    /// permits a second call — so it is stated here.
     pub async fn drive(&self) {
-        use futures::FutureExt;
-
         loop {
             let (shutting_down, retry_owed, wakers, reports) = {
                 let mut inner = self.inner.borrow_mut();
+                #[cfg(test)]
+                {
+                    inner.passes += 1;
+                }
                 inner.submit_pending();
                 let wakers = inner.reap_completions();
                 let reports = inner.take_reports();
@@ -1238,17 +1349,17 @@ impl Driver {
                 continue;
             }
 
-            futures::select! {
-                _ = self.wake.wait().fuse() => {
-                    self.wake.reset().ok();
-                }
-                _ = self.completion_event.wait().fuse() => {
-                    self.completion_event.reset().ok();
-                }
-            }
+            self.park().await;
         }
 
         self.run_teardown_async().await;
+    }
+
+    /// Suspends until the driver owes another pass.
+    ///
+    /// The whole wakeup guarantee lives in [`Park::poll`]; see its comment.
+    fn park(&self) -> Park<'_> {
+        Park { driver: self }
     }
 
     /// Drains cooperatively, yielding between steps.
@@ -1371,6 +1482,110 @@ impl Drop for AbortOnUnwind {
     }
 }
 
+/// Suspends the driver until something gives it work to do.
+///
+/// Two things can: the application queuing work or asking for shutdown, which
+/// happens on this very thread, and the platform announcing completions, which
+/// does not.
+struct Park<'a> {
+    driver: &'a Driver,
+}
+
+impl Future for Park<'_> {
+    type Output = ();
+
+    /// # Why no wakeup can be lost here
+    ///
+    /// The nudge is consumed and the platform wait is armed inside this one
+    /// `poll`, on one thread, with no `await`, no callback into caller code and
+    /// no re-entrant path between the two. A nudge can only be raised by code
+    /// holding an `Rc` to the driver, which is to say by code on the driver's
+    /// own thread — and while this `poll` runs, that thread is running this
+    /// `poll`. So a nudge is either
+    ///
+    /// - raised before the check below, and observed by it; or
+    /// - raised after this returns `Pending`, by which time the waker stored
+    ///   below is visible to `take_driver_waker`, so the nudger wakes us.
+    ///
+    /// There is no third case. The borrow released between the two steps runs
+    /// only driver-private code and cannot reach a site that raises a nudge.
+    ///
+    /// Being woken from inside the driver's own pass — which happens when a
+    /// future woken by this pass queues more work inline — is harmless: an
+    /// executor cannot re-enter a future it is currently polling, so the wake
+    /// degrades to marking the task ready, which is what the flag already
+    /// guarantees.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+
+        // Any waker this park evicts is dropped *after* the borrow is released.
+        // Dropping a `Waker` runs executor code, and if it is the last reference
+        // to a task holding an operation future, that future's `Drop` re-enters
+        // the driver — which under a live borrow would panic. Same discipline as
+        // the `#[must_use]` waker returns elsewhere in this file.
+        let evicted;
+        {
+            let mut inner = this.driver.inner.borrow_mut();
+            if inner.take_nudge() {
+                evicted = inner.driver_waker.take();
+                drop(inner);
+                drop(evicted);
+                // Give up the waker the armed wait may be holding for us. No
+                // completion can be lost by doing so: its signal is sticky, so
+                // one raised with no waker recorded is still seen by the next
+                // poll.
+                this.driver.completion_wait.release_waker();
+                return Poll::Ready(());
+            }
+            // Record who is driving *before* arming, so a nudge raised from here
+            // on has something to wake.
+            evicted = inner.driver_waker.replace(cx.waker().clone());
+        }
+        drop(evicted);
+
+        match this.driver.completion_wait.poll_signalled(cx) {
+            Poll::Ready(()) => {
+                let evicted = this
+                    .driver
+                    .inner
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut inner| inner.driver_waker.take());
+                drop(evicted);
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                #[cfg(test)]
+                {
+                    this.driver.inner.borrow_mut().parks += 1;
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for Park<'_> {
+    fn drop(&mut self) {
+        // A park abandoned part-way — which happens when the `drive` future
+        // itself is dropped — must not leave its waker behind. Nothing is
+        // stranded if it does, because `nudged` is durable and the next driver
+        // to run observes it; but the slot is documented as occupied only while
+        // parked, and a waker left there keeps the abandoned task alive.
+        //
+        // `try_borrow_mut` because this can run while the driver is mid-pass,
+        // and the waker is dropped after the borrow for the reason in `poll`.
+        let evicted = self
+            .driver
+            .inner
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut inner| inner.driver_waker.take());
+        drop(evicted);
+        self.driver.completion_wait.release_waker();
+    }
+}
+
 /// Resolves once the driver has finished tearing down.
 ///
 /// Created by [`Handle::shutdown_complete`].
@@ -1432,7 +1647,6 @@ pub struct Handle {
     inner: Weak<RefCell<DriverInner>>,
     /// Strong, so a handle held by the caller keeps the driver usable.
     strong: Rc<RefCell<DriverInner>>,
-    wake: Rc<AsyncEvent>,
 }
 
 impl Handle {
@@ -1462,16 +1676,32 @@ impl Handle {
         self.escalate(ShutdownMode::Immediate);
     }
 
+    /// Records that the driver owes a pass, and wakes it if it is parked.
+    ///
+    /// The borrow is confined to this call and the wake happens after it, since
+    /// an executor may poll the woken driver inline and call straight back in.
+    fn nudge_driver(&self) {
+        let waker = self.strong.borrow_mut().nudge();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     /// Raises the shutdown mode, never lowers it.
     fn escalate(&self, mode: ShutdownMode) {
-        {
+        let waker = {
             let mut inner = self.strong.borrow_mut();
             if inner.shutdown >= mode {
                 return;
             }
             inner.shutdown = mode;
+            inner.nudge()
+        };
+        // After the borrow: an executor may poll the woken task inline and call
+        // straight back into the driver.
+        if let Some(waker) = waker {
+            waker.wake();
         }
-        let _ = self.wake.signal();
     }
 
     /// Returns `true` if the driver has been asked to shut down, by either
@@ -1620,9 +1850,13 @@ impl Handle {
         // The entry is now in the submission queue and cannot be withdrawn.
         inner.slab.set_lifecycle(token, Lifecycle::Built);
         inner.pending_submit = true;
+        let waker = inner.nudge();
         drop(inner);
 
-        let _ = self.wake.signal();
+        // After the borrow: an executor may poll the woken driver inline.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
 
         Ok(ReadFuture::pending(token, slot, Weak::clone(&self.inner)))
     }
@@ -1762,9 +1996,13 @@ impl Handle {
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
         inner.pending_submit = true;
+        let waker = inner.nudge();
         drop(inner);
 
-        let _ = self.wake.signal();
+        // After the borrow: an executor may poll the woken driver inline.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
 
         Ok(WriteFuture {
             inner: OpFuture::pending(token, slot, Weak::clone(&self.inner)),
@@ -1891,9 +2129,13 @@ impl Handle {
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
         inner.pending_submit = true;
+        let waker = inner.nudge();
         drop(inner);
 
-        let _ = self.wake.signal();
+        // After the borrow: an executor may poll the woken driver inline.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
 
         Ok(FlushFuture {
             state: FlushState::Waiting(OpFuture::pending(token, slot, Weak::clone(&self.inner))),
@@ -1916,7 +2158,7 @@ impl Handle {
             Ok(started) => started,
             Err((e, buffers)) => return Registered::Failed(e, buffers),
         };
-        let _ = self.wake.signal();
+        self.nudge_driver();
 
         // The driver adopts the registration on completion, in completion
         // order, and hands the resources back through the slot on failure.
@@ -2071,7 +2313,7 @@ impl Handle {
     /// [`File`] values, or drop them, without invalidating the registration.
     pub async fn register_files(&self, files: &[File]) -> Result<()> {
         let (token, slot) = self.start_register_files(files)?;
-        let _ = self.wake.signal();
+        self.nudge_driver();
 
         // Nothing was taken from the caller, so there is nothing to give back.
         (RegistrationFuture {
@@ -2315,9 +2557,13 @@ impl Handle {
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
         inner.pending_submit = true;
+        let waker = inner.nudge();
         drop(inner);
 
-        let _ = self.wake.signal();
+        // After the borrow: an executor may poll the woken driver inline.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
 
         Ok(RegisteredOpFuture {
             state: RegisteredOpState::Waiting(OpFuture::pending(
@@ -2334,7 +2580,17 @@ impl Handle {
     /// buffer. Cancelling twice, or cancelling an operation that has already
     /// finished, is a no-op.
     pub fn cancel(&self, id: OperationId) {
-        self.strong.borrow_mut().request_cancel(id.0);
+        let waker = {
+            let mut inner = self.strong.borrow_mut();
+            inner.request_cancel(id.0);
+            // `request_cancel` only marks, because it is also reached from
+            // inside the driver's own pass. Entering from outside one, this is
+            // where the parked driver gets woken.
+            inner.take_driver_waker()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -2573,11 +2829,12 @@ impl Drop for OpFuture {
         // Detaching leaves the operation running. Its buffer is released only
         // when its own completion is dequeued, never here. What varies is
         // whether anything can be done about it.
-        match inner.slab.detach(self.token) {
+        let waker = match inner.slab.detach(self.token) {
             Some(Lifecycle::Described) => {
                 // Nothing was ever built, so no queue entry references the
                 // buffer and it can be released immediately.
                 drop(inner.slab.complete(self.token));
+                None
             }
             Some(Lifecycle::Built) => {
                 // A submission queue entry references the buffer and cannot be
@@ -2585,14 +2842,23 @@ impl Drop for OpFuture {
                 // there is nothing for the platform to cancel. The slab records
                 // this slot as detached, and the driver cancels it once
                 // submission promotes it.
+                None
             }
             Some(Lifecycle::Submitted) => {
                 // Best-effort: ask the platform to give up early. Failure here
                 // is not an error and changes nothing about the buffer's
                 // lifetime. This returns without waiting on the kernel.
                 inner.request_cancel(self.token);
+                // That only marks the nudge, because it is also reached from
+                // inside the driver's own pass. A future dropped by application
+                // code is outside one, so the parked driver is woken here.
+                inner.take_driver_waker()
             }
-            None => {}
+            None => None,
+        };
+        drop(inner);
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -5199,5 +5465,528 @@ mod tests {
         assert_eq!(&external_buf[..4], b"mine");
 
         external.close().unwrap();
+    }
+
+    // ---- the same-thread nudge -------------------------------------------
+    //
+    // These are the tests for the wakeup guarantee. Each asserts the `parks`
+    // counter or a wake count rather than merely that the work finished: a
+    // driver that reached the same end state by parking and being woken by an
+    // unrelated completion would satisfy "the read completed" while the
+    // mechanism under test was broken.
+
+    /// A waker that counts wakes, so a test can tell being woken from being
+    /// polled again for some other reason.
+    struct CountingWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for CountingWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl CountingWake {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(CountingWake(std::sync::atomic::AtomicUsize::new(0)))
+        }
+        fn count(self: &std::sync::Arc<Self>) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn work_queued_before_the_first_poll_is_seen_on_the_first_pass() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        // Queue before `drive` has ever been polled, so there is no waker to
+        // take and the flag is the only record that survives.
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 64], 20, 0));
+        assert!(
+            driver.inner.borrow().nudged,
+            "queuing work must leave a durable record even with no driver parked"
+        );
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            !driver.inner.borrow().nudged,
+            "the first pass must consume the nudge"
+        );
+        assert!(
+            driver.inner.borrow().passes >= 1,
+            "the nudge raised before any poll must produce a pass"
+        );
+
+        // Settle so teardown is clean.
+        for _ in 0..200 {
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+            let _ = drive.as_mut().poll(&mut cx);
+        }
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn work_queued_while_the_driver_runs_is_seen_without_parking() {
+        // The flag-only path: work is queued while the driver is *running*, so
+        // there is no waker to take and nothing wakes anything. The next park
+        // must consume the flag and resolve rather than suspend.
+        //
+        // Asserted on passes rather than parks, because a park that ignored the
+        // flag would also suspend exactly once per poll — see the vacuity trap
+        // recorded in docs/testing.md.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // A poll with nothing outstanding: one pass, then it parks.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            1,
+            "an idle poll should run exactly one pass"
+        );
+
+        // Control: polling again while still parked resumes *inside* the park,
+        // so with nothing to report it runs no pass at all. This is what makes
+        // the assertion below meaningful rather than a count of polls.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            0,
+            "a re-poll with nothing outstanding must not run a pass"
+        );
+
+        // Raise the flag the way code inside a pass does — mark only, no waker
+        // taken, nothing woken.
+        let wakes_before = waker.count();
+        driver.inner.borrow_mut().mark_nudged();
+        assert_eq!(
+            waker.count(),
+            wakes_before,
+            "marking must not wake; this is the path where no waker exists"
+        );
+
+        // The park must now resolve on the flag alone and let a pass run,
+        // rather than suspending on work it has already been told about.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            1,
+            "the park must resolve on the flag and run a pass, not suspend"
+        );
+        assert!(
+            !driver.inner.borrow().nudged,
+            "the park must consume the flag"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_nudge_between_the_check_and_the_park_still_causes_a_pass() {
+        // The narrowest window in the design: the driver has satisfied itself
+        // that nothing is outstanding, and work arrives before it is parked.
+        // Reached here by raising the nudge directly between two polls, which
+        // is the same state the window produces.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // Park with nothing to do.
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        let passes = driver.inner.borrow().passes;
+        assert_eq!(
+            driver.inner.borrow().parks,
+            1,
+            "the driver should have parked"
+        );
+
+        // Raise a nudge with the driver parked. It must both wake the task and
+        // leave a record, so the next poll runs another pass.
+        let before = waker.count();
+        handle.nudge_driver();
+        assert!(
+            waker.count() > before,
+            "a nudge raised against a parked driver must wake it"
+        );
+
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        // Asserting on passes, not parks: a park that ignored the nudge and
+        // simply re-armed would also increment `parks`, so `parks` alone cannot
+        // tell the two apart. Only another pass proves the nudge was honoured.
+        assert_eq!(
+            driver.inner.borrow().passes,
+            passes + 1,
+            "a nudge must produce another pass, not merely another suspension"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_nudge_reaches_the_task_that_is_driving_now() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let first = CountingWake::new();
+        let second = CountingWake::new();
+        let w1 = std::task::Waker::from(std::sync::Arc::clone(&first));
+        let w2 = std::task::Waker::from(std::sync::Arc::clone(&second));
+
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // Park under the first waker, then re-poll under the second, as an
+        // executor that moved the task between workers would.
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending()
+        );
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_pending()
+        );
+
+        let first_before = first.count();
+        let second_before = second.count();
+        handle.nudge_driver();
+
+        assert_eq!(
+            first.count(),
+            first_before,
+            "the waker from the previous park must not be used"
+        );
+        assert!(
+            second.count() > second_before,
+            "the nudge must reach whichever task is driving now"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_ready()
+            {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_nudges_before_a_pass_produce_one_pass() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        let passes = driver.inner.borrow().passes;
+
+        handle.nudge_driver();
+        handle.nudge_driver();
+        handle.nudge_driver();
+
+        // Three nudges, one outstanding pass: the flag collapses them, and only
+        // the first found a waker to take.
+        assert_eq!(
+            waker.count(),
+            1,
+            "only the nudge that found the driver parked should wake it"
+        );
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes,
+            passes + 1,
+            "three nudges must produce one additional pass, not three"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_wakes_a_parked_driver_on_its_own() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        let before = waker.count();
+
+        // No completion can arrive — nothing was ever issued — so if shutdown
+        // does not wake the park itself, nothing ever will.
+        handle.shutdown_now();
+        assert!(
+            waker.count() > before,
+            "a shutdown request must wake a parked driver by itself"
+        );
+
+        let mut finished = false;
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "the driver should have torn down");
+        assert!(driver.inner.borrow().torn_down);
+    }
+
+    #[test]
+    fn a_nudge_after_shutdown_does_not_obstruct_teardown() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        handle.shutdown_now();
+        // Raise a nudge mid-teardown; it must be inert rather than obstructive.
+        handle.nudge_driver();
+
+        let mut finished = false;
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                finished = true;
+                break;
+            }
+            handle.nudge_driver();
+        }
+        assert!(finished, "nudges during teardown must not prevent it");
+        assert!(driver.inner.borrow().torn_down);
+    }
+
+    #[test]
+    fn an_abandoned_park_leaves_no_waker_behind() {
+        // The `drive` future can be dropped mid-park. The flag is durable, so
+        // nothing is stranded, but the waker slot must not outlive the park.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+
+        {
+            let drive = driver.drive();
+            futures::pin_mut!(drive);
+            assert!(drive.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                driver.inner.borrow().driver_waker.is_some(),
+                "a parked driver should have recorded its waker"
+            );
+        }
+
+        assert!(
+            driver.inner.borrow().driver_waker.is_none(),
+            "an abandoned park must not leave its waker behind"
+        );
+
+        // A fresh driving task still sees work raised while nobody was driving.
+        handle.nudge_driver();
+        assert!(driver.inner.borrow().nudged);
+
+        handle.shutdown_now();
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    // ---- the armed completion wait ---------------------------------------
+
+    #[test]
+    fn a_completion_signalled_mid_pass_is_not_lost() {
+        // Withhold reaping so a completion is signalled while the driver is
+        // between its last look and its park. The armed wait's signal is
+        // sticky, so the next park must resolve rather than suspend on work the
+        // platform has already finished.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        driver.inner.borrow_mut().withhold_reaps = 1;
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 64], 20, 0));
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        let mut resolved = false;
+        for _ in 0..500 {
+            let _ = drive.as_mut().poll(&mut cx);
+            if fut.as_mut().poll(&mut cx).is_ready() {
+                resolved = true;
+                break;
+            }
+        }
+        assert!(
+            resolved,
+            "a completion signalled while the driver was mid-pass was lost"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_polled_by_a_new_task_is_still_woken_by_a_completion() {
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+        let file = readme();
+
+        let first = CountingWake::new();
+        let second = CountingWake::new();
+        let w1 = std::task::Waker::from(std::sync::Arc::clone(&first));
+        let w2 = std::task::Waker::from(std::sync::Arc::clone(&second));
+
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // Park under the first waker with nothing outstanding, then re-poll
+        // under the second, as an executor moving the task would.
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending()
+        );
+        assert!(
+            drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_pending()
+        );
+
+        let first_before = first.count();
+        let mut fut = Box::pin(handle.read(&file, vec![0_u8; 64], 20, 0));
+
+        let mut resolved = false;
+        for _ in 0..500 {
+            let _ = drive.as_mut().poll(&mut Context::from_waker(&w2));
+            if fut.as_mut().poll(&mut Context::from_waker(&w2)).is_ready() {
+                resolved = true;
+                break;
+            }
+        }
+        assert!(resolved, "the read should have completed");
+        assert_eq!(
+            first.count(),
+            first_before,
+            "the waker from the earlier park must not be used"
+        );
+        assert!(
+            second.count() > 0,
+            "the wake must reach whichever task is driving now"
+        );
+
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive
+                .as_mut()
+                .poll(&mut Context::from_waker(&w2))
+                .is_ready()
+            {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_whose_wait_cannot_be_armed_reports_it() {
+        // A driver that silently could not be woken would hang rather than
+        // fail, so this must surface through the constructor.
+        crate::sys::ArmedEvent::fail_next_arm();
+        let ring = IoRing::builder().build().unwrap();
+        let result = Driver::new(ring);
+        assert!(
+            result.is_err(),
+            "a wait that cannot be armed must fail construction"
+        );
+        // The seam is consumed, so a driver built afterwards works normally.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        drop(driver);
     }
 }
