@@ -8,9 +8,11 @@
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
 use win_ioring_bench::config::Config;
-use win_ioring_bench::harness::{Job, Which, run_one};
+use win_ioring_bench::fairness::Ledger;
+use win_ioring_bench::harness::{Job, Record, Which, measure_combination, run_one};
+use win_ioring_bench::measure::Repeats;
 use win_ioring_bench::scenario::{Rng, Scenario};
-use win_ioring_bench::verify::{Phase, Trace};
+use win_ioring_bench::verify::{Mismatch, Phase, Trace};
 use win_ioring_bench::workload;
 
 /// Prepares a small working set for the tests.
@@ -28,16 +30,6 @@ fn ring_available() -> bool {
     matches!(ioring::availability(), Availability::Available)
 }
 
-/// The block size and operation count each scenario uses in these tests.
-fn shape(config: &Config, scenario: Scenario) -> (u32, usize) {
-    let (block, total) = match scenario {
-        Scenario::SequentialRead => (config.sequential_block, config.read_file_bytes),
-        Scenario::RandomRead => (config.random_block, config.read_file_bytes / 8),
-        Scenario::WriteThenRead => (config.write_block, config.write_file_bytes),
-    };
-    (block, config.operations(total, block))
-}
-
 /// SC-014: every backend is instantiated from one common entry point and runs
 /// every scenario, with no scenario code naming an implementation.
 #[test]
@@ -46,7 +38,9 @@ fn every_backend_runs_every_scenario() {
     let (read_path, write_path) = prepare("all", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = shape(&config, scenario);
+        let (block, operations) = config.shape(scenario);
+        // One ledger for this (scenario, depth), shared across its backends.
+        let mut ledger = Ledger::new();
 
         for which in Which::all() {
             if !ring_available() && matches!(which, Which::RingPlain | Which::RingRegistered) {
@@ -60,7 +54,10 @@ fn every_backend_runs_every_scenario() {
                 operations,
                 depth: 1,
             };
-            let run = run_one(which, &config, &job);
+            let run = run_one(which, &config, &job, &mut ledger);
+            run.fairness.unwrap_or_else(|f| {
+                panic!("{} was rejected on {}: {f}", run.name, scenario.name())
+            });
             let measured = run
                 .measured
                 .unwrap_or_else(|e| panic!("{} failed on {}: {e}", run.name, scenario.name()));
@@ -86,6 +83,9 @@ fn every_backend_runs_every_scenario() {
 /// The property the whole comparison rests on. It is also what catches a backend
 /// that reports a transfer without putting the data anywhere the application can
 /// read — the exact hazard the registered path used to have.
+///
+/// The agreement is asserted through the ledger the measurement itself consults,
+/// rather than through a copy of that comparison written here.
 #[test]
 fn every_backend_does_the_same_work() {
     if !ring_available() {
@@ -95,9 +95,10 @@ fn every_backend_does_the_same_work() {
     let (read_path, write_path) = prepare("same", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = shape(&config, scenario);
+        let (block, operations) = config.shape(scenario);
 
-        let mut reference: Option<(String, Trace)> = None;
+        let mut ledger = Ledger::new();
+        let mut last_trace: Option<Trace> = None;
         for which in Which::all() {
             let job = Job {
                 scenario,
@@ -107,31 +108,72 @@ fn every_backend_does_the_same_work() {
                 operations,
                 depth: 4,
             };
-            let run = run_one(which, &config, &job);
+            let run = run_one(which, &config, &job, &mut ledger);
+            run.fairness
+                .unwrap_or_else(|f| panic!("{} disagreed on {}: {f}", run.name, scenario.name()));
             let measured = run
                 .measured
                 .unwrap_or_else(|e| panic!("{} failed on {}: {e}", run.name, scenario.name()));
-            match &reference {
-                None => reference = Some((run.name, measured.trace)),
-                Some((ref_name, ref_trace)) => {
-                    if let Err(mismatch) = ref_trace.agrees_with(&measured.trace) {
-                        panic!(
-                            "{} disagreed with {ref_name} on {}: {mismatch}",
-                            run.name,
-                            scenario.name()
-                        );
-                    }
-                }
-            }
+            last_trace = Some(measured.trace);
         }
 
-        let (_, trace) = reference.expect("at least one backend ran");
+        let trace = last_trace.expect("at least one backend ran");
         assert!(
             trace.delivered_total() > 0,
             "{} delivered no bytes at all",
             scenario.name()
         );
     }
+}
+
+/// The gate on the ledger being shared across a combination's backends rather
+/// than constructed per call.
+///
+/// Two real runs of the same backend through `measure_combination`, the second
+/// asked to do half the work, against one ledger: the rejection has to come out
+/// of the measured path. A ledger constructed per call — inside
+/// `measure_combination` or inside `run_one` — would make each run its own
+/// reference, no comparison could ever fail, and the cross-backend check would
+/// be gone with nothing to notice it.
+#[test]
+fn a_backend_that_ran_a_different_job_is_rejected() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("rejected", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
+    let depth = 1;
+    // The thread-pool backend, so this gate holds on a host without a ring.
+    let which = Which::TokioOne;
+
+    let mut ledger = Ledger::new();
+
+    let job = Job {
+        scenario,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth,
+    };
+    let mut timer = Repeats::new(config.repeats);
+    let first = measure_combination(which, &config, &job, &mut ledger, &mut timer)
+        .expect("the first observation has nothing to disagree with");
+    assert!(
+        matches!(first, Record::Measured { .. }),
+        "the reference run did not produce a measurement"
+    );
+
+    let halved = Job {
+        operations: operations / 2,
+        ..job.clone()
+    };
+    let mut timer = Repeats::new(config.repeats);
+    let failure = measure_combination(which, &config, &halved, &mut ledger, &mut timer)
+        .expect_err("half the operations is not the same work");
+    assert!(
+        matches!(failure.mismatch, Mismatch::OperationCount { .. }),
+        "rejected for the wrong reason: {failure}"
+    );
 }
 
 /// SC-021: a randomised scenario issues an identical sequence on two runs.

@@ -1,8 +1,14 @@
 //! Measuring, and assembling the results.
+//!
+//! This module is the hand-rolled timing layer: a fixed number of repeats, a
+//! median and a min/max. It is deliberately visible as such, because it is the
+//! part an established statistics implementation replaces.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::concurrency::{Achieved, Shortfall};
+use crate::harness::{Timed, Timer};
+use crate::session::Prepared;
 
 /// What one backend achieved on one scenario at one depth.
 pub struct Cell {
@@ -56,22 +62,50 @@ impl Cell {
     }
 }
 
-/// Times one closure, discarding a warm-up repeat first.
+/// Times a fixed number of iterations with [`Instant`], collecting a sample per
+/// iteration.
 ///
-/// Only the measured region is timed: preparation, warm-up and verification all
-/// happen outside it.
-pub fn measure<F>(repeats: usize, mut once: F) -> std::io::Result<Vec<Duration>>
-where
-    F: FnMut() -> std::io::Result<Duration>,
-{
-    // Discarded: it pays for lazily created threads, first-touch page faults,
-    // and anything else a backend defers until first use.
-    once()?;
-    let mut samples = Vec::with_capacity(repeats);
-    for _ in 0..repeats {
-        samples.push(once()?);
+/// The warm-up is not here: it belongs to `measure_combination`, so every timer
+/// gets one and none has to remember to discard a repeat of its own.
+pub struct Repeats {
+    repeats: usize,
+    samples: Vec<Duration>,
+}
+
+impl Repeats {
+    /// A timer that will run `repeats` measured iterations.
+    pub fn new(repeats: usize) -> Self {
+        Self {
+            repeats,
+            samples: Vec::with_capacity(repeats),
+        }
     }
-    Ok(samples)
+
+    /// The timings collected, in issue order.
+    pub fn into_samples(self) -> Vec<Duration> {
+        self.samples
+    }
+}
+
+impl Timer for Repeats {
+    fn time<F, Fut>(&mut self, _timed: &Timed, prepared: &Prepared, mut one: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let repeats = self.repeats;
+        let samples = &mut self.samples;
+        // One `block_on` around the whole loop rather than one per iteration:
+        // the ring backends' driver is pumped by that call, and restarting it
+        // per iteration would abandon a park between every pair of them.
+        prepared.block_on(async move {
+            for _ in 0..repeats {
+                let started = Instant::now();
+                one().await;
+                samples.push(started.elapsed());
+            }
+        });
+    }
 }
 
 /// What a set of measured repeats produced.
