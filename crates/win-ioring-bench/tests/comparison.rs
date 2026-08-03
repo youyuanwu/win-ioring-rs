@@ -9,10 +9,10 @@ use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
-use win_ioring_bench::harness::{Job, Record, Which, measure_combination, run_one};
-use win_ioring_bench::measure::Repeats;
+use win_ioring_bench::harness::{Job, Record, Untimed, Which, measure_combination, run_one};
 use win_ioring_bench::scenario::{Rng, Scenario};
 use win_ioring_bench::verify::{Mismatch, Phase, Trace};
+use win_ioring_bench::weaken::Weakness;
 use win_ioring_bench::workload;
 
 /// Prepares a small working set for the tests.
@@ -155,9 +155,16 @@ fn a_backend_that_ran_a_different_job_is_rejected() {
         operations,
         depth,
     };
-    let mut timer = Repeats::new(config.repeats);
-    let first = measure_combination(which, &config, &job, &mut ledger, &mut timer)
-        .expect("the first observation has nothing to disagree with");
+    let mut timer = Untimed { iterations: 2 };
+    let first = measure_combination(
+        which,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("the first observation has nothing to disagree with");
     assert!(
         matches!(first, Record::Measured { .. }),
         "the reference run did not produce a measurement"
@@ -167,9 +174,16 @@ fn a_backend_that_ran_a_different_job_is_rejected() {
         operations: operations / 2,
         ..job.clone()
     };
-    let mut timer = Repeats::new(config.repeats);
-    let failure = measure_combination(which, &config, &halved, &mut ledger, &mut timer)
-        .expect_err("half the operations is not the same work");
+    let mut timer = Untimed { iterations: 2 };
+    let failure = measure_combination(
+        which,
+        Weakness::None,
+        &config,
+        &halved,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect_err("half the operations is not the same work");
     assert!(
         matches!(failure.mismatch, Mismatch::OperationCount { .. }),
         "rejected for the wrong reason: {failure}"

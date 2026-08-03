@@ -34,6 +34,7 @@ use crate::backends::tokio_fs::TokioFs;
 use crate::config::Config;
 use crate::harness::{Job, Which};
 use crate::scenario::{self, Outcome};
+use crate::weaken::{Weakened, Weakness};
 
 /// A backend the host could not provide, and the reason it could not.
 ///
@@ -164,11 +165,16 @@ impl Prepared {
     /// One `async fn` over three variants, so every call yields a future of one
     /// type, which is what a `FnMut() -> F` routine requires. The match costs
     /// one predictable branch per iteration and nothing per operation.
-    pub async fn one(&self, job: &Job<'_>) -> io::Result<Outcome> {
+    ///
+    /// `weakness` is [`Weakness::None`] for every real measurement. When it is
+    /// not, the backend is wrapped in a [`Weakened`] before the scenario ever
+    /// sees it, so a deliberately weakened run travels this identical path
+    /// rather than a parallel implementation a test wrote for itself.
+    pub async fn one(&self, job: &Job<'_>, weakness: Weakness) -> io::Result<Outcome> {
         match self {
-            Prepared::Pool(backend) => run_job(backend, job).await,
-            Prepared::Plain { backend, .. } => run_job(backend, job).await,
-            Prepared::Registered { backend, .. } => run_job(backend, job).await,
+            Prepared::Pool(backend) => run_job(backend, job, weakness).await,
+            Prepared::Plain { backend, .. } => run_job(backend, job, weakness).await,
+            Prepared::Registered { backend, .. } => run_job(backend, job, weakness).await,
         }
     }
 
@@ -211,7 +217,22 @@ impl Prepared {
 
 /// Runs one job against one backend, through the one shared scenario entry
 /// point.
-async fn run_job<B: Backend>(backend: &B, job: &Job<'_>) -> io::Result<Outcome> {
+///
+/// The weakening is decided here, once per call, rather than inside the
+/// scenario: nothing under this line knows a backend can be weakened.
+async fn run_job<B: Backend>(
+    backend: &B,
+    job: &Job<'_>,
+    weakness: Weakness,
+) -> io::Result<Outcome> {
+    match weakness {
+        Weakness::None => run_scenario(backend, job).await,
+        weakness => run_scenario(&Weakened::new(backend, weakness), job).await,
+    }
+}
+
+/// Hands one backend to the scenario it was prepared for.
+async fn run_scenario<B: Backend>(backend: &B, job: &Job<'_>) -> io::Result<Outcome> {
     scenario::run(
         backend,
         job.scenario,

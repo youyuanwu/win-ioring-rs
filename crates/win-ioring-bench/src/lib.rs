@@ -26,6 +26,11 @@
 //! exactly one call site for the comparator, removing it breaks a test rather
 //! than quietly removing the check.
 //!
+//! That last claim is settled rather than asserted: [`weaken::Weakened`] is a
+//! backend that really does less, and `tests/fairness.rs` drives it through
+//! [`harness::measure_combination`] — the same function a measurement calls —
+//! and watches the run fail.
+//!
 //! See `docs/performance.md` for what the measurements do and do not tell you.
 
 pub mod backend;
@@ -39,4 +44,5 @@ pub mod report;
 pub mod scenario;
 pub mod session;
 pub mod verify;
+pub mod weaken;
 pub mod workload;

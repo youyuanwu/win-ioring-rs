@@ -19,6 +19,7 @@ use crate::measure::{Measured, Repeats};
 use crate::scenario::{Outcome, Scenario};
 use crate::session::{self, Prepared};
 use crate::verify::Trace;
+use crate::weaken::Weakness;
 
 /// What a single run is asked to do.
 ///
@@ -209,8 +210,15 @@ pub enum Record {
 /// `ledger` is **the caller's**, shared across one (scenario, depth)'s backends.
 /// Constructing one here would make every backend its own reference and no
 /// disagreement could ever be reported.
+///
+/// `weakness` is [`Weakness::None`] for every real measurement. A test passes
+/// something else to watch a backend that really does less be rejected by this
+/// function rather than by a copy of its comparison — which is the only way
+/// "a weakened backend fails a run" can be settled about the code a measurement
+/// actually runs.
 pub fn measure_combination(
     which: Which,
+    weakness: Weakness,
     config: &Config,
     job: &Job<'_>,
     ledger: &mut Ledger,
@@ -231,7 +239,7 @@ pub fn measure_combination(
     // One untimed warm-up: it pays for lazily created threads, first-touch page
     // faults, and anything else a backend defers until first use. A combination
     // whose warm-up could not run has nothing to time.
-    let warm = match prepared.block_on(prepared.one(job)) {
+    let warm = match prepared.block_on(prepared.one(job, weakness)) {
         Ok(outcome) => outcome,
         Err(error) => {
             let teardown = prepared.finish();
@@ -258,7 +266,7 @@ pub fn measure_combination(
         let prepared = &prepared;
         let evidence = &evidence;
         timer.time(&benchmark, prepared, move || async move {
-            match prepared.one(job).await {
+            match prepared.one(job, weakness).await {
                 Ok(outcome) => evidence.borrow_mut().record(outcome),
                 Err(error) => evidence.borrow_mut().record_failure(error),
             }
@@ -315,6 +323,35 @@ pub fn measure_combination(
     })
 }
 
+/// A timer that runs a fixed number of iterations and times nothing.
+///
+/// For tests, and for anything else that wants the path — preparation, warm-up,
+/// verification, teardown — without the statistics. It exists so a test can
+/// exercise [`measure_combination`] without paying for repeats whose timings
+/// nobody will read.
+pub struct Untimed {
+    /// How many iterations to run.
+    pub iterations: usize,
+}
+
+impl Timer for Untimed {
+    fn time<F, Fut>(&mut self, _timed: &Timed, prepared: &Prepared, mut one: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let iterations = self.iterations;
+        // One `block_on` around the whole loop, as any timer must: the ring
+        // backends' driver is pumped by that call, and restarting it per
+        // iteration would abandon a park between every pair of them.
+        prepared.block_on(async move {
+            for _ in 0..iterations {
+                one().await;
+            }
+        });
+    }
+}
+
 /// What one backend's run produced, alongside how it was configured.
 pub struct Run {
     /// The backend's name.
@@ -339,7 +376,7 @@ pub struct Run {
 /// backends of that combination.
 pub fn run_one(which: Which, config: &Config, job: &Job<'_>, ledger: &mut Ledger) -> Run {
     let mut timer = Repeats::new(config.repeats);
-    match measure_combination(which, config, job, ledger, &mut timer) {
+    match measure_combination(which, Weakness::None, config, job, ledger, &mut timer) {
         Ok(Record::Measured {
             name,
             configuration,
