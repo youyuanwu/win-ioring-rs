@@ -45,7 +45,6 @@ impl AsyncEvent {
     }
 
     /// Resets the event to the non-signaled state, allowing it to be reused.
-    /// Resets the event to the non-signaled state, allowing it to be reused.
     /// After calling reset(), a subsequent wait will block until signal() is
     /// called again.
     pub fn reset(&self) -> windows::core::Result<()> {
@@ -91,13 +90,6 @@ impl AsyncEvent {
     }
 }
 
-/// State shared between a waiting future and the thread pool callback that
-/// signals it.
-///
-/// The callback runs on an operating system thread pool thread, so this must be
-/// thread-safe even though the driver that ultimately consumes the wakeup is
-/// single-threaded. Waking across threads is exactly what makes the crate
-/// runtime-agnostic: the executor's own waker does the hand-off.
 /// A Windows event with one thread-pool wait armed for its whole life.
 ///
 /// This is how a completion signalled by the platform reaches the driver's
@@ -195,23 +187,41 @@ impl ArmedEvent {
             }),
         });
 
-        #[cfg(test)]
-        if FAIL_NEXT_ARM.with(|f| f.replace(false)) {
-            return Err(crate::Error::Os(windows::core::Error::from(
-                windows::Win32::Foundation::E_FAIL,
-            )));
-        }
-
         // Hand one reference count to the operating system. It belongs to the
         // registration for its whole life; `Drop` reclaims it once the blocking
         // unregister has proved no callback can still be running.
         let raw = Arc::into_raw(Arc::clone(&shared));
         let mut wait = HANDLE::default();
+
+        // The seam is consulted *after* the count has been handed over, so a
+        // simulated failure takes the same reclaim path a real one does. Failing
+        // earlier would have left that path — the one the test is named for —
+        // unreachable.
+        #[cfg(test)]
+        let armed = if FAIL_NEXT_ARM.with(|f| f.replace(false)) {
+            Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        } else {
+            // SAFETY: as below.
+            unsafe {
+                RegisterWaitForSingleObject(
+                    &mut wait,
+                    event.handle(),
+                    Some(armed_callback),
+                    Some(raw as *const std::ffi::c_void),
+                    INFINITE,
+                    WORKER_THREAD_FLAGS(0),
+                )
+            }
+        };
+
         // SAFETY: `wait` is a local the call fills in; `event` outlives the
         // registration because both are fields of the value built below and
         // `Drop` unregisters before the handle closes; `raw` is a reference
         // count deliberately handed over for the callback to borrow. No flags,
         // so the wait re-arms rather than firing once.
+        #[cfg(not(test))]
         let armed = unsafe {
             RegisterWaitForSingleObject(
                 &mut wait,
@@ -382,6 +392,30 @@ impl Drop for AsyncEvent {
 mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
+
+    // Nine tests were removed here when `AsyncEvent::wait` and
+    // `EventWaitFuture` were deleted. The reasons, so a reader of this file does
+    // not have to find the pull request:
+    //
+    // - `test_async_event_signal_and_wait`, `test_async_event_delayed_signal`,
+    //   `test_async_event_timeout`, `test_async_event_reset_and_reuse` —
+    //   rewritten against `ArmedEvent` below, asserting the same properties:
+    //   signalled-before-wait, signalled-after-wait, never-signalled, and one
+    //   event serving many waits.
+    // - `test_multiple_waiters_on_reset_event`,
+    //   `test_manual_reset_multiple_waiters` — **removed outright**. Both
+    //   asserted how many of two concurrent waiters a given event mode releases.
+    //   `ArmedEvent` is single-consumer by construction: one registration, one
+    //   waker slot. They would have asserted a property the replacement
+    //   deliberately does not have. The contract that replaced it is asserted by
+    //   `a_second_poller_replaces_the_first_pollers_waker`.
+    // - `cancelled_waits_do_not_leak`, `dropping_a_wait_while_it_fires_is_safe`,
+    //   `a_replacement_wait_still_sees_the_signal`, and the
+    //   `register_then_abandon` helper — superseded by the reference-count and
+    //   drop-race tests below, which exercise the same three hazards against the
+    //   primitive that now exists.
+    //
+    // The five `wait_sync` tests are unchanged: that surface is untouched.
 
     // ---- the armed wait ---------------------------------------------------
     //
@@ -560,6 +594,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_failure_to_arm_is_reported_and_reclaims_its_count() {
+        // The seam fails the arming *after* the reference count has been handed
+        // over, so this exercises the reclaim branch rather than skipping it.
+        // The `Weak` is what proves the count came back: a leak would leave the
+        // allocation alive after both the `Arc` and the raw count are gone.
+        let watch = {
+            let probe = ArmedEvent::new().unwrap();
+            probe.watch()
+        };
+        assert_eq!(watch.strong_count(), 0, "control: a normal build reclaims");
+
         ArmedEvent::fail_next_arm();
         let result = ArmedEvent::new();
         assert!(
@@ -567,10 +611,23 @@ mod tests {
             "a wait that cannot be armed must be reported, not swallowed — a \
              driver that silently could not be woken would hang"
         );
-        // The seam is consumed, so the next construction succeeds.
+
+        // The seam is consumed, so the next construction succeeds and works.
         let event = ArmedEvent::new().unwrap();
+        let watch = event.watch();
+        assert_eq!(
+            watch.strong_count(),
+            2,
+            "a live registration holds exactly one count besides ours"
+        );
         event.signal().unwrap();
         wait_once(&event).await;
+        drop(event);
+        assert_eq!(
+            watch.strong_count(),
+            0,
+            "teardown must reclaim the operating system's count exactly once"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

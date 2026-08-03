@@ -11,7 +11,8 @@ the working files it leaves under `target/bench-data`.
 but no longer on all of it.** At one operation in flight this crate now wins two
 of the three scenarios — random reads at 0.64x and write-then-read at 0.93x —
 having lost both before the driver's wake path was rewritten. Everywhere else it
-loses, by 1.18x to 1.90x.
+loses: by 1.18x to 1.90x with owned buffers, and up to 2.04x with registered
+buffers, which are consistently a few percent behind the owned-buffer path.
 
 That is a change of ranking, not just of numbers, and it is stated first because
 the previous revision of this document led with an unqualified loss and would
@@ -87,36 +88,31 @@ count includes work its kernel has not accepted and the other exposes nothing
 comparable. It therefore **cannot see a backend serialising operations below its
 own interface** — read it beside that backend's configuration, not alone.
 
-## Representative result
+## Full result
+
+All nine scenario/depth cells, not a selection — an earlier revision of this
+document showed four, and changing which four are shown in the same revision that
+reports an improvement invites exactly the question it should not have to answer.
 
 Taken on a 16-logical-processor Windows host, working files on an NVMe volume.
-Times in microseconds; `relative` is against the first row.
+Times in microseconds, median of five repeats; `relative` is against
+`tokio::fs (blocking pool 1)`.
 
-```
-## sequential read — depth 1, 4096 operations
-tokio::fs (blocking pool 1)          371299.4      1.00x
-tokio::fs (blocking pool 512)        782989.9      2.11x
-win-ioring (owned buffers)           704884.9      1.90x
-win-ioring (registered)              714631.1      1.92x
+| scenario | depth | tokio pool 1 | tokio pool 512 | ioring owned | ioring registered |
+|---|---|---|---|---|---|
+| sequential read | 1 | 371299 (1.00x) | 782990 (2.11x) | 704885 (1.90x) | 714631 (1.92x) |
+| sequential read | 8 | 540395 (1.00x) | 550783 (1.02x) | 662333 (1.23x) | 675810 (1.25x) |
+| sequential read | 64 | 532716 (1.00x) | 553542 (1.04x) | 629880 (1.18x) | 660018 (1.24x) |
+| random read | 1 | 54711 (1.00x) | 55040 (1.01x) | **35222 (0.64x)** | **37775 (0.69x)** |
+| random read | 8 | 13320 (1.00x) | 26356 (1.98x) | 22279 (1.67x) | 23973 (1.80x) |
+| random read | 64 | 11769 (1.00x) | 25973 (2.21x) | 22246 (1.89x) | 24013 (2.04x) |
+| write then read | 1 | 467846 (1.00x) | 478465 (1.02x) | **434025 (0.93x)** | **437992 (0.94x)** |
+| write then read | 8 | 349972 (1.00x) | 356850 (1.02x) | 412561 (1.18x) | 414994 (1.19x) |
+| write then read | 64 | 332308 (1.00x) | 350838 (1.06x) | 416179 (1.25x) | 419489 (1.26x) |
 
-## random read — depth 1, 1024 operations
-tokio::fs (blocking pool 1)           54711.4      1.00x
-tokio::fs (blocking pool 512)         55040.4      1.01x
-win-ioring (owned buffers)            35221.9      0.64x
-win-ioring (registered)               37774.5      0.69x
-
-## random read — depth 64, 1024 operations
-tokio::fs (blocking pool 1)           11769.4      1.00x
-tokio::fs (blocking pool 512)         25973.0      2.21x
-win-ioring (owned buffers)            22245.9      1.89x
-win-ioring (registered)               24012.8      2.04x
-
-## write then read — depth 1, 1024 operations
-tokio::fs (blocking pool 1)          467846.2      1.00x
-tokio::fs (blocking pool 512)        478464.5      1.02x
-win-ioring (owned buffers)           434025.0      0.93x
-win-ioring (registered)              437991.5      0.94x
-```
+Bold marks the cells where this crate is ahead. Min and max for every cell are in
+the harness's own output; run it to see the spreads before reading much into any
+gap under about 10%.
 
 ## What to take from it
 
@@ -206,6 +202,10 @@ backend — and because it was caught by review rather than by any automated che
 - **The cost of registering.** Setup — ring, runtime, registration and buffer
   pool — is built once per scenario and depth and is outside every timed region,
   so these figures are per-operation cost only.
+- **Anything about the `sys` layer's own async surface.** `sys::AsyncEvent` no
+  longer offers asynchronous waiting; the persistent-wait primitive that replaced
+  it is crate-internal, for reasons given in [design.md](design.md). A caller
+  driving a ring by hand uses `wait_sync` or supplies its own waiting.
 - **Why the harness reports roughly 4 µs per operation more than a direct probe
   measured for the same shape of work at depth 64.** Unexplained; recorded in
   [pending-work.md](pending-work.md).

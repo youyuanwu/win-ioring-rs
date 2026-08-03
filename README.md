@@ -144,7 +144,8 @@ Measured, in [docs/performance.md](docs/performance.md), and the short answer is
 **sometimes, and only at low concurrency**. At one operation in flight this crate
 now edges ahead of `tokio::fs` on random reads and on write-then-read; at eight
 and sixty-four operations in flight, and on 64 KiB sequential reads, `tokio::fs`
-is still ahead by 1.18x to 1.90x.
+is still ahead — by 1.18x to 1.90x with owned buffers, up to 2.04x with
+registered ones.
 
 Run it yourself with `cargo run -p win-ioring-bench --release`; the harness runs
 one piece of application logic against every backend and rejects any run that did

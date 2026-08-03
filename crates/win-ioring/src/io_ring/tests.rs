@@ -151,10 +151,15 @@ async fn readme_test_async() {
     let local = tokio::task::LocalSet::new();
 
     let ring_cp = ring.clone();
+    // Clone *before* the `async move` below, or that block captures `event`
+    // itself and the handle closes when the block finishes — before
+    // `ring.close()`, which is exactly the ordering the SAFETY comment above
+    // forbids. The clone is what goes in; `event` stays owned by this function.
+    let event_cp = Rc::clone(&event);
     local
         .run_until(async move {
             let ring_cp2 = ring_cp.clone();
-            let event = Rc::clone(&event);
+            let event = event_cp;
             // spawn read task.
             let (tx, rx) = futures::channel::oneshot::channel::<()>();
             let t1 = tokio::task::spawn_local(async move {
@@ -205,6 +210,11 @@ async fn readme_test_async() {
 
     ring.borrow_mut().close().unwrap();
     println!("ring closed");
+    // Only now may `event` drop: while the ring was open the platform could
+    // still signal the handle, and closing a handle with a wait pending on it is
+    // undefined. Naming it here keeps that ordering visible rather than relying
+    // on declaration order alone.
+    drop(event);
 
     println!("data read: [{}]", String::from_utf8_lossy(&buffer));
 }

@@ -462,6 +462,7 @@ impl DriverInner {
     ///
     /// Called only from the park. Consuming anywhere else would let the driver
     /// park on work it has been told about and never told about again.
+    #[must_use = "consuming the nudge without acting on it loses the wakeup"]
     fn take_nudge(&mut self) -> bool {
         std::mem::take(&mut self.nudged)
     }
@@ -1001,11 +1002,13 @@ impl DriverInner {
         self.registration_in_flight = false;
         self.file_registration = None;
         self.retired_file_registrations.clear();
-        // Not needed for correctness — a resolved park leaves the slot empty —
-        // but the slot is documented as occupied only while parked, and a waker
-        // surviving teardown inside `DriverInner` would keep the driving task's
-        // allocation alive through a reference cycle.
+        // Not needed for correctness — a resolved park leaves the slot empty,
+        // and nothing consumes a nudge after teardown — but both fields are
+        // documented as transient, and leaving either set on a torn-down driver
+        // reads as an oversight. A waker surviving here would additionally keep
+        // the driving task's allocation alive through a reference cycle.
         self.driver_waker = None;
+        self.nudged = false;
         self.torn_down = true;
         // Everything is released, so anyone awaiting the end of teardown can be
         // told. Collected rather than woken here, like every other waker: an
@@ -1289,6 +1292,14 @@ impl Driver {
     /// Runs the driver until shutdown is requested, then closes the ring.
     ///
     /// Spawn this on your executor.
+    ///
+    /// # Poll exactly one of these per driver
+    ///
+    /// The driver records the waker of whichever task is parked in a single
+    /// slot. Two `drive` futures polled concurrently against one `Driver` would
+    /// each overwrite the other's waker, and the one whose waker was evicted
+    /// would not be re-polled by a completion. Nothing enforces this — `&self`
+    /// permits a second call — so it is stated here.
     pub async fn drive(&self) {
         loop {
             let (shutting_down, retry_owed, wakers, reports) = {
@@ -1507,11 +1518,18 @@ impl Future for Park<'_> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
 
+        // Any waker this park evicts is dropped *after* the borrow is released.
+        // Dropping a `Waker` runs executor code, and if it is the last reference
+        // to a task holding an operation future, that future's `Drop` re-enters
+        // the driver — which under a live borrow would panic. Same discipline as
+        // the `#[must_use]` waker returns elsewhere in this file.
+        let evicted;
         {
             let mut inner = this.driver.inner.borrow_mut();
             if inner.take_nudge() {
-                inner.driver_waker = None;
+                evicted = inner.driver_waker.take();
                 drop(inner);
+                drop(evicted);
                 // Give up the waker the armed wait may be holding for us. No
                 // completion can be lost by doing so: its signal is sticky, so
                 // one raised with no waker recorded is still seen by the next
@@ -1521,14 +1539,19 @@ impl Future for Park<'_> {
             }
             // Record who is driving *before* arming, so a nudge raised from here
             // on has something to wake.
-            inner.driver_waker = Some(cx.waker().clone());
+            evicted = inner.driver_waker.replace(cx.waker().clone());
         }
+        drop(evicted);
 
         match this.driver.completion_wait.poll_signalled(cx) {
             Poll::Ready(()) => {
-                if let Ok(mut inner) = this.driver.inner.try_borrow_mut() {
-                    inner.driver_waker = None;
-                }
+                let evicted = this
+                    .driver
+                    .inner
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut inner| inner.driver_waker.take());
+                drop(evicted);
                 Poll::Ready(())
             }
             Poll::Pending => {
@@ -1550,10 +1573,15 @@ impl Drop for Park<'_> {
         // to run observes it; but the slot is documented as occupied only while
         // parked, and a waker left there keeps the abandoned task alive.
         //
-        // `try_borrow_mut` because this can run while the driver is mid-pass.
-        if let Ok(mut inner) = self.driver.inner.try_borrow_mut() {
-            inner.driver_waker = None;
-        }
+        // `try_borrow_mut` because this can run while the driver is mid-pass,
+        // and the waker is dropped after the borrow for the reason in `poll`.
+        let evicted = self
+            .driver
+            .inner
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut inner| inner.driver_waker.take());
+        drop(evicted);
         self.driver.completion_wait.release_waker();
     }
 }
@@ -5507,6 +5535,77 @@ mod tests {
             }
             let _ = drive.as_mut().poll(&mut cx);
         }
+        handle.shutdown_now();
+        for _ in 0..200 {
+            if drive.as_mut().poll(&mut cx).is_ready() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn work_queued_while_the_driver_runs_is_seen_without_parking() {
+        // The flag-only path: work is queued while the driver is *running*, so
+        // there is no waker to take and nothing wakes anything. The next park
+        // must consume the flag and resolve rather than suspend.
+        //
+        // Asserted on passes rather than parks, because a park that ignored the
+        // flag would also suspend exactly once per poll — see the vacuity trap
+        // recorded in docs/testing.md.
+        let ring = IoRing::builder().build().unwrap();
+        let driver = Driver::new(ring).unwrap();
+        let handle = driver.handle();
+
+        let waker = CountingWake::new();
+        let w = std::task::Waker::from(std::sync::Arc::clone(&waker));
+        let mut cx = Context::from_waker(&w);
+        let drive = driver.drive();
+        futures::pin_mut!(drive);
+
+        // A poll with nothing outstanding: one pass, then it parks.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            1,
+            "an idle poll should run exactly one pass"
+        );
+
+        // Control: polling again while still parked resumes *inside* the park,
+        // so with nothing to report it runs no pass at all. This is what makes
+        // the assertion below meaningful rather than a count of polls.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            0,
+            "a re-poll with nothing outstanding must not run a pass"
+        );
+
+        // Raise the flag the way code inside a pass does — mark only, no waker
+        // taken, nothing woken.
+        let wakes_before = waker.count();
+        driver.inner.borrow_mut().mark_nudged();
+        assert_eq!(
+            waker.count(),
+            wakes_before,
+            "marking must not wake; this is the path where no waker exists"
+        );
+
+        // The park must now resolve on the flag alone and let a pass run,
+        // rather than suspending on work it has already been told about.
+        let before = driver.inner.borrow().passes;
+        assert!(drive.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(
+            driver.inner.borrow().passes - before,
+            1,
+            "the park must resolve on the flag and run a pass, not suspend"
+        );
+        assert!(
+            !driver.inner.borrow().nudged,
+            "the park must consume the flag"
+        );
+
         handle.shutdown_now();
         for _ in 0..200 {
             if drive.as_mut().poll(&mut cx).is_ready() {

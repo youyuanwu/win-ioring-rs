@@ -182,7 +182,9 @@ this becomes a recurring worry.
 ### Two faster dispatch mechanisms were measured and not taken
 
 Getting a signalled event to the driver's thread costs about 4.3 µs through the
-OS thread pool, which is now the single largest remaining item in a park.
+OS thread pool, which is now the single largest remaining item in a park. (That
+figure and the one below come from the original investigation run, not from the
+retained measurement artifacts, and are approximate.)
 
 - **A dedicated waiter thread** measured 1.66 µs — roughly 2.6x faster. Rejected
   because it costs one OS thread per driver, which sits badly with a crate whose
