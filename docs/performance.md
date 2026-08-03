@@ -208,10 +208,39 @@ where this crate is ahead.
 the bytes of a 4 KiB one, and write-then-read pays a file-system write path the
 read scenarios never touch. Compare down a group of four rows, not across them.
 
-Every relative figure in this table was reproduced by a second full run of the
-same binary, with the largest disagreement being random read at depth 64 with
-owned buffers (1.75x against 1.40x). Treat one significant figure of a relative
-as solid and two as optimistic.
+**What a second full run reproduced, and what it did not.** The same binary was
+run again minutes later against this run as a stored baseline — the same binary
+in the checkable sense: `sequential-read/tokio-pool-1/1` came back at 27.521 ms
+against the 27.540 ms above, a reported change of −0.07%. Recomputing every
+relative from that run's own absolutes:
+
+- **The direction of each ring backend against `tokio::fs (pool 1)` reproduced in
+  all eighteen ring cells.** Ahead at depth 1 in all three scenarios, behind at
+  depths 8 and 64 in all three. That is the comparison this document is about, and
+  it is the one that held.
+- **The magnitudes moved, by up to 0.36 in the relative.** Random read at depth 64
+  read 2.32x for `tokio-pool-512` against 1.96x, and 1.75x for owned buffers
+  against 1.40x. A relative from this table is good to its direction and its rough
+  size, not to a decimal — and not, on this evidence, even to one significant
+  figure, since 1.75x and 1.40x do not share one.
+- **The `tokio-pool-1`-against-`tokio-pool-512` comparison did not reproduce.** It
+  reversed which of the two was faster in four of its nine cells: sequential read
+  at depths 1 and 8, and write-then-read at depths 1 and 8, all of them cells
+  where the two are within a few percent of each other. Read those cells as "no
+  difference measured", not as a ranking.
+- **The two ring backends' order against each other flipped in two cells** —
+  random read at depth 1 and write-then-read at depth 8 — which is the same fact
+  the "registration is behind in six of nine and ahead in three" reading below
+  rests on, and the reason that reading is given as "a few percent either way"
+  rather than as a winner.
+
+**This paragraph used to claim that every relative figure was reproduced**, with
+"the largest disagreement being random read at depth 64 with owned buffers (1.75x
+against 1.40x)", and advised treating one significant figure as solid. Four cells
+reverse direction between the two runs, and 1.75x against 1.40x is itself a
+disagreement in the first significant figure, so both halves were wrong. The
+1.75x that the headline and `README.md` quote as the top of the loss range is a
+figure from one run; the second put that cell at 1.40x.
 
 ## What changed when the instrument changed
 
@@ -229,21 +258,43 @@ moved per-I/O cost by **1.01x to 1.25x**, against a gap of 0.47x to 0.64x. The
 operation count is not the cause and the specification's assumption — that
 shrinking it does not change per-operation economics — survives.
 
-The cause is **repetition**. The old harness ran each scenario six times: one
-discarded warm-up and five repeats. Criterion runs it as many times as a hundred
-samples take, which on this matrix is 131 to 1311 iterations of the *same
-deterministic offset sequence*. The bytes an iteration touches are therefore
-revisited one to two orders of magnitude more often, and on a processor with
-16 MiB of L3 a 2 MiB or 16 MiB touched set revisited that often is resident in
-cache, not merely in the page cache both harnesses warmed. The effect tracks that
-explanation across scenarios: largest on random read (2 MiB touched, 0.39x–0.60x),
-similar on sequential read (16 MiB, right at the cache boundary, 0.50x–0.57x),
-and smallest by a factor of three on write-then-read (0.75x–0.94x), whose write
-half goes through a path no amount of read-side residency accelerates.
+The most likely cause is **repetition**, and it is a hypothesis, not a finding.
+The old harness ran each scenario six times: one discarded warm-up and five
+repeats. Criterion runs it as many times as a hundred samples take, which on this
+matrix is 131 to 1311 iterations of the *same deterministic offset sequence*. The
+bytes an iteration touches are therefore revisited one to two orders of magnitude
+more often. What that revisiting buys was **not** measured: no cache counter was
+read, and no configuration was run that varies data residency while holding
+repetition fixed. Two of this document's own numbers sit badly with a
+cache-residency story in particular — the old harness's random read already
+touched only 4 MiB per repeat, comfortably inside this host's 16 MiB L3, yet
+random read shows the *largest* shift (0.39x–0.60x); and sequential read's
+touched set shrank sixteenfold, from far outside L3 to its boundary, yet moved by
+the same factor (0.50x–0.57x). Sustained load is at least as plausible a
+contributor: a three-second continuously loaded sampling window versus six short
+bursts differs in boost residency, core parking and thread-pool settling, which
+would also explain why `tokio-pool-1`, the most thread-hop-bound backend, moved
+as much as the ring ones. Write-then-read moved least (0.75x–0.94x), and its
+write half is the part no read-side effect of any kind accelerates.
 
-That is a fact about benchmarking, not about this crate. Every backend moved by
-roughly the same factor, including the two `tokio::fs` backends, which nothing in
-this repository can make faster.
+**The conclusion does not rest on the mechanism.** What rules out a regression in
+this crate is that all four backends moved by roughly the same factor —
+including the two `tokio::fs` backends, which nothing in this repository can make
+faster — and that the *relative* column is stable across the change. For owned
+buffers against `tokio::fs (pool 1)`, in the eight cells whose pre-change side is
+trustworthy: seq d8 1.18→1.10, seq d64 1.17→1.22, rand d1 0.63→0.55, rand d8
+1.89→1.50, rand d64 1.65→1.75, wtr d1 0.93→0.86, wtr d8 1.19→1.16, wtr d64
+1.17→1.12. A regression in this crate would move the ring backends *relative to*
+the pool backends. Nothing does, except the one cell already recorded below as
+inconclusive — which is excluded from that list precisely because its pre-change
+`tokio-pool-1` figure is the untrustworthy one.
+
+**This section used to assert the mechanism as established** — "The cause is
+**repetition** … a 2 MiB or 16 MiB touched set revisited that often is resident in
+cache … The effect tracks that explanation across scenarios". The diagnostic that
+was run refuted the *rival* explanation, the operation count; it established
+nothing about residency. The correction is recorded here rather than made
+silently, because the strong argument was buried under the weak one.
 
 **One cell is unresolved and is recorded as such**: sequential read at depth 1
 with the narrow blocking pool reads as 1.20x *slower*, the only cell in the wrong
@@ -278,13 +329,24 @@ typed a filter; the combinations it did not time are marked
 
 **Read the verdicts against this host's noise floor, not against zero.** Running
 the suite twice with no change at all between the runs produced a "significant"
-verdict for **17 of 36** benchmarks, in both directions, all within ±17% and with
-a mean change-interval width of 8 points. Criterion's default noise threshold is
-1%, so on a machine that drifts by 5–10% over three minutes it will report
-changes that are real drift and not real regressions. The threshold is
-deliberately not raised: a statistic tuned until the answer is comfortable is not
-a measurement. What the number is good for is a bound — a reported change under
-about 20% on this host means very little, and one of 40% means something.
+verdict for **17 of 36** benchmarks, in both directions. Two quantities, because
+they differ and the difference matters: the **point estimates** ran from −15.2%
+to +13.7%, while the **change intervals** those estimates sit in reached from
+−17.6% (sequential read, depth 8, `tokio-pool-1`) to +23.7% (write then read,
+depth 8, `ioring-registered`), with a mean interval width of 8 points.
+Criterion's default noise threshold is 1%, so on a machine that drifts this far
+over three minutes it will report changes that are real drift and not real
+regressions. The threshold is deliberately not raised: a statistic tuned until
+the answer is comfortable is not a measurement. What the number is good for is a
+bound — on this host, a reported change whose interval lies inside roughly
+−18% to +24% is indistinguishable from an unchanged tree, and one of 40% is not.
+
+**That bound used to be published as "±17%"**, which is neither of the two
+quantities above: the point estimates never reached 17% and the intervals went
+past 24%. The nearest 17 in the data is `parse.py`'s "widest change-interval
+**width**: 17.43 points", a different quantity from a bound on a change, and the
+two look to have been conflated. `docs/pending-work.md` leaned on the ±17%
+figure as an envelope and is corrected with it.
 
 ## The fairness account
 

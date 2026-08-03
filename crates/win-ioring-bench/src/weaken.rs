@@ -40,12 +40,52 @@
 //!
 //! An implementer who removes either constraint produces a weakening that fails
 //! for the wrong reason or does not weaken at all.
+//!
+//! # One weakening varies between runs, and has to
+//!
+//! [`Weakness::HollowFromRun`] is the only weakening that behaves differently on
+//! different runs of the same combination, and it exists because two properties
+//! of [`crate::harness::measure_combination`] cannot be observed by a weakening
+//! that does not: that the trace handed to the ledger comes from the last
+//! **timed** iteration rather than from the untimed warm-up, and that a backend
+//! drifting *between* iterations is rejected. A uniform weakening makes the
+//! warm-up and every iteration alike, so a measurement that verified the wrong
+//! one of them looks identical. Its counter is a thread-local rather than state
+//! on the wrapper, because the wrapper is rebuilt for every run; see
+//! [`reset_runs`].
 
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
 
 use crate::backend::{Backend, Buffer, OpResult};
+
+thread_local! {
+    /// How many runs weakened by [`Weakness::HollowFromRun`] this thread has
+    /// begun since the last [`reset_runs`].
+    ///
+    /// Per thread rather than global: one combination's runs — the warm-up and
+    /// every iteration — all happen on the thread that called `block_on`, and a
+    /// process-global counter would be raced by the test binary's other threads.
+    static RUNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Forgets how many runs this thread has begun.
+///
+/// Call before each combination measured with [`Weakness::HollowFromRun`], so
+/// the run index that weakening counts from is that combination's own.
+pub fn reset_runs() {
+    RUNS.with(|runs| runs.set(0));
+}
+
+/// Returns the index of the run starting now and counts it.
+fn next_run() -> usize {
+    RUNS.with(|runs| {
+        let index = runs.get();
+        runs.set(index + 1);
+        index
+    })
+}
 
 /// How a backend has been weakened.
 ///
@@ -69,6 +109,17 @@ pub enum Weakness {
     /// The exact shape of the registered-read defect that motivated the digest:
     /// a transfer count with nothing readable behind it.
     HollowDelivery,
+    /// [`Weakness::HollowDelivery`], but only from the given run of the job
+    /// onward — the untimed warm-up being run 0, the first timed iteration run 1
+    /// and so on, counted per thread from the last [`reset_runs`].
+    ///
+    /// The only weakening that is not the same on every run, and the only one
+    /// that can say *which* run's trace a measurement verified. With `1` the
+    /// warm-up is honest and every timed iteration is hollow, so a measurement
+    /// that verified the warm-up would report a weakened run as clean. With `2`
+    /// and two timed iterations the first is honest and the last is not, which
+    /// nothing but the first-versus-last comparison can catch.
+    HollowFromRun(usize),
 }
 
 /// The byte a hollow delivery fills with.
@@ -92,6 +143,12 @@ pub const SKIP_EVERY: usize = 4;
 pub struct Weakened<'a, B: Backend> {
     inner: &'a B,
     weakness: Weakness,
+    /// Whether *this* run delivers hollow buffers.
+    ///
+    /// Decided once, when the wrapper is built, because
+    /// [`Weakness::HollowFromRun`] is a property of the run rather than of the
+    /// operation and consulting the counter per operation would advance it.
+    hollow: bool,
     /// How many reads have been issued, so the skip is deterministic: the
     /// scenario calls `read_at` in issue order even though completions arrive in
     /// any order.
@@ -101,9 +158,15 @@ pub struct Weakened<'a, B: Backend> {
 impl<'a, B: Backend> Weakened<'a, B> {
     /// Wraps `inner`, weakened as `weakness` says.
     pub fn new(inner: &'a B, weakness: Weakness) -> Self {
+        let hollow = match weakness {
+            Weakness::HollowDelivery => true,
+            Weakness::HollowFromRun(from) => next_run() >= from,
+            Weakness::None | Weakness::SkipsWork => false,
+        };
         Self {
             inner,
             weakness,
+            hollow,
             reads: Cell::new(0),
         }
     }
@@ -113,13 +176,12 @@ impl<'a, B: Backend> Weakened<'a, B> {
         self.weakness == Weakness::SkipsWork && index.is_multiple_of(SKIP_EVERY)
     }
 
-    /// Overwrites what an operation delivered, if this weakening is the hollow
-    /// one.
+    /// Overwrites what an operation delivered, if this run is a hollow one.
     ///
     /// Applied *after* the operation completed, so a write still puts the honest
     /// bytes on disk and only the trace's view of what came back is hollowed.
     fn hollow(&self, transferred: u32, buffer: &mut B::Buf) -> io::Result<()> {
-        if self.weakness != Weakness::HollowDelivery {
+        if !self.hollow {
             return Ok(());
         }
         buffer.fill(&vec![HOLLOW; transferred as usize])

@@ -195,8 +195,14 @@ compares against a **baseline**, so `cargo bench -p win-ioring-bench --
 reports, per benchmark, a change interval and a verdict. That is a committed
 guard on **end-to-end per-operation cost**, and a regression in the park path
 large enough to move the depth-1 figures would show up in it — the wake-path work
-moved random read at depth 1 by 38%, and a change of that order is far outside
-the ±17% this host's own run-to-run noise produces.
+moved random read at depth 1 by 38%, against a null run of this host whose change
+intervals reached −18% to +24% on an unchanged tree. So 38% is larger than
+anything the noise produced, but by roughly a factor of 1.6, not by an order of
+magnitude: this guard catches a regression of that size and would not reliably
+catch one half of it. (This sentence previously compared 38% against "the ±17%
+this host's own run-to-run noise produces". That figure is not what the null run
+measured — see [performance.md](performance.md) — and it was doing load-bearing
+work here, which is why it is corrected rather than dropped.)
 
 Three things it still does not do, and all three matter:
 
@@ -260,6 +266,19 @@ quantity under a different instrument and not a new datum on this question.
 
 ## Test coverage gaps
 
+- **The weakening tests never weaken a ring backend.** The three tests in
+  `crates/win-ioring-bench/tests/fairness.rs` that require a weakened run to be
+  rejected take fixed positions from the available-backend list, and the two
+  `tokio::fs` backends are always first, so `tokio-pool-1` and `tokio-pool-512`
+  are the only backends ever weakened — on a host with an I/O ring as much as on
+  one without. The rejection they establish is a property of
+  `harness::measure_combination`, which is backend-agnostic, and the honest
+  control case does run all four; but `Weakness::HollowDelivery` exists because
+  the *registered* backend once reported transfer counts with nothing readable
+  behind them, and that is the backend the weakening never reaches. Looping the
+  weakening over every available backend, weakening backend *i* against an honest
+  reference, would close it, at the cost of the extra combinations' run time in
+  every `cargo test`.
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and
   `register_buffers`, but not for `register_files`, `read_registered` or
   `write_registered` — all three implement the check.
@@ -275,6 +294,18 @@ quantity under a different instrument and not a new datum on this question.
 
 ## Minor
 
+- **`cargo bench -p win-ioring-bench -- --list` builds the full working set.**
+  `--list` sets `bench=true, test=false`, so `test_mode()` correctly reports a
+  benchmark run and `Config::default()` is selected; Criterion's list mode then
+  never invokes a routine. The result is that merely asking which benchmarks
+  exist creates the 256 MiB read file, walks all thirty-six combinations through
+  preparation, warm-up, verification and teardown, and reports every one of them
+  as verified but not timed — minutes of I/O for a list of names. Detecting
+  `--list` alongside `--test` and using `Config::small()`, or returning before
+  preparation, would fix it. Not fixed inside the Criterion migration because
+  every additional argument `test_mode()` reads is another way for a benchmark
+  run to be misclassified as a test run, which is the failure that would silently
+  publish figures from the small configuration.
 - `cancel_holds` is a `Vec` cleared with a linear `retain` on every cancel
   completion. O(n) per completion; a `HashMap` would be O(1). Only matters at
   high cancel volume.

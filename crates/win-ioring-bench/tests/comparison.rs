@@ -453,14 +453,22 @@ fn the_write_file_does_not_grow_across_iterations() {
 
 /// SC-014: a driver is built once per combination, not once per iteration.
 ///
-/// **A lower bound, deliberately.** `drivers_built()` is a process-global
-/// counter and this binary runs its tests on several threads at once, so other
-/// tests here that build ring backends bump it between this test's two reads. An
-/// exact delta would fail intermittently, and a test that fails for reasons
-/// unrelated to its subject teaches a reader to ignore it. The lower bound still
-/// catches what SC-014 exists to exclude — a driver per iteration would be off
-/// by three orders of magnitude, not by a handful. The exact figure is settled
-/// in Phase 5, from a full `cargo bench` run in a process of its own.
+/// **A lower bound, and one that excludes only the too-few case.**
+/// `drivers_built()` is a process-global counter and this binary runs its tests
+/// on several threads at once, so other tests here that build ring backends bump
+/// it between this test's two reads. An exact delta would fail intermittently,
+/// and a test that fails for reasons unrelated to its subject teaches a reader to
+/// ignore it. The price is that this assertion cannot see an *excess*: under a
+/// driver-per-iteration implementation `built` would be far larger than
+/// `combinations` and `built >= combinations` would hold just as happily. What
+/// it establishes is that a driver is not shared between combinations or skipped
+/// altogether — the failure a per-combination design invites in the other
+/// direction.
+///
+/// The too-many case is settled outside this test, deliberately: by the full
+/// `cargo bench` run in Phase 5, in a process that builds nothing else, and by
+/// the fairness account's own line, which prints drivers built against ring
+/// combinations measured and marks the two when they differ.
 #[test]
 fn one_driver_is_built_per_combination() {
     if !ring_available() {

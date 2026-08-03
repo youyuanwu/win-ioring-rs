@@ -20,7 +20,7 @@ use win_ioring_bench::fairness::{FairnessFailure, Ledger};
 use win_ioring_bench::harness::{Job, Record, Untimed, Which, measure_combination};
 use win_ioring_bench::scenario::Scenario;
 use win_ioring_bench::verify::{Mismatch, Trace};
-use win_ioring_bench::weaken::Weakness;
+use win_ioring_bench::weaken::{self, Weakness};
 use win_ioring_bench::workload;
 
 /// The depth these run at.
@@ -51,10 +51,18 @@ fn prepare(tag: &str, config: &Config) -> (std::path::PathBuf, std::path::PathBu
 
 /// The backends this host can actually run.
 ///
-/// The two thread-pool backends are always available, so a host without a ring
-/// still runs every test below against two real backends rather than skipping
-/// them — a weakened-backend test that quietly did nothing would be worse than
-/// no test at all.
+/// The two thread-pool backends are always available and are ordered first, so a
+/// host without a ring still runs every test below against real backends rather
+/// than skipping them — a weakened-backend test that quietly did nothing would be
+/// worse than no test at all.
+///
+/// **Only [`an_honest_matrix_agrees`] walks the whole list.** The weakening tests
+/// take fixed positions from it, so on every host — ring or not — they weaken
+/// `tokio-pool-1` or `tokio-pool-512` and never a ring backend. The weakening is
+/// applied inside `harness::measure_combination`, which is backend-agnostic, so
+/// this establishes the rejection rather than any one backend's honesty; that the
+/// ring backends are honest is what the control case above establishes. The gap
+/// is recorded in `docs/pending-work.md`.
 fn available() -> Vec<Which> {
     let mut backends = vec![Which::TokioOne, Which::TokioMany];
     if matches!(ioring::availability(), Availability::Available) {
@@ -239,6 +247,91 @@ fn a_weakened_backend_still_issues_the_same_operations() {
                 scenario.name()
             );
         }
+    }
+}
+
+/// The trace that reaches the ledger comes from a **timed** iteration, not from
+/// the untimed warm-up.
+///
+/// [`measure_combination`] runs an untimed warm-up before handing the closure to
+/// the timer, and verifies the last timed iteration rather than that warm-up.
+/// Every other weakening here is uniform across runs, so it is caught either
+/// way and none of them can tell the two apart: a measurement that verified the
+/// warm-up instead would leave the whole suite green. This one weakens from the
+/// first timed iteration onward, leaving the warm-up honest, so it is rejected
+/// only if what the ledger saw came from a timed iteration.
+#[test]
+fn the_warm_up_is_not_what_gets_verified() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("warm-up", &config);
+
+    for scenario in Scenario::all() {
+        let job = job(scenario, &read_path, &write_path, &config);
+        let backends = available();
+        let mut ledger = Ledger::new();
+
+        run(backends[0], Weakness::None, &config, &job, &mut ledger)
+            .unwrap_or_else(|f| panic!("the reference backend was rejected: {f}"));
+
+        weaken::reset_runs();
+        let failure = run(
+            backends[1],
+            Weakness::HollowFromRun(1),
+            &config,
+            &job,
+            &mut ledger,
+        )
+        .expect_err("a backend hollow in every timed iteration must be rejected");
+        assert!(
+            matches!(failure.mismatch, Mismatch::Delivered { .. }),
+            "{} was rejected for the wrong reason: {failure}",
+            scenario.name()
+        );
+    }
+}
+
+/// A backend that does not do the same work on every iteration fails a run.
+///
+/// SC-005 asks that removing a verification step break a test; this is the test
+/// for the first-versus-last comparison, which the two recorded mutations did
+/// not reach — deleting it left the whole suite green.
+///
+/// Weakened from the *last* iteration onward, so the warm-up and the first timed
+/// iteration are honest and only the last is not. Its own ledger, with no other
+/// backend in front of it, so the cross-backend comparison cannot be what
+/// rejects it: the first-versus-last comparison inside
+/// [`measure_combination`] is the only thing left that can.
+#[test]
+fn a_backend_that_drifts_between_iterations_fails_a_run() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("drifts", &config);
+
+    for scenario in Scenario::all() {
+        let job = job(scenario, &read_path, &write_path, &config);
+        let mut ledger = Ledger::new();
+
+        weaken::reset_runs();
+        let failure = run(
+            available()[0],
+            // Run 0 is the warm-up and run 1 the first timed iteration, so with
+            // ITERATIONS = 2 this hollows the last iteration and nothing else.
+            Weakness::HollowFromRun(ITERATIONS),
+            &config,
+            &job,
+            &mut ledger,
+        )
+        .expect_err("a backend that changed between iterations must be rejected");
+        assert!(
+            failure.reference.contains("first iteration")
+                && failure.backend.contains("last iteration"),
+            "{} was rejected by something other than the first-versus-last check: {failure}",
+            scenario.name()
+        );
+        assert!(
+            matches!(failure.mismatch, Mismatch::Delivered { .. }),
+            "{} was rejected for the wrong reason: {failure}",
+            scenario.name()
+        );
     }
 }
 

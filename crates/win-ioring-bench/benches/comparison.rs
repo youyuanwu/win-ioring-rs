@@ -175,9 +175,27 @@ fn test_mode() -> bool {
     !bench || test
 }
 
+/// Whether a positional benchmark filter was given on the command line.
+///
+/// Criterion's filter is positional, so anything that is not a flag is read here
+/// as one. Deliberately over-reporting: an option's *value* looks positional too,
+/// and every mistake this makes switches the check below **off**. A check that
+/// switched itself on by mistake would fail a legitimate run.
+fn filtered() -> bool {
+    std::env::args().skip(1).any(|arg| !arg.starts_with('-'))
+}
+
 /// The run proper, with a failure path that can return.
 fn run(c: &mut Criterion) -> Result<(), i32> {
     let test_mode = test_mode();
+    // `CriterionTimer` below is the only `Timer` a published figure ever passes
+    // through, and the library's own tests cannot reach it — they use `Untimed`,
+    // which by design times nothing. An unfiltered test run is the one place
+    // where Criterion invokes every routine, so it is where a timer that had
+    // stopped driving the closure `measure_combination` handed it — timing some
+    // other work, or none — is caught. `timed` is false exactly when that
+    // closure never ran.
+    let every_combination_must_be_timed = test_mode && !filtered();
     let config = if test_mode {
         eprintln!("running the small configuration (a test run, not a benchmark run)");
         Config::small()
@@ -277,7 +295,15 @@ fn run(c: &mut Criterion) -> Result<(), i32> {
                         return Err(1);
                     }
                 };
-                if let Record::Measured { name, .. } = &record {
+                if let Record::Measured { name, timed, .. } = &record {
+                    if every_combination_must_be_timed && !*timed {
+                        eprintln!(
+                            "TIMER FAILURE {name} on {}/{depth} was prepared and verified but \
+                             never timed: the timer did not run the work it was given",
+                            scenario.slug()
+                        );
+                        return Err(1);
+                    }
                     if which.builds_a_driver() {
                         ring_combinations += 1;
                     }

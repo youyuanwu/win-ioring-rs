@@ -422,11 +422,23 @@ impl Account {
         // thread-pool backends build no driver, so 36 measured combinations
         // build 18 drivers and reading SC-014 against 36 would fail a correct
         // run.
+        //
+        // The narrative clause is conditional on the two numbers, because the
+        // reassuring version of this line is the one a reader would most want to
+        // be able to trust: printing "one per combination, not one per
+        // iteration" beside 1800 and 18 would be the exact false comfort the
+        // line exists to prevent. Same shape as the write-file line below.
         writeln!(
             out,
-            "- drivers built: {} against {} ring combinations measured — one per combination, \
-             not one per iteration (the thread-pool backends build none)",
-            self.drivers_built, self.ring_combinations
+            "- drivers built: {} against {} ring combinations measured — {} (the thread-pool \
+             backends build none)",
+            self.drivers_built,
+            self.ring_combinations,
+            if self.drivers_built == self.ring_combinations {
+                "one per combination, not one per iteration"
+            } else {
+                "**NOT ONE PER COMBINATION**"
+            }
         )
         .unwrap();
         match self.write_file_bytes {
@@ -604,6 +616,33 @@ mod tests {
                 "the account did not report {expected:?}:\n{rendered}"
             );
         }
+    }
+
+    /// The reassuring half of the driver line is a claim, so it must be
+    /// conditional on the numbers beside it.
+    ///
+    /// A run that built a driver per iteration is exactly the run whose reader
+    /// needs to be told so, and it is the run in which an unconditional "one per
+    /// combination, not one per iteration" would be most convincing and most
+    /// wrong.
+    #[test]
+    fn a_driver_count_that_does_not_match_is_not_reported_as_if_it_did() {
+        let mut account = account();
+        account.ring_combinations = 2;
+        account.drivers_built = 1800;
+
+        let rendered = account.render();
+        assert!(
+            rendered.contains(
+                "drivers built: 1800 against 2 ring combinations measured — **NOT \
+                 ONE PER COMBINATION**"
+            ),
+            "a mismatched driver count was not marked:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("one per combination, not one per iteration"),
+            "a mismatched driver count still claimed one driver per combination:\n{rendered}"
+        );
     }
 
     /// A backend that failed must not be reportable as a run that succeeded.
