@@ -19,9 +19,14 @@ caller ──> Handle ──┐                    ┌──> IoRing (unsafe lay
                     │    (Rc<RefCell>)   │
 Driver::drive() ────┘                    └──> OpSlab (operation storage)
                           ▲
-                          │ waker signalled from an OS thread pool thread
-                    AsyncEvent (completion event)
+                          │ waker signalled from an OS thread pool thread —
+                          │ the crate's only thread boundary
+                    ArmedEvent (completion event, one wait armed for life)
 ```
+
+Queuing work does not appear in that diagram, because it does not cross
+anything: `Handle` raises a flag on `DriverInner` and wakes the driver's own
+waker, all on the caller's thread.
 
 - `io_ring` — an unsafe, one-for-one wrapper over all fourteen platform entry
   points. No lifetime tracking. Every method that hands the kernel a resource is
@@ -318,15 +323,82 @@ is worked through in [buffer-ownership.md](buffer-ownership.md).
 `Driver` and `Handle` share state through `Rc` and `RefCell` and are `!Send`. The
 compiler enforces it and a `compile_fail` doc-test asserts it.
 
-The one genuine thread boundary is `sys::AsyncEvent`. The completion event is
-waited on via `RegisterWaitForSingleObject`, whose callback runs on an OS thread
-pool thread. The shared state handed to that callback is an `Arc` whose reference
-count is deliberately given to the OS and reclaimed **exactly once** — either by
-the callback, or by a blocking `UnregisterWaitEx(handle, INVALID_HANDLE_VALUE)`
-that proves the callback will never run. The `callback_ran` flag is checked
-*first* to avoid deadlocking against the callback the caller is inside.
+The one genuine thread boundary is the completion event's thread-pool wait. It
+is genuinely the only one. There used to appear to be a second — a `wake` event
+the application signalled to tell the driver work was queued — but everything
+that could signal it holds `Rc`s, so it only ever travelled between two points on
+the driver's own thread, by way of a kernel object and an OS thread pool. That
+cost more than the I/O it was announcing; see [performance.md](performance.md).
 
-That blocking `UnregisterWaitEx` is load-bearing. Do not "optimise" it away.
+#### Waking the driver from its own thread
+
+The nudge is now `DriverInner::nudged`, a flag, plus `driver_waker`, the waker of
+whichever task is parked in `Driver::drive`.
+
+The flag is durable state rather than an edge, and that is load-bearing. Within
+one pass the driver releases its borrow and calls back into caller code twice —
+waking futures and delivering reports — and either can queue work or request
+shutdown, *after* the pass has already read whether it should keep going. A
+signal that had to be caught in flight could be raised in that window and missed.
+A flag raised there is still set when the park consults it.
+
+The remaining window — between the park consulting the flag and the park being
+suspended — is closed by construction. `Park::poll` consumes the nudge and arms
+the wait in one `poll`, on one thread, with no `await`, no callback into caller
+code and no re-entrant path between them. A nudge can only be raised by code
+holding an `Rc` to the driver, which is to say by code on the driver's own
+thread; while that `poll` runs, that thread is running that `poll`. So a nudge is
+either raised before the check and seen by it, or raised after the poll returns
+`Pending`, by which time the waker is visible to whoever raises it. There is no
+third case.
+
+`nudged` is deliberately *not* `pending_submit`, although the two are raised at
+the same moments. `pending_submit` means "entries are queued and the kernel has
+not taken them", is cleared by a successful `submit_pending` at the head of every
+pass — before the park decision is reached — and is never set by
+`Handle::escalate`. Reusing it would have left a shutdown request with no record
+at all.
+
+#### The wait is armed once, not once per park
+
+`sys::ArmedEvent` owns an auto-reset event and one `RegisterWaitForSingleObject`
+registration created in its constructor and torn down in `Drop`. The
+registration omits `WT_EXECUTEONLYONCE`, so the OS re-arms it after every
+callback and it serves every park for the driver's life.
+
+That flag's absence is why the type owns its event rather than accepting one.
+The platform's guidance is that an object which stays signalled — a manual-reset
+event — must not be registered without it, or the callback "might be called too
+many times before the event is reset". An auto-reset event is a requirement here,
+not a preference, and constructing it inside makes handing the type the wrong
+kind unrepresentable rather than merely documented.
+
+The signal is **sticky**; the waker is not. A completion raised while nobody is
+polling — between two parks, or while the driver is mid-pass — must still be seen
+by the next poll, or it would be announced to nobody and the driver would park on
+work the platform has already finished. The waker, by contrast, is replaced on
+every poll, because the task driving may not be the one that parked last time.
+
+The reference count handed to the OS belongs to the registration for its whole
+life. The callback borrows the shared state without touching the count, and
+`Drop` reclaims it **exactly once**, after a blocking
+`UnregisterWaitEx(handle, INVALID_HANDLE_VALUE)` has proved that no callback is
+running or can start. There is no `callback_ran` flag and no question of who
+reclaims.
+
+That blocking `UnregisterWaitEx` is load-bearing. Do not "optimise" it away. It
+orders the unregister before the handle closes — the platform calls closing a
+handle with a wait still pending undefined — and it is what makes the count safe
+to reclaim. If it *fails*, `Drop` reclaims nothing and closes nothing: it leaks
+both, deliberately, because the alternatives are undefined behaviour.
+
+Taking that single blocking path is sound only because `Drop` can never run on a
+callback thread. `ArmedEvent` is `pub(crate)` and carries a
+`PhantomData<*const ()>` so it is `!Send` by construction, which makes that a
+property the compiler checks rather than one a reviewer must remember. Making it
+public would give the guarantee away and require the two-path teardown back —
+non-blocking unregister when dropping from inside the callback, blocking
+otherwise, with the reclaim deferred to callback exit.
 
 ### Recurring hazards
 
@@ -344,3 +416,14 @@ checking for in any change:
   prove the *submitted* drop path ran. Asserting an operation is still
   outstanding after a drop is racy for a small local read unless nothing has
   awaited in between.
+- **Consuming the nudge anywhere other than the park.** `take_nudge` is the only
+  place the flag may be cleared. Clearing it elsewhere lets the driver park on
+  work it has been told about and will not be told about again.
+- **Storing the driver's waker beyond the parked window.** `driver_waker` is
+  documented as occupied only while parked. A waker left there keeps an
+  abandoned driving task alive and makes "is the driver parked" unanswerable.
+- **Asserting on park counts instead of pass counts.** A driver whose park
+  ignored the nudge entirely still parks once per poll, so a park counter cannot
+  tell "the nudge was honoured" from "the wait re-armed and suspended again".
+  One of this crate's own wakeup tests passed against exactly that broken variant
+  until it was changed to assert on passes.

@@ -33,7 +33,9 @@ already have. Everything else goes through the `Handle` the driver gives you.
 The driver and its handle are single-threaded by design: they share state
 through `Rc` and are `!Send`, which the compiler enforces. Completions are
 signalled from an OS thread pool thread, so the *waker* crosses threads, but the
-ring itself never does.
+ring itself never does — and that is the only thread boundary in the crate.
+Queuing work does not cross one: it raises a flag on the driver and wakes the
+driver's own waker, on your thread.
 
 ```rust,no_run
 use win_ioring::file::File;
@@ -138,11 +140,16 @@ println!("{:?}", &buffer[..result?  as usize]);
 
 ## Is it faster?
 
-Measured, in [docs/performance.md](docs/performance.md), and the short answer on
-that measurement is **no** — `tokio::fs` is at parity or ahead almost everywhere.
+Measured, in [docs/performance.md](docs/performance.md), and the short answer is
+**sometimes, and only at low concurrency**. At one operation in flight this crate
+now edges ahead of `tokio::fs` on random reads and on write-then-read; at eight
+and sixty-four operations in flight, and on 64 KiB sequential reads, `tokio::fs`
+is still ahead by 1.18x to 1.90x.
+
 Run it yourself with `cargo run -p win-ioring-bench --release`; the harness runs
 one piece of application logic against every backend and rejects any run that did
-not do identical work.
+not do identical work. Treat the absolute figures as one host on one day — that
+document explains why, at some length.
 
 ## The unsafe layer
 

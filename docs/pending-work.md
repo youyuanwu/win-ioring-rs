@@ -162,6 +162,58 @@ loop until the queue accepts the entries. Bounded in practice — the entries ar
 accepted as soon as there is room — but it is a busy-wait, and the same waitable
 timer that would fix the submission retry above would fix this.
 
+## Wake path
+
+### There is no committed guard on park cost
+
+The driver's park machinery was measured at **13.99 µs per operation above the
+synchronous ring floor** at one operation in flight, and rewritten down to
+**2.46 µs**. Both figures came from a probe that was deleted afterwards, by
+decision: a benchmark nobody runs is a benchmark nobody maintains.
+
+The consequence is that nothing in this repository would catch a regression in
+that path. The comparison harness would notice a large one, but it cannot
+separate park cost from ring cost, so a small regression disappears into the
+difference between backends. Restoring the probe as a test with a threshold was
+considered and rejected as too brittle to be worth its maintenance; a
+lower-variance measurement of the same quantity would be the thing to build if
+this becomes a recurring worry.
+
+### Two faster dispatch mechanisms were measured and not taken
+
+Getting a signalled event to the driver's thread costs about 4.3 µs through the
+OS thread pool, which is now the single largest remaining item in a park.
+
+- **A dedicated waiter thread** measured 1.66 µs — roughly 2.6x faster. Rejected
+  because it costs one OS thread per driver, which sits badly with a crate whose
+  whole shape is "no hidden machinery".
+- **`WT_EXECUTEINWAITTHREAD`** would avoid queueing the callback to a worker
+  thread entirely. Rejected because it runs arbitrary executor wake code on a
+  shared wait thread, and the platform reference warns of deadlock when another
+  thread calls `UnregisterWaitEx` while the callback contends for a lock — which
+  is exactly the shape of this crate's teardown.
+
+### The always-armed registration has a standing cost
+
+The completion wait is armed for the driver's whole life, so the OS dispatches a
+callback for every completion signal even on passes where the driver is not
+parked and will find the work itself. That callback is paid on a pool thread and
+costs the driver one uncontended mutex acquisition. Measured harmless at eight
+and sixty-four operations in flight — per-operation cost fell at both — but it is
+a real cost that a workload with very high completion rates and a rarely-parked
+driver would pay.
+
+### The harness and a direct probe disagree by about 4 µs per operation
+
+At sixty-four operations in flight on random reads, the comparison harness
+reports roughly 9.3 µs per operation for this crate where a direct probe over the
+same shape of work measures roughly 5.1 µs. Both were measured on the same host.
+The difference belongs to something in the harness — trace recording, the
+verification digest, the work loop's own bookkeeping — and has not been chased
+down. It does not affect the harness's *comparisons*, since every backend pays
+it, but it means the harness's absolute figures are not a measurement of the
+crate alone.
+
 ## Test coverage gaps
 
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and

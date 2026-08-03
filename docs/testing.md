@@ -91,6 +91,24 @@ reaches has no reproducible natural failure mode:
 | `cancel_attempts: u32` | *observes* — how many cancellations were attempted |
 | `withhold_reaps: u32` | an operation that stays outstanding for a known number of drain steps |
 | `fail_next_registration: bool` | a registration that fails at completion time |
+| `parks: u32` | *observes* — how many times the driver actually suspended |
+| `passes: u32` | *observes* — how many times the driver loop ran a pass |
+
+Plus one outside `DriverInner`, on the wait primitive itself:
+
+| Seam | Reaches |
+|---|---|
+| `ArmedEvent::fail_next_arm()` | a `RegisterWaitForSingleObject` that fails, so a driver that cannot be woken reports rather than hangs |
+
+`fail_next_arm` is a thread-local rather than a global, so tests running in
+parallel cannot consume each other's injection. Verify by running the affected
+tests both with `--test-threads=1` and at the default parallelism.
+
+**`parks` and `passes` are both needed, and the distinction is the whole point.**
+A driver whose park ignored the nudge entirely still suspends once per poll, so
+`parks` alone cannot tell "the nudge was honoured" from "the wait re-armed and
+suspended again". Only a pass counter separates them. See the vacuity traps
+below — this one was caught by mutation, not by inspection.
 
 **Counted, not boolean, and that matters.** The drain is unbounded, so a seam
 that withheld reaping or refused cancellations *unconditionally* produces a test
@@ -177,6 +195,28 @@ the pattern recurs, not because the specific tests matter.
 - **After a read, `buf.len()` is the transferred count, not the original
   length.** Assert `capacity()` to prove the caller's own allocation came back;
   asserting `len()` proves only that a read happened.
+- **A park counter cannot prove a wakeup was honoured.** A test asserted that a
+  nudge raised against a parked driver increased the park count, and passed
+  against a driver whose park ignored nudges completely — because such a driver
+  still parks once per poll, so the count rises either way. It needed a separate
+  *pass* counter. Found by mutating `take_nudge` to consume the flag without
+  reporting it; two tests caught that mutation before the fix and four after.
+
+### Proving a wakeup cannot be lost
+
+The wakeup guarantee is the easiest thing in this crate to get subtly wrong and
+the hardest to catch, because a lost wakeup is a race that a passing test cannot
+distinguish from a won one. Two techniques carry most of the weight:
+
+- **Two wakers, and assert the old one was *not* used.** Poll the driver to a
+  park under waker A, re-poll under waker B, then raise the signal. Asserting
+  only that B fired lets a driver that wakes *both* pass; asserting that A's
+  count did not move is what proves the waker was replaced rather than
+  accumulated.
+- **Mutate, do not inspect.** Every test in this group was run against a
+  deliberately broken variant — `nudge()` returning `None`, `take_nudge()`
+  never reporting, `Drop for Park` not clearing its waker — and required to fail.
+  The counts above (two caught, then four) are the reason that is not optional.
 
 ### What cannot be tested here
 

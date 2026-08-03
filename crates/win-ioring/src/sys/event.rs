@@ -13,9 +13,9 @@ use windows::Win32::System::Threading::{
 /// raw [`crate::io_ring`] layer needs a completion event and a caller driving a
 /// ring by hand needs to be able to make one.
 ///
-/// Asynchronous waiting lives on [`ArmedEvent`] instead, which keeps one
-/// thread-pool registration armed for its whole life rather than creating one
-/// per wait.
+/// Asynchronous waiting lives on the crate-internal `ArmedEvent` instead, which
+/// keeps one thread-pool registration armed for its whole life rather than
+/// creating one per wait.
 pub struct AsyncEvent {
     handle: HANDLE,
 }

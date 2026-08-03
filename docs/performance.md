@@ -7,14 +7,15 @@ the working files it leaves under `target/bench-data`.
 
 ## The headline
 
-**On this measurement, `tokio::fs` is faster than this crate almost everywhere.**
-The IoRing backend is within a few percent at one operation in flight and 1.2× to
-2.2× slower as concurrency rises. Registration does not pay for itself: it is a
-consistent few percent behind even the owned-buffer path.
+**`tokio::fs` is still faster than this crate on most of what is measured here,
+but no longer on all of it.** At one operation in flight this crate now wins two
+of the three scenarios — random reads at 0.64x and write-then-read at 0.93x —
+having lost both before the driver's wake path was rewritten. Everywhere else it
+loses, by 1.18x to 1.90x.
 
-That is not the result the crate was built expecting, and it is stated first
-because a benchmark that only gets quoted when it flatters its author is worth
-nothing.
+That is a change of ranking, not just of numbers, and it is stated first because
+the previous revision of this document led with an unqualified loss and would
+have been quietly wrong to keep doing so.
 
 ## What is actually being measured
 
@@ -88,58 +89,108 @@ own interface** — read it beside that backend's configuration, not alone.
 
 ## Representative result
 
-Taken on a 16-logical-processor Windows host, 28 GiB memory, working files on an
-NVMe volume. Times in microseconds; `relative` is against the first row.
+Taken on a 16-logical-processor Windows host, working files on an NVMe volume.
+Times in microseconds; `relative` is against the first row.
 
 ```
 ## sequential read — depth 1, 4096 operations
-tokio::fs (blocking pool 1)          394051.4      1.00x
-tokio::fs (blocking pool 512)        386620.5      0.98x
-win-ioring (owned buffers)           404686.0      1.03x
-win-ioring (registered)              433112.3      1.10x
+tokio::fs (blocking pool 1)          371299.4      1.00x
+tokio::fs (blocking pool 512)        782989.9      2.11x
+win-ioring (owned buffers)           704884.9      1.90x
+win-ioring (registered)              714631.1      1.92x
 
-## sequential read — depth 64, 4096 operations
-tokio::fs (blocking pool 1)          256606.1      1.00x
-tokio::fs (blocking pool 512)        266071.6      1.04x
-win-ioring (owned buffers)           326977.3      1.27x
-win-ioring (registered)              329994.8      1.29x
+## random read — depth 1, 1024 operations
+tokio::fs (blocking pool 1)           54711.4      1.00x
+tokio::fs (blocking pool 512)         55040.4      1.01x
+win-ioring (owned buffers)            35221.9      0.64x
+win-ioring (registered)               37774.5      0.69x
 
 ## random read — depth 64, 1024 operations
-tokio::fs (blocking pool 1)            4927.6      1.00x
-tokio::fs (blocking pool 512)         10447.8      2.12x
-win-ioring (owned buffers)             9268.4      1.88x
-win-ioring (registered)               10787.3      2.19x
+tokio::fs (blocking pool 1)           11769.4      1.00x
+tokio::fs (blocking pool 512)         25973.0      2.21x
+win-ioring (owned buffers)            22245.9      1.89x
+win-ioring (registered)               24012.8      2.04x
+
+## write then read — depth 1, 1024 operations
+tokio::fs (blocking pool 1)          467846.2      1.00x
+tokio::fs (blocking pool 512)        478464.5      1.02x
+win-ioring (owned buffers)           434025.0      0.93x
+win-ioring (registered)              437991.5      0.94x
 ```
 
 ## What to take from it
 
-- **At depth 1 the backends are within a few percent of each other.** There is
-  nothing for a submission ring to batch, so this is the expected shape.
-- **Concurrency does not favour this crate on this workload.** The advantage
-  completion-based I/O is supposed to earn — coalescing outstanding operations
-  into one submission — does not show up against a warm cache, where each
-  operation is cheap enough that the driver's own bookkeeping is a visible share
-  of the cost.
+- **At depth 1 the crate is now competitive, and sometimes ahead.** This is
+  where the wake-path work landed: with one operation in flight there is nothing
+  to amortise the cost of parking over, so the driver paid it in full on every
+  operation. Removing it moved random reads at depth 1 from 1.02x to 0.64x.
+- **Concurrency still does not favour this crate on this workload.** The
+  advantage completion-based I/O is supposed to earn — coalescing outstanding
+  operations into one submission — does not show up against a warm cache, where
+  each operation is cheap enough that the driver's own bookkeeping is a visible
+  share of the cost.
 - **A narrow blocking pool beats a wide one for small reads.** `tokio::fs` at one
   blocking thread is roughly twice as fast as at 512 on random reads at depth 64.
   That is contention, not I/O.
-- **Registration does not pay for itself here.** It is a consistent few percent
-  *behind* the owned-buffer path. Its own cost is excluded from these figures
-  (see below), so this is the per-operation comparison alone.
+- **Registration still does not pay for itself here.** It is a consistent few
+  percent *behind* the owned-buffer path. Its own cost is excluded from these
+  figures, so this is the per-operation comparison alone.
+- **Sequential reads at depth 1 remain the worst case**, at 1.90x. 64 KiB
+  transfers are dominated by data movement rather than per-operation overhead, so
+  there was less for this work to remove.
+
+## Where the improvement came from
+
+The driver used to wait on two operating-system events at once and arm a
+thread-pool wait for both on every pass, tearing the loser down with a blocking
+`UnregisterWaitEx`. One of those two events carried nothing but "the application
+queued work for you" — a signal raised only ever from the driver's own thread,
+routed through a kernel object and an OS thread pool to travel no distance.
+
+Measured with temporary scaffolding, per-operation park overhead above a
+synchronous ring floor was **13.99 µs at one operation in flight**, against a
+ring that cost 10.69 µs to drive synchronously — so the machinery cost more than
+the I/O. After the rewrite it is **2.46 µs**, an 82% reduction. At eight and
+sixty-four operations in flight, where a single park already served many
+completions, per-operation cost fell slightly as well.
+
+**Those decomposition figures are not reproducible from this repository.** They
+were produced by a probe that was deleted once it had done its job, on the
+grounds that a benchmark nobody runs is a benchmark nobody maintains. The figures
+in the tables above *are* reproducible — they come from the committed harness.
+The raw probe output, with every repeat and its provenance, is preserved outside
+the repository in the workflow artifacts for this change.
+
+The consequence, accepted knowingly: **nothing committed would catch a
+regression in the park path.** The comparison harness would notice a large one,
+but it cannot separate park cost from ring cost, so a small regression would
+disappear into the difference between backends.
 
 ### A correction worth recording
 
-An earlier revision of this harness reported registration *winning* sequential
+An earlier revision of this document reported sequential read at depth 1 as
+1.03x. Re-running the *unchanged* crate on the current host gives **2.04x** for
+that same cell. The gap is not caused by any change since — it is present in the
+code those figures describe.
+
+So the old absolute numbers reflected a machine, or a machine state, that no
+longer exists, and the document presented them with more confidence than a single
+run supports. Treat every absolute figure here as one host on one day; the
+relative ordering is the part that travels, and even that only within the
+scenario it was measured in.
+
+### An earlier correction, still worth recording
+
+An earlier revision of the *harness* reported registration winning sequential
 reads at depth 1 by ~16%. That was an artifact: the two owned-buffer backends
 were allocating and zeroing a fresh buffer per operation while the registered one
-reused pre-registered buffers, so the comparison included an `alloc_zeroed` on
-one side and nothing on the other. Every backend now draws from a pool allocated
-once at construction, and the apparent advantage disappeared.
+reused pre-registered buffers, so the comparison included an `alloc_zeroed` on one
+side and nothing on the other. Every backend now draws from a pool allocated once
+at construction, and the apparent advantage disappeared.
 
-It is recorded here because it is the exact failure mode this harness exists to
+It is recorded because it is the exact failure mode this harness exists to
 prevent — a difference in the benchmark being read as a difference in the
-backend — and because it was caught by review rather than by any of the automated
-checks.
+backend — and because it was caught by review rather than by any automated check.
 
 ## What this does not tell you
 
@@ -154,14 +205,16 @@ checks.
   rewarding the alternative for using more.
 - **The cost of registering.** Setup — ring, runtime, registration and buffer
   pool — is built once per scenario and depth and is outside every timed region,
-  so these figures are per-operation cost only. A registration is a one-off whose
-  cost belongs to the decision to register rather than to any single transfer;
-  measuring it is separate work.
+  so these figures are per-operation cost only.
+- **Why the harness reports roughly 4 µs per operation more than a direct probe
+  measured for the same shape of work at depth 64.** Unexplained; recorded in
+  [pending-work.md](pending-work.md).
 
-The honest summary is that this crate's design has costs that are visible and
-benefits that this measurement does not exercise. Finding a workload where
-completion-based I/O wins on Windows — and reporting it with the same rigour —
-is the obvious next piece of work.
+The honest summary is that this crate's remaining costs are visible and its
+benefits are still largely unexercised by this measurement. Finding a workload
+where completion-based I/O wins on Windows for reasons other than avoided
+overhead — and reporting it with the same rigour — is the obvious next piece of
+work.
 
 ## Reproducing
 
