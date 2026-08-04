@@ -150,10 +150,26 @@ own interface** — read it beside that backend's configuration, not alone. It i
 reported in the fairness account rather than here, because Criterion has nowhere
 to put it.
 
+**Achieved depth used to be decoration.** A shortfall against the configured
+depth was annotated in the account and failed nothing, at any depth or shape, so
+a run that never reached the concurrency it claimed would publish figures without
+complaint. It now carries a check: each scenario declares its shape, the expected
+mean depth follows in closed form from the shape, the operation count and the
+depth, and a run whose measured mean disagrees is a **failure**, not a note. The
+shortfall annotation remains, and remains only an annotation — it is the shape
+check that bites.
+
 ## Full result
 
-All thirty-six cells — every scenario, depth and backend — because a selection
-invites the question of how it was selected.
+All thirty-six cells of the rolling matrix — every rolling scenario, depth and
+backend — because a selection invites the question of how it was selected.
+
+The bulk-read scenario was added after this run and is not in this table.
+Republishing forty cells would have meant re-running everything, and a table
+stitched from two runs is worse than two tables. It has its own section,
+[below](#the-batched-window-and-what-it-settled), reported against the rolling
+depth-64 cells **from the same run as itself** so the shape comparison is
+internal to one run rather than across the ±24% floor.
 
 Taken on an AMD Ryzen 7 PRO 6850U (8 cores, 16 logical processors, 16 MiB L3),
 28436 MiB of memory, working files on an NVMe volume. `warm_up_time` 1 s,
@@ -242,7 +258,96 @@ disagreement in the first significant figure, so both halves were wrong. The
 1.75x that the headline and `README.md` quote as the top of the loss range is a
 figure from one run; the second put that cell at 1.40x.
 
-## What changed when the instrument changed
+## The batched window, and what it settled
+
+Everything in the table above is a **rolling window**: fill to the configured
+depth, await one completion, refill one. That shape was suspected of never
+engaging this crate's central mechanism — the single `SubmitIoRing` that covers
+every entry built since the last one. A **batched window** was added to settle
+it: issue N reads with no await between them, await all N, repeat, so every
+operation in a batch is built before the driver's next pass.
+
+The suspicion was wrong, and finding that out was worth more than confirming it
+would have been.
+
+### Batching was already at full depth
+
+`Handle::submission_counts` reports how many submissions a run made and how many
+entries they covered. Across the whole default matrix, entries per submission:
+
+| scenario | depth 1 | depth 8 | depth 64 |
+|---|---|---|---|
+| sequential read (256 ops) | 1.0 | 8.0 | 64.0 |
+| random read (512 ops) | 1.0 | 8.0 | 64.0 |
+| write then read (257 entries) | 1.0 | 7.8 | 51.4 |
+| bulk read (256 ops) | — | — | 64.0 |
+
+The rolling window batches at **exactly the configured depth** — 256 entries over
+4 submissions at depth 64. Where a figure is not the depth it is arithmetic:
+write-then-read's 257 entries are four submissions of 64 and one of 1. Both ring
+backends agree to the digit in all **twenty** ring cells — the other twenty rows
+of the matrix are `tokio::fs`, which has no ring and reports the figure as not
+applicable rather than as zero — and **three full runs produced bit-identical
+figures**, so this is not an average over noise.
+
+The mechanism: the executor drains every ready completion in one pass before the
+driver submits again, so against a warm cache a rolling refill rebuilds the whole
+window before the next `submit_pending`. **That is a property of the measurement
+conditions, not of the shapes.** Every figure in this document is warm-cache by
+design. A cold cache would stagger completions, and whether the two shapes still
+coincide there is unmeasured.
+
+### The two shapes cost this crate the same, and `tokio::fs` more
+
+Sequential read and bulk read do identical work — 256 reads of 64 KiB from the
+same file at depth 64 — and differ only in shape. Both batch 64.0 entries per
+submission. They differ in sustained depth: the rolling window holds a mean of
+56.1 operations outstanding, the batched one 32.5, because it drains to zero at
+every batch boundary.
+
+From one run, µs per I/O:
+
+| shape | backend | [lower, estimate, upper] | relative |
+| --- | --- | --- | --- |
+| rolling | tokio::fs (pool 1) | [61.66, 61.98, 62.33] | 1.00x |
+| rolling | tokio::fs (pool 512) | [65.28, 66.02, 66.83] | 1.07x |
+| rolling | win-ioring (owned) | [77.64, 78.35, 79.10] | 1.26x |
+| rolling | win-ioring (registered) | [78.60, 79.35, 80.15] | 1.28x |
+| batched | tokio::fs (pool 1) | [66.53, 67.36, 68.23] | 1.00x |
+| batched | tokio::fs (pool 512) | [67.10, 67.66, 68.23] | 1.00x |
+| batched | win-ioring (owned) | [78.28, 79.33, 80.44] | 1.18x |
+| batched | win-ioring (registered) | [78.95, 79.81, 80.72] | 1.18x |
+
+Read by interval overlap within the run:
+
+- **This crate is indistinguishable between the two shapes.** Owned buffers
+  [77.64, 79.10] against [78.28, 80.44]; registered [78.60, 80.15] against
+  [78.95, 80.72]. Both pairs overlap. Draining the ring to zero at every batch
+  tail cost it nothing measurable, and neither did filling it.
+- **`tokio::fs` is slower in the batched shape.** [61.66, 62.33] against
+  [66.53, 68.23] — disjoint, and disjoint again in a second run ([66.34, 67.78]
+  against [70.90, 72.94]). Handed 64 tasks at once rather than a steady trickle,
+  the one-thread pool pays about 8% more per I/O.
+- **So the gap narrows and does not close**: 1.26x to 1.18x. That is the whole of
+  the batching advantage visible here, and it does not reach parity.
+
+Across three runs bulk read at depth 64 ran **1.15x to 1.28x** against
+`tokio::fs (pool 1)`, inside the 0.92x-1.61x band the rolling sequential read
+occupied in the same three runs.
+
+### What that leaves unexplained
+
+This crate's central claimed advantage was **already fully in effect in every
+figure ever published here**, at exactly the configured depth, and the crate
+still loses as depth rises. So the loss is not a batching shortfall, and this
+document previously implied otherwise.
+
+**Why it loses is currently unknown.** Nothing measured here establishes a cause,
+and the honest position is to leave the gap open rather than fill it with the
+next plausible guess — single-threaded completion processing against a
+512-thread pool, per-completion dequeue cost, cache effects. Each is testable and
+none is tested.
+
 
 The migration to Criterion shrank what one iteration does — the read scenarios
 from a whole 256 MiB sweep to 16 MiB, write-then-read from 64 MiB to 8 MiB — and
@@ -322,9 +427,9 @@ whatever was there before. The second names a baseline; the third compares
 against that name and prints, per benchmark, a change interval and a verdict.
 Baselines live under `target/criterion/<group>/<backend>/<depth>/<name>`, survive
 rebuilds, and are lost with the `target` directory. A filtered run times only the
-benchmarks matching the filter but still prepares, warms and verifies all
-thirty-six combinations, so the fairness check never narrows because somebody
-typed a filter; the combinations it did not time are marked
+benchmarks matching the filter but still prepares, warms and verifies all ten
+combinations, so the fairness check never narrows because somebody typed a
+filter; the combinations it did not time are marked
 **verified but not timed** in the account.
 
 **Read the verdicts against this host's noise floor, not against zero.** Running
@@ -402,18 +507,30 @@ level, resampling count and noise threshold are all Criterion's.
 
 The two that moved had to. A benchmark costs at least its warm-up plus its
 measurement window no matter how small an iteration is, and at Criterion's
-defaults of 3 s and 5 s, thirty-six benchmarks are 288 seconds of floor against a
+defaults of 3 s and 5 s, forty benchmarks are 320 seconds of floor against a
 five-minute budget — over it before a single I/O is issued. Reducing what an
 iteration does cannot get below that floor; only the budget can.
+
+**The budget is a number, not an aspiration.** It used to exist only in this
+paragraph, which is no use as a constraint when somebody proposes a new scenario.
+`RUN_BUDGET` is 300 seconds and `Budget::CHOSEN` holds the two timing values, and
+a test computes the matrix's floor from the real depth lists and checks it. The
+check is against **half** the budget, not all of it: three recorded runs cost
+1.79x, 1.83x and 2.06x their floor once preparation, untimed warm-ups, analysis
+and window overruns are counted, so a matrix whose floor merely fits the budget
+will overrun it in practice. At forty benchmarks the floor is 120 seconds against
+a 150-second limit, which is room for about two more combinations. Past that,
+something has to be traded away — which is how bulk read came to run at depth 64
+alone.
 
 `measurement_time` is a floor, not a cap, and this is worth knowing before
 reading an interval. A benchmark whose hundred samples fit inside the window is
 padded back up to fill it with extra iterations per sample. A benchmark whose
 hundred samples do not fit overruns the window, prints "Unable to complete 100
 samples", and takes as long as a hundred samples take. Between half and two
-thirds of this matrix is in the second regime on any given run — nineteen to
-twenty-four of the thirty-six — and the warning is expected, not a defect. The
-sample count is 100 either way, which is what the intervals rest on.
+thirds of this matrix is in the second regime on any given run, and the warning
+is expected, not a defect. The sample count is 100 either way, which is what the
+intervals rest on.
 
 A reader comparing intervals should know that each was gathered over two seconds.
 Estimates gathered over longer would be tighter, and the whole matrix would not
@@ -423,8 +540,9 @@ then fit the budget.
 
 Roughly **190 to 255 seconds** on the host above, with the working files already
 present and warm; the first run on a fresh checkout also creates a 256 MiB file.
-Five timed runs of this configuration came in at 190, 210, 213, 225 and 254
-seconds. The spread is the machine, not the suite: the same binary measuring the
+Five timed runs of the thirty-six-benchmark matrix came in at 190, 210, 213, 225
+and 254 seconds; three of the forty-benchmark matrix at 247, 219 and 215. The
+spread is the machine, not the suite: the same binary measuring the
 same work varies by a minute depending on what else the host is doing, which is
 the same fact the noise-floor finding above reports in a different unit. Budget
 for the slow end, not the fast one. The account prints preparation and
@@ -442,11 +560,13 @@ scenario, and it is stated here so nobody discovers it from a wear indicator.
   wake-path work landed: with one operation in flight there is nothing to
   amortise the cost of parking over, so the driver paid it in full on every
   operation.
-- **Concurrency still does not favour this crate on this workload.** The
-  advantage completion-based I/O is supposed to earn — coalescing outstanding
-  operations into one submission — does not show up against a warm cache, where
-  each operation is cheap enough that the driver's own bookkeeping is a visible
-  share of the cost.
+- **Concurrency still does not favour this crate on this workload, and the
+  reason is not the one this document used to give.** The advantage
+  completion-based I/O is supposed to earn — coalescing outstanding operations
+  into one submission — is *not* missing: it was measured, and it runs at exactly
+  the configured depth in every cell above. The crate loses anyway. What accounts
+  for that is currently unknown; see [the batched
+  window](#the-batched-window-and-what-it-settled).
 - **A narrow blocking pool beats a wide one for small reads.** `tokio::fs` at one
   blocking thread is more than twice as fast as at 512 on random reads at depth
   64. That is contention, not I/O.

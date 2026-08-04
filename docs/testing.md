@@ -212,14 +212,22 @@ Criterion timed *that* closure; that rests on reading those ten lines.
 `cargo test --benches` runs the Criterion target in **test mode** — one iteration
 per benchmark, against `Config::small()` and a working directory of its own — so
 `cargo test --workspace --all-targets` exercises preparation, warm-up,
-verification and teardown end to end for **twenty-four** combinations: every
-scenario × backend pair, at two of the three depths. `Config::small()` has depths
-`[1, 4]` where the benchmark configuration has `[1, 8, 64]`, so 3 scenarios × 2
-depths × 4 backends is 24, not the 36 a benchmark run walks. (This paragraph said
-thirty-six until it was checked against `config.rs`; the path is the same one, but
-a dozen fewer combinations travel it.) The bench target detects test mode by
+verification and teardown end to end for **twenty-eight** combinations.
+`Config::small()` has depths `[1, 4]` where the benchmark configuration has
+`[1, 8, 64]`, so the three rolling scenarios contribute 3 × 2 × 4 = 24, and bulk
+read — which runs at the deepest configured depth alone — contributes 1 × 1 × 4 =
+4. That is 28 against the 40 a benchmark run walks. (This paragraph said
+thirty-six until it was checked against `config.rs`, then twenty-four until bulk
+read was added; the path is the same one, but a dozen fewer combinations travel
+it.) The bench target detects test mode by
 Criterion's own rule rather than by testing for `--test` alone: a target that read
 it wrongly would build a 256 MiB working file inside the test suite.
+
+The depths `Config::small()` resolves to are the ones with teeth. They are what
+every `cargo test` actually checks, so the closed-form depth predictions are
+asserted at *those* values — a rolling mean of 3.90625 at 64 operations and depth
+4, a batched mean of 2.5 — and not only at the default configuration's, which
+nothing but a full benchmark run ever evaluates.
 
 The bench crate also carries a driver-count observation seam, `drivers_built()`,
 which is a plain counter and deliberately **not** `#[cfg(test)]`. What it observes
