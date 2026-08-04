@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
 use win_ioring_bench::config::Config;
+use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
 use win_ioring_bench::fairness::Ledger;
 use win_ioring_bench::harness::{Job, Record, Timed, Timer, Untimed, Which, measure_combination};
 use win_ioring_bench::scenario::{Rng, Scenario};
@@ -47,7 +48,7 @@ fn every_backend_runs_every_scenario() {
     let (read_path, write_path) = prepare("all", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = config.shape(scenario);
+        let (block, operations) = config.work(scenario);
         // One ledger for this (scenario, depth), shared across its backends.
         let mut ledger = Ledger::new();
 
@@ -112,7 +113,7 @@ fn every_backend_does_the_same_work() {
     let (read_path, write_path) = prepare("same", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = config.shape(scenario);
+        let (block, operations) = config.work(scenario);
 
         let mut ledger = Ledger::new();
         let mut last_trace: Option<Trace> = None;
@@ -164,7 +165,7 @@ fn a_backend_that_ran_a_different_job_is_rejected() {
     let config = Config::small();
     let (read_path, write_path) = prepare("rejected", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
     let depth = 1;
     // The thread-pool backend, so this gate holds on a host without a ring.
     let which = Which::TokioOne;
@@ -251,7 +252,7 @@ fn an_unavailable_backend_is_reported_not_measured() {
     let config = Config::small();
     let (read_path, write_path) = prepare("unavailable", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let mut ledger = Ledger::new();
     let job = Job {
@@ -296,7 +297,7 @@ fn a_backend_that_fails_after_preparing_is_reported_not_timed() {
     let config = Config::small();
     let (_, write_path) = prepare("missing", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
     let absent = workload::data_dir().join("test-missing").join("absent.dat");
 
     let mut ledger = Ledger::new();
@@ -351,7 +352,7 @@ fn a_failure_inside_a_timed_iteration_fills_the_error_slot() {
     let config = Config::small();
     let (read_path, write_path) = prepare("vanishing", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     /// Runs one iteration with the read file moved out of the way.
     struct Vanishing {
@@ -419,7 +420,7 @@ fn the_write_file_does_not_grow_across_iterations() {
     let config = Config::small();
     let (read_path, write_path) = prepare("growth", &config);
     let scenario = Scenario::WriteThenRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let mut ledger = Ledger::new();
     let job = Job {
@@ -478,7 +479,7 @@ fn one_driver_is_built_per_combination() {
     let config = Config::small();
     let (read_path, write_path) = prepare("drivers", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let before = ioring::drivers_built();
     let mut combinations = 0_usize;
@@ -513,4 +514,75 @@ fn one_driver_is_built_per_combination() {
         built >= combinations,
         "{built} drivers for {combinations} ring combinations — fewer than one each"
     );
+}
+
+/// FR-007: the shape a scenario declares is the shape it actually drives.
+///
+/// Runs bulk read and sequential read through the same seam, at the same depth,
+/// over the same number of operations, and holds each to the closed-form mean
+/// its shape predicts. The two predictions differ (2.5 against 3.90625 at depth
+/// 4 over 64 operations), so a bulk read that quietly rolled — or a sequential
+/// read that quietly batched — fails here rather than being reported as a
+/// measurement of something it is not.
+///
+/// The expected shape is written out here rather than read from
+/// [`Scenario::shape`]. Deriving it would move both sides of the comparison
+/// together, and a scenario that declared the wrong shape *and* drove it would
+/// pass: the test would confirm only that the runner is self-consistent, which
+/// was never in doubt.
+#[test]
+fn each_scenario_drives_the_shape_it_declares() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("shape", &config);
+    let depth = 4;
+
+    for (scenario, expected) in [
+        (Scenario::SequentialRead, Shape::Rolling),
+        (Scenario::RandomRead, Shape::Rolling),
+        (Scenario::BulkRead, Shape::Batched),
+    ] {
+        assert_eq!(
+            scenario.shape(),
+            expected,
+            "{} declares {:?}, not the {expected:?} this test measures it against",
+            scenario.name(),
+            scenario.shape()
+        );
+        let (block, operations) = config.work(scenario);
+        let predicted = predicted_mean_depth(expected, operations, depth);
+        let mut ledger = Ledger::new();
+
+        for which in Which::all() {
+            if !ring_available() && which.builds_a_driver() {
+                continue;
+            }
+            let job = Job {
+                scenario,
+                read_path: &read_path,
+                write_path: &write_path,
+                block,
+                operations,
+                depth,
+            };
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .unwrap_or_else(|f| panic!("{which:?} was rejected on {}: {f}", scenario.name()));
+            let Record::Measured { achieved, .. } = record else {
+                panic!("{which:?} did not measure {}: {record:?}", scenario.name());
+            };
+            assert_eq!(
+                achieved.mean, predicted,
+                "{which:?} on {} at depth {depth} achieved {} where {expected:?} predicts {predicted}",
+                scenario.name(),
+                achieved.mean,
+            );
+        }
+    }
 }

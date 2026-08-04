@@ -288,7 +288,7 @@ impl Account {
         )
         .unwrap();
         for scenario in Scenario::all() {
-            let (block, operations) = self.config.shape(scenario);
+            let (block, operations) = self.config.work(scenario);
             writeln!(
                 out,
                 "- {}: {operations} operations of {} per iteration, touching {}",

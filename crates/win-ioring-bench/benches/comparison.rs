@@ -253,7 +253,7 @@ fn run(c: &mut Criterion) -> Result<(), i32> {
     let mut rotation = 0_usize;
 
     for scenario in Scenario::all() {
-        let (block, operations) = config.shape(scenario);
+        let (block, operations) = config.work(scenario);
         let mut group = c.benchmark_group(scenario.slug());
         group.warm_up_time(WARM_UP).measurement_time(MEASUREMENT);
 

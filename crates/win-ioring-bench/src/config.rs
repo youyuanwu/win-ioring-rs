@@ -98,9 +98,11 @@ impl Config {
 
     /// The block size and operation count for one scenario.
     ///
-    /// The one place a scenario's shape is decided, shared by the benchmark and
+    /// The one place a scenario's work is decided, shared by the benchmark and
     /// the tests — so a change to what is measured cannot reach one without
-    /// reaching the other.
+    /// reaching the other. Named `work` rather than `shape` because
+    /// [`Scenario::shape`] is a different concept a file away: this is how much
+    /// I/O to do, that is the window shape to do it in.
     ///
     /// # The floor these counts must clear
     ///
@@ -110,18 +112,36 @@ impl Config {
     /// issue-and-drain, and the ramp dominates the steady state the comparison
     /// is about. `the_operation_counts_clear_the_depth_floor` holds both
     /// configurations to it.
-    pub fn shape(&self, scenario: Scenario) -> (u32, usize) {
+    pub fn work(&self, scenario: Scenario) -> (u32, usize) {
         let block = match scenario {
-            Scenario::SequentialRead => self.sequential_block,
+            Scenario::SequentialRead | Scenario::BulkRead => self.sequential_block,
             Scenario::RandomRead => self.random_block,
             Scenario::WriteThenRead => self.write_block,
         };
         let count = match scenario {
-            Scenario::SequentialRead => self.operations_per_iteration.sequential,
+            Scenario::SequentialRead | Scenario::BulkRead => {
+                self.operations_per_iteration.sequential
+            }
             Scenario::RandomRead => self.operations_per_iteration.random,
             Scenario::WriteThenRead => self.operations_per_iteration.write_then_read,
         };
         (block, count)
+    }
+
+    /// The depths one scenario is benchmarked at.
+    ///
+    /// Bulk read omits depth 1, because a batched window one operation wide is
+    /// a rolling window one operation wide — the same run under two names,
+    /// costing a benchmark cell to measure nothing new.
+    ///
+    /// This is a statement about which cells the *matrix* measures, not an
+    /// invariant of the runner: the batched shape is well defined at depth 1
+    /// and `tests/comparison.rs` legitimately drives every scenario there.
+    pub fn depths_for(&self, scenario: Scenario) -> Vec<usize> {
+        match scenario {
+            Scenario::BulkRead => self.depths.iter().copied().filter(|&d| d > 1).collect(),
+            _ => self.depths.clone(),
+        }
     }
 
     /// How large the write-then-read scenario's file ends up.
@@ -131,7 +151,7 @@ impl Config {
     /// the file's size. A separately configured size could disagree with what
     /// the scenario actually writes, and SC-015 is checked against this figure.
     pub fn write_file_bytes(&self) -> u64 {
-        let (block, operations) = self.shape(Scenario::WriteThenRead);
+        let (block, operations) = self.work(Scenario::WriteThenRead);
         block as u64 * operations as u64
     }
 
@@ -140,7 +160,7 @@ impl Config {
     /// Write-then-read counts twice, because it writes that many bytes and then
     /// reads the same bytes back — two I/Os per nominal operation.
     pub fn touched_bytes(&self, scenario: Scenario) -> u64 {
-        let (block, operations) = self.shape(scenario);
+        let (block, operations) = self.work(scenario);
         let bytes = block as u64 * operations as u64;
         match scenario {
             Scenario::WriteThenRead => bytes * 2,
@@ -169,9 +189,13 @@ mod tests {
     #[test]
     fn the_operation_counts_clear_the_depth_floor() {
         for config in [Config::default(), Config::small()] {
-            let deepest = config.depths.iter().copied().max().expect("a depth");
             for scenario in Scenario::all() {
-                let (_, operations) = config.shape(scenario);
+                let deepest = config
+                    .depths_for(scenario)
+                    .into_iter()
+                    .max()
+                    .expect("a depth");
+                let (_, operations) = config.work(scenario);
                 let floor = match scenario {
                     Scenario::WriteThenRead => 2 * deepest,
                     _ => 4 * deepest,
@@ -185,12 +209,78 @@ mod tests {
         }
     }
 
+    /// Bulk read's depth list is what makes its predicted mean depth exactly
+    /// `(N+1)/2`. A count that is not a whole multiple of every depth leaves a
+    /// partial final batch, which lowers the mean and turns an exact check into
+    /// an approximate one without anything announcing it.
+    #[test]
+    fn the_bulk_read_count_is_a_whole_multiple_of_every_depth_it_runs_at() {
+        for (label, config) in [("default", Config::default()), ("small", Config::small())] {
+            let (_, operations) = config.work(Scenario::BulkRead);
+            for depth in config.depths_for(Scenario::BulkRead) {
+                assert_eq!(
+                    operations % depth,
+                    0,
+                    "{label}: bulk read's {operations} operations leave a partial batch at depth {depth}"
+                );
+            }
+        }
+    }
+
+    /// A batched window one operation wide is a rolling window one operation
+    /// wide. Measuring it would cost a benchmark cell to learn nothing.
+    #[test]
+    fn bulk_read_is_not_benchmarked_at_depth_one() {
+        for (label, config) in [("default", Config::default()), ("small", Config::small())] {
+            let depths = config.depths_for(Scenario::BulkRead);
+            assert!(
+                !depths.contains(&1),
+                "{label}: bulk read's benchmark depths {depths:?} include 1"
+            );
+            assert!(!depths.is_empty(), "{label}: bulk read has no depths left");
+            for scenario in Scenario::all() {
+                if scenario != Scenario::BulkRead {
+                    assert_eq!(
+                        config.depths_for(scenario),
+                        config.depths,
+                        "{label}: {} lost a depth",
+                        scenario.name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bulk read's block size and operation count come from the resolved
+    /// configuration, like every other scenario's, rather than from constants
+    /// baked into the scenario. A hard-coded count would ignore
+    /// [`Config::small`] and make the benchmark's test mode measure the large
+    /// configuration.
+    #[test]
+    fn bulk_read_draws_its_parameters_from_the_configuration() {
+        let default = Config::default();
+        let small = Config::small();
+        assert_ne!(
+            default.work(Scenario::BulkRead),
+            small.work(Scenario::BulkRead),
+            "bulk read reports the same work for two different configurations"
+        );
+        assert_eq!(
+            default.work(Scenario::BulkRead),
+            (default.sequential_block, default.operations_per_iteration.sequential),
+        );
+        assert_eq!(
+            small.work(Scenario::BulkRead),
+            (small.sequential_block, small.operations_per_iteration.sequential),
+        );
+    }
+
     /// The write file's size is what the scenario writes, not a separate number
     /// that could disagree with it.
     #[test]
     fn the_write_file_is_one_iterations_worth() {
         let config = Config::default();
-        let (block, operations) = config.shape(Scenario::WriteThenRead);
+        let (block, operations) = config.work(Scenario::WriteThenRead);
         assert_eq!(config.write_file_bytes(), block as u64 * operations as u64);
         assert_eq!(
             config.touched_bytes(Scenario::WriteThenRead),

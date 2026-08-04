@@ -92,7 +92,7 @@ fn job<'a>(
     write_path: &'a std::path::Path,
     config: &Config,
 ) -> Job<'a> {
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
     Job {
         scenario,
         read_path,
