@@ -47,6 +47,50 @@ pub struct Budget {
     pub sample_size: usize,
 }
 
+/// How long a full `cargo bench` run is allowed to take.
+///
+/// This existed only as prose until the matrix grew, at which point it needed
+/// to be a number something could check. It is the constraint that fixed
+/// [`Budget::warm_up`] and [`Budget::measurement`] below Criterion's defaults:
+/// a benchmark costs at least its warm-up plus its measurement window however
+/// small an iteration is, so the floor is `benchmarks * (warm_up +
+/// measurement)` and shrinking the per-iteration work cannot get under it.
+///
+/// Five minutes is not a property of the machine. It is how long a run may take
+/// before people stop doing them, which is the only budget that matters.
+pub const RUN_BUDGET: Duration = Duration::from_secs(300);
+
+impl Budget {
+    /// The budget this suite actually runs at.
+    ///
+    /// Every *statistical* parameter is Criterion's own — confidence level,
+    /// resampling count, noise threshold. The two timing parameters moved
+    /// because they had to: at Criterion's defaults of 3 s and 5 s this matrix
+    /// is over [`RUN_BUDGET`] before a single I/O is issued.
+    ///
+    /// It lives here rather than in the benchmark so that a test can check the
+    /// matrix still fits, which a constant in the bench target could not be
+    /// reached to do.
+    pub const CHOSEN: Self = Self {
+        warm_up: Duration::from_secs(1),
+        measurement: Duration::from_secs(2),
+        sample_size: 100,
+    };
+
+    /// The least time a matrix of `benchmarks` can take under this budget.
+    ///
+    /// Criterion's `measurement_time` is a floor, not a cap: a benchmark whose
+    /// samples fit inside the window is padded back up with extra iterations to
+    /// fill it, and one whose samples do not fit overruns it. So this is a lower
+    /// bound that no amount of shrinking the workload can beat, not an estimate
+    /// — real runs land well above it. Preparation, file creation and Criterion's
+    /// own analysis are all on top.
+    #[must_use]
+    pub fn floor(&self, benchmarks: usize) -> Duration {
+        (self.warm_up + self.measurement) * u32::try_from(benchmarks).unwrap_or(u32::MAX)
+    }
+}
+
 /// What one backend did in one combination.
 #[derive(Debug)]
 pub enum Standing {

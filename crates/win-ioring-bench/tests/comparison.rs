@@ -9,7 +9,9 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use win_ioring_bench::account::{Budget, RUN_BUDGET};
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
 use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
@@ -810,5 +812,69 @@ fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
         cells.last().map(|(s, _)| *s),
         Some(Scenario::BulkRead),
         "bulk read must be last, or it would displace an existing combination's rotation"
+    );
+}
+
+/// The matrix still fits the run budget, with the margin real runs need.
+///
+/// The floor is what Criterion charges before any I/O happens: warm-up plus
+/// measurement, per benchmark, whatever an iteration costs. Real runs land well
+/// above it — 247, 219 and 215 seconds were measured against a 120-second floor
+/// at forty benchmarks — because preparation, the untimed warm-ups, Criterion's
+/// analysis and the benchmarks that overrun their window are all on top.
+///
+/// The ratio matters more than the difference. Those three runs came in at
+/// **1.79 to 2.06 times the floor**, so the floor is not the constraint; twice
+/// the floor is. A matrix whose floor exceeds half the budget will overrun it in
+/// practice while still looking affordable on paper, which is exactly the
+/// mistake this check exists to prevent. At forty benchmarks the floor is 120
+/// seconds against a 150-second limit, leaving room for about two more
+/// combinations before something has to be traded away.
+#[test]
+fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
+    let config = Config::default();
+    let benchmarks: usize = Scenario::all()
+        .iter()
+        .map(|scenario| config.depths_for(*scenario).len() * Which::all().len())
+        .sum();
+
+    let floor = Budget::CHOSEN.floor(benchmarks);
+
+    // Three recorded runs cost 1.79x, 1.83x and 2.06x their floor. Half the
+    // budget is the largest floor that survives that multiplier.
+    let limit = RUN_BUDGET / 2;
+    assert!(
+        floor <= limit,
+        "{benchmarks} benchmarks have a floor of {floor:?} against a {limit:?} limit, which is \
+         half the {RUN_BUDGET:?} budget; recorded runs cost 1.8x to 2.1x their floor, so this \
+         matrix would overrun the budget in practice. Drop a scenario or a depth rather than \
+         raising the budget"
+    );
+}
+
+/// What the matrix costs today, recorded so a change to it is visible.
+///
+/// Separate from the budget check on purpose. Folding the two together would put
+/// an exact-count assertion in front of the affordability one, and the count
+/// would then fire first on every matrix change — leaving the budget check
+/// unable to fail for the reason it exists. Which was true of an earlier draft
+/// of this test: at forty-eight benchmarks the floor is 144 seconds, still
+/// inside the limit, so only the count noticed.
+#[test]
+fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
+    let config = Config::default();
+    let benchmarks: usize = Scenario::all()
+        .iter()
+        .map(|scenario| config.depths_for(*scenario).len() * Which::all().len())
+        .sum();
+
+    assert_eq!(
+        benchmarks, 40,
+        "the matrix is ten combinations of four backends"
+    );
+    assert_eq!(
+        Budget::CHOSEN.floor(benchmarks),
+        Duration::from_secs(120),
+        "forty benchmarks at one second of warm-up and two of measurement"
     );
 }

@@ -54,7 +54,7 @@ use win_ioring_bench::workload;
 /// here because [`measure_combination`] has already run an untimed warm-up of
 /// its own — outside anything Criterion sees — that pays for lazily created
 /// threads and first-touch page faults.
-const WARM_UP: Duration = Duration::from_secs(1);
+const WARM_UP: Duration = Budget::CHOSEN.warm_up;
 
 /// How long each benchmark is sampled over.
 ///
@@ -76,13 +76,13 @@ const WARM_UP: Duration = Duration::from_secs(1);
 /// The statistical configuration is untouched: a hundred samples still drive
 /// every estimate. What changes is how many iterations each of those samples
 /// averages over, not how many samples there are.
-const MEASUREMENT: Duration = Duration::from_secs(2);
+const MEASUREMENT: Duration = Budget::CHOSEN.measurement;
 
 /// How many samples Criterion gathers per estimate.
 ///
 /// Left at Criterion's default and reported rather than set, so the account
 /// says what the intervals rest on.
-const SAMPLE_SIZE: usize = 100;
+const SAMPLE_SIZE: usize = Budget::CHOSEN.sample_size;
 
 /// A [`Prepared`]'s `block_on`, in the shape Criterion asks for.
 ///
