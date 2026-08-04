@@ -373,7 +373,7 @@ closed-form prediction for the declared shape and routes a mismatch through
   `--list` sets `bench=true, test=false`, so `test_mode()` correctly reports a
   benchmark run and `Config::default()` is selected; Criterion's list mode then
   never invokes a routine. The result is that merely asking which benchmarks
-  exist creates the 256 MiB read file, walks all ten combinations through
+  exist creates the 256 MiB read file, walks all forty combinations through
   preparation, warm-up, verification and teardown, and reports every one of them
   as verified but not timed — minutes of I/O for a list of names. Detecting
   `--list` alongside `--test` and using `Config::small()`, or returning before

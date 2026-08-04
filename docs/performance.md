@@ -427,7 +427,7 @@ whatever was there before. The second names a baseline; the third compares
 against that name and prints, per benchmark, a change interval and a verdict.
 Baselines live under `target/criterion/<group>/<backend>/<depth>/<name>`, survive
 rebuilds, and are lost with the `target` directory. A filtered run times only the
-benchmarks matching the filter but still prepares, warms and verifies all ten
+benchmarks matching the filter but still prepares, warms and verifies all forty
 combinations, so the fairness check never narrows because somebody typed a
 filter; the combinations it did not time are marked
 **verified but not timed** in the account.

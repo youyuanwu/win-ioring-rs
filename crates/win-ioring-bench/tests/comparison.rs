@@ -700,12 +700,13 @@ fn the_batching_figure_is_per_iteration_not_per_session() {
 /// the whole window, so that race has never been observed to bite. It is not
 /// asserted as an invariant because nothing in the design forbids it.
 ///
-/// What is invariant for rolling, and is asserted: a submission covers at least
-/// one entry and at most `depth`, because the window never holds more than
-/// `depth` outstanding and so no more than `depth` entries can accumulate
-/// between two submissions. A figure above `depth` would mean the delta had
-/// captured submissions from outside the measured iteration, which is the
-/// failure this bound exists to catch.
+/// What is asserted for rolling is the property the scenario exists to measure:
+/// a submission covers *more than one* entry. That is the difference between
+/// batching and not batching, it is what a regression would destroy, and it is
+/// not implied by anything else in this test — the upper bound of `depth` is,
+/// since `entries` is pinned to `operations` above and the window never holds
+/// more than `depth` outstanding, so the upper bound is kept only as a sanity
+/// rail and carries no weight on its own.
 ///
 /// This test has caught a broken `submit_pending` for real, not just under a
 /// deliberate mutation: a stale `win-ioring` rlib carrying an earlier mutation
@@ -717,7 +718,7 @@ fn the_batching_figure_is_per_iteration_not_per_session() {
 /// assertion — see `docs/performance.md`. It is taken from `cargo bench`, which
 /// is the only build whose numbers this repository publishes.
 #[test]
-fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
+fn every_ring_backend_batches_its_submissions_in_both_shapes() {
     if !ring_available() {
         return;
     }
@@ -779,12 +780,14 @@ fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
                     counts.submissions,
                 ),
                 Shape::Rolling => assert!(
-                    counts.submissions >= 1 && counts.submissions * depth as u64 >= counts.entries,
-                    "{which:?} on {} is rolling, so a submission covers between 1 and {depth} \
-                     entries — the window never holds more than {depth} outstanding. It \
-                     recorded {} entries over {} submissions, which is {per_submission:.2} per \
-                     submission; above {depth} means the delta captured submissions from \
-                     outside the measured iteration",
+                    counts.entries > counts.submissions
+                        && counts.submissions * depth as u64 >= counts.entries,
+                    "{which:?} on {} is rolling, so a submission must cover more than one \
+                     entry — batching is the thing being measured — and no more than {depth}, \
+                     because the window never holds more than {depth} outstanding. It recorded \
+                     {} entries over {} submissions, which is {per_submission:.2} per \
+                     submission; 1.00 means batching stopped happening, and above {depth} \
+                     means more entries were counted than the window can hold",
                     scenario.name(),
                     counts.entries,
                     counts.submissions,
