@@ -684,11 +684,38 @@ fn the_batching_figure_is_per_iteration_not_per_session() {
 /// plain one, and publishing it on that basis would generalise across the two
 /// configurations this suite exists to distinguish.
 ///
-/// It stays falsifiable in four distinguishable directions: a rolling figure
-/// near 1 would restore the original premise; a bulk-read figure below N would
-/// mean batches are not assembling whole; a figure above N would mean the delta
-/// is capturing submissions from outside the measured iteration; and a figure
-/// that moved between runs would contradict determinism.
+/// **The two shapes are held to different standards, and deliberately so.**
+///
+/// The batched shape is held to equality. It builds all N operations with no
+/// await between them, so all N are pending before the driver's next pass
+/// whatever the relative speed of the application and the kernel. One submission
+/// must cover the window; that is structural, and it is asserted as such.
+///
+/// The rolling shape is held to bounds rather than to equality, because its
+/// figure is not structural in the same way. A rolling window awaits one
+/// completion and refills one, so in principle a completion could arrive between
+/// two refills and the driver submit in between, splitting the window across
+/// submissions. Every measurement taken so far — three release `cargo bench`
+/// runs, bit-identical, and twenty debug runs — shows one submission covering
+/// the whole window, so that race has never been observed to bite. It is not
+/// asserted as an invariant because nothing in the design forbids it.
+///
+/// What is invariant for rolling, and is asserted: a submission covers at least
+/// one entry and at most `depth`, because the window never holds more than
+/// `depth` outstanding and so no more than `depth` entries can accumulate
+/// between two submissions. A figure above `depth` would mean the delta had
+/// captured submissions from outside the measured iteration, which is the
+/// failure this bound exists to catch.
+///
+/// This test has caught a broken `submit_pending` for real, not just under a
+/// deliberate mutation: a stale `win-ioring` rlib carrying an earlier mutation
+/// survived into a later build, and this assertion reported the resulting 1.00
+/// entries per submission. See `docs/testing.md` on rebuilding after mutation
+/// testing.
+///
+/// The release-build rolling figure is a published measurement, not a test
+/// assertion — see `docs/performance.md`. It is taken from `cargo bench`, which
+/// is the only build whose numbers this repository publishes.
 #[test]
 fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
     if !ring_available() {
@@ -737,17 +764,32 @@ fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
                 scenario.name(),
                 counts.entries
             );
-            assert_eq!(
-                counts.entries,
-                counts.submissions * depth as u64,
-                "{which:?} on {} ({:?}) recorded {} entries over {} submissions, which is {:.2} \
-                 per submission rather than the configured {depth}",
-                scenario.name(),
-                scenario.shape(),
-                counts.entries,
-                counts.submissions,
-                counts.entries as f64 / counts.submissions as f64,
-            );
+
+            let per_submission = counts.entries as f64 / counts.submissions as f64;
+            match scenario.shape() {
+                Shape::Batched => assert_eq!(
+                    counts.entries,
+                    counts.submissions * depth as u64,
+                    "{which:?} on {} is batched, so one submission must cover the whole window \
+                     however fast the kernel is; it recorded {} entries over {} submissions, \
+                     which is {per_submission:.2} per submission rather than the configured \
+                     {depth}",
+                    scenario.name(),
+                    counts.entries,
+                    counts.submissions,
+                ),
+                Shape::Rolling => assert!(
+                    counts.submissions >= 1 && counts.submissions * depth as u64 >= counts.entries,
+                    "{which:?} on {} is rolling, so a submission covers between 1 and {depth} \
+                     entries — the window never holds more than {depth} outstanding. It \
+                     recorded {} entries over {} submissions, which is {per_submission:.2} per \
+                     submission; above {depth} means the delta captured submissions from \
+                     outside the measured iteration",
+                    scenario.name(),
+                    counts.entries,
+                    counts.submissions,
+                ),
+            }
         }
     }
 }
@@ -786,28 +828,33 @@ fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
         "bulk read should occupy exactly one cell"
     );
 
-    // What the rotation counter was before bulk read existed: the same walk,
-    // over the three original scenarios at every configured depth.
-    let mut original = Vec::new();
-    for scenario in Scenario::all() {
-        if scenario == Scenario::BulkRead {
-            continue;
-        }
-        for depth in config.depths_for(scenario) {
-            original.push((scenario, depth));
-        }
-    }
-    for (rotation, cell) in original.iter().enumerate() {
-        assert_eq!(
-            cells[rotation], *cell,
-            "rotation {rotation} used to run {cell:?} and now runs {:?}, so {cell:?} gets a \
-             different backend order than it had before bulk read existed",
-            cells[rotation],
-        );
-    }
+    // The expected walk, written out rather than re-derived. Rebuilding it from
+    // Scenario::all() and depths_for -- the two things under test -- would move
+    // both sides of the comparison together: reordering the rolling scenarios
+    // shifts every rotation index and re-orders backends against every stored
+    // baseline, and a re-derived expectation would shift with it and notice
+    // nothing.
+    let expected = vec![
+        (Scenario::SequentialRead, 1),
+        (Scenario::SequentialRead, 8),
+        (Scenario::SequentialRead, 64),
+        (Scenario::RandomRead, 1),
+        (Scenario::RandomRead, 8),
+        (Scenario::RandomRead, 64),
+        (Scenario::WriteThenRead, 1),
+        (Scenario::WriteThenRead, 8),
+        (Scenario::WriteThenRead, 64),
+        (Scenario::BulkRead, 64),
+    ];
+    assert_eq!(
+        cells, expected,
+        "the rotation counter advances once per combination in this order, and the backend \
+         running order is that counter rotated; any change here re-orders backends against \
+         every stored Criterion baseline"
+    );
 
     // Bulk read takes the last rotation, so it is the only combination whose
-    // backend order is newly assigned.
+    // backend order was newly assigned when it was added.
     assert_eq!(
         cells.last().map(|(s, _)| *s),
         Some(Scenario::BulkRead),

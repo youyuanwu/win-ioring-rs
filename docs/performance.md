@@ -463,7 +463,7 @@ proceeds, and in full to `target/bench-data/fairness.md` at the end. It carries
 - host processor count, physical memory, and the volume the working files are on;
 - the warm-cache premise, stated against both the **resident** working set that
   must stay cached (264 MiB) and the bytes each scenario **touches** per iteration
-  (16 MiB, 2 MiB, 16 MiB), which are no longer the same number;
+  (16 MiB, 2 MiB, 16 MiB, 16 MiB), which are no longer the same number;
 - every backend's name, configuration and availability, with a reason for each
   one that was unavailable and each one that prepared and then failed;
 - the run order actually used;
@@ -471,7 +471,7 @@ proceeds, and in full to `target/bench-data/fairness.md` at the end. It carries
   concurrency, and whether it was **timed** or **verified but not timed**;
 - the reference backend and the agreement verdict per (scenario, depth);
 - the number of drivers built against the number of **ring** combinations
-  measured — 18 of the 36, because the two thread-pool backends build none;
+  measured — 20 of the 40, because the two thread-pool backends build none;
 - the write file's size after the run, and whether the first and last measured
   iteration issued and delivered the same work;
 - preparation and measurement wall clock.

@@ -313,6 +313,20 @@ the pattern recurs, not because the specific tests matter.
   depends on it and *pass* the one that does not, which is only possible if the
   weakening was real and specific. Both mutations are recorded verbatim in the
   workflow artifacts, and neither is worth running without the other.
+- **A mutation you think you reverted can outlive the revert.** Restoring a file
+  in a way that preserves its old modification time — `Move-Item` of a `.bak`
+  copy will do it — leaves Cargo with no reason to rebuild, so the mutated
+  artifact stays in `target/` and every later run measures it. This has produced
+  two false findings in this repository: a matrix size read as 52 when it is 28,
+  and an entries-per-submission figure read as 1.00 when it is the configured
+  depth. The second survived a code review and most of a day's investigation,
+  because it was stable on every run and flipped whenever anything forced a
+  rebuild — adding a package to `-p`, toggling an unrelated feature, inserting a
+  `println!` — which reads exactly like codegen sensitivity and is nothing of the
+  kind. After reverting a mutation, force the rebuild (touch the file, or restore
+  by content rather than by moving a file over it) and re-take any measurement
+  made since. If a result changes when you add an observer that cannot affect it,
+  suspect a stale artifact before you believe the result.
 
 ### Proving a wakeup cannot be lost
 
