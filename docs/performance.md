@@ -313,27 +313,41 @@ From one run, µs per I/O:
 | rolling | tokio::fs (pool 512) | [65.28, 66.02, 66.83] | 1.07x |
 | rolling | win-ioring (owned) | [77.64, 78.35, 79.10] | 1.26x |
 | rolling | win-ioring (registered) | [78.60, 79.35, 80.15] | 1.28x |
-| batched | tokio::fs (pool 1) | [66.53, 67.36, 68.23] | 1.00x |
+| batched | tokio::fs (pool 1) | [66.53, 67.36, 68.24] | 1.00x |
 | batched | tokio::fs (pool 512) | [67.10, 67.66, 68.23] | 1.00x |
 | batched | win-ioring (owned) | [78.28, 79.33, 80.44] | 1.18x |
 | batched | win-ioring (registered) | [78.95, 79.81, 80.72] | 1.18x |
 
-Read by interval overlap within the run:
+Read by interval overlap within the run. A comparison is treated as **resolved**
+only when the intervals settle it; where it depends on a ratio between two
+backends, the null band is applied to that ratio as a **conservative proxy** —
+the band was measured on single-cell repeats, not on ratios, so using it this way
+can only under-claim, never over-claim. A comparison that does not clear both is
+recorded as **unresolved** rather than reported as a direction.
 
-- **This crate is indistinguishable between the two shapes.** Owned buffers
-  [77.64, 79.10] against [78.28, 80.44]; registered [78.60, 80.15] against
-  [78.95, 80.72]. Both pairs overlap. Draining the ring to zero at every batch
-  tail cost it nothing measurable, and neither did filling it.
-- **`tokio::fs` is slower in the batched shape.** [61.66, 62.33] against
-  [66.53, 68.23] — disjoint, and disjoint again in a second run ([66.34, 67.78]
-  against [70.90, 72.94]). Handed 64 tasks at once rather than a steady trickle,
-  the one-thread pool pays about 8% more per I/O.
-- **So the gap narrows and does not close**: 1.26x to 1.18x. That is the whole of
-  the batching advantage visible here, and it does not reach parity.
+- **Resolved: this crate is indistinguishable between the two shapes.** Owned
+  buffers [77.64, 79.10] against [78.28, 80.44]; registered [78.60, 80.15]
+  against [78.95, 80.72]. Both pairs overlap. Draining the ring to zero at every
+  batch tail cost it nothing measurable, and neither did filling it.
+- **Resolved: `tokio::fs` is slower in the batched shape.** [61.66, 62.33]
+  against [66.53, 68.24] — disjoint, and disjoint again in a second run
+  ([66.34, 67.78] against [70.90, 72.94]). Handed 64 tasks at once rather than a
+  steady trickle, the one-thread pool pays about 8% more per I/O.
+- **Unresolved: whether the gap between this crate and `tokio::fs` narrows.**
+  Within this run the ratio is smaller in the batched shape, 1.26x against
+  1.18x. That difference is not resolvable: both ratios fall inside the null
+  band, and across three runs bulk read at depth 64 ran 1.15x to 1.28x while
+  rolling sequential read ran 0.92x to 1.61x in the same runs — overlapping
+  ranges. The narrowing is what one run shows; it is not a result. What the
+  interval evidence does support is only the two statements above, and neither of
+  them is a claim that this crate closes the gap. It does not: every ring cell in
+  the table is slower than every `tokio::fs` cell.
 
-Across three runs bulk read at depth 64 ran **1.15x to 1.28x** against
-`tokio::fs (pool 1)`, inside the 0.92x-1.61x band the rolling sequential read
-occupied in the same three runs.
+**These two shapes are not directly comparable to each other.** Rolling and
+batched sustain different depths by construction — 56.1 against 32.5 — so a
+difference between the two rows of one backend mixes shape with depth. The
+comparison this table is arranged to support is **between backends within one
+shape**, which is the only axis on which the application logic is identical.
 
 ### What that leaves unexplained
 
@@ -348,6 +362,7 @@ next plausible guess — single-threaded completion processing against a
 512-thread pool, per-completion dequeue cost, cache effects. Each is testable and
 none is tested.
 
+## What changed when the instrument changed
 
 The migration to Criterion shrank what one iteration does — the read scenarios
 from a whole 256 MiB sweep to 16 MiB, write-then-read from 64 MiB to 8 MiB — and

@@ -37,9 +37,14 @@ pub type Depth = usize;
 pub enum Shape {
     /// Fill to the configured depth, await one completion, refill one.
     ///
-    /// Depth stays at the configured value for almost the whole run, so
-    /// operations are issued a few at a time and a submission covers far fewer
-    /// entries than the depth suggests.
+    /// Depth stays at the configured value for almost the whole run. It was
+    /// assumed that this issued operations a few at a time and that a
+    /// submission therefore covered far fewer entries than the depth suggests;
+    /// measurement refuted that. A submission covers the whole window here too,
+    /// because the executor drains every ready completion in one poll pass
+    /// before the driver submits again, so a refill rebuilds the window before
+    /// the next `SubmitIoRing`. See `docs/performance.md`, "The batched window,
+    /// and what it settled".
     Rolling,
     /// Issue a whole batch, drain it to zero, then issue the next.
     ///
@@ -346,11 +351,6 @@ impl<'a, B: Backend> Runner<'a, B> {
                 measured,
             }
         }
-    }
-
-    /// The shape this runner was told to drive.
-    pub fn shape(&self) -> Shape {
-        self.shape
     }
 
     /// Mean of the outstanding count over the run's completions.
