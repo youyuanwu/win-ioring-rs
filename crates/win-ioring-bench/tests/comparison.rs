@@ -749,3 +749,66 @@ fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
         }
     }
 }
+
+/// The matrix is exactly what the per-scenario depth lists say it is, and
+/// appending bulk read did not disturb the backend rotation of any combination
+/// that existed before it.
+///
+/// The benchmark advances a rotation counter once per (scenario, depth) in
+/// scenario-major order and rotates the backend running order by it, so that no
+/// backend is always first. Inserting a scenario anywhere but the end, or giving
+/// bulk read more than one depth, would shift the counter every later
+/// combination sees and silently re-order backends against every stored
+/// Criterion baseline.
+#[test]
+fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
+    let config = Config::default();
+
+    let mut cells = Vec::new();
+    for scenario in Scenario::all() {
+        for depth in config.depths_for(scenario) {
+            cells.push((scenario, depth));
+        }
+    }
+    assert_eq!(
+        cells.len(),
+        10,
+        "the matrix should be nine rolling cells plus one bulk-read cell: {cells:?}"
+    );
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|(s, _)| *s == Scenario::BulkRead)
+            .count(),
+        1,
+        "bulk read should occupy exactly one cell"
+    );
+
+    // What the rotation counter was before bulk read existed: the same walk,
+    // over the three original scenarios at every configured depth.
+    let mut original = Vec::new();
+    for scenario in Scenario::all() {
+        if scenario == Scenario::BulkRead {
+            continue;
+        }
+        for depth in config.depths_for(scenario) {
+            original.push((scenario, depth));
+        }
+    }
+    for (rotation, cell) in original.iter().enumerate() {
+        assert_eq!(
+            cells[rotation], *cell,
+            "rotation {rotation} used to run {cell:?} and now runs {:?}, so {cell:?} gets a \
+             different backend order than it had before bulk read existed",
+            cells[rotation],
+        );
+    }
+
+    // Bulk read takes the last rotation, so it is the only combination whose
+    // backend order is newly assigned.
+    assert_eq!(
+        cells.last().map(|(s, _)| *s),
+        Some(Scenario::BulkRead),
+        "bulk read must be last, or it would displace an existing combination's rotation"
+    );
+}

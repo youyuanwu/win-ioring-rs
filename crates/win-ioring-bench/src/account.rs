@@ -462,14 +462,14 @@ impl Account {
         writeln!(out, "## Teardown and provenance").unwrap();
         writeln!(out).unwrap();
         // Against the ring combinations, not against all of them: the two
-        // thread-pool backends build no driver, so 36 measured combinations
-        // build 18 drivers and reading SC-014 against 36 would fail a correct
+        // thread-pool backends build no driver, so 40 measured combinations
+        // build 20 drivers and reading SC-014 against 40 would fail a correct
         // run.
         //
         // The narrative clause is conditional on the two numbers, because the
         // reassuring version of this line is the one a reader would most want to
         // be able to trust: printing "one per combination, not one per
-        // iteration" beside 1800 and 18 would be the exact false comfort the
+        // iteration" beside 2000 and 20 would be the exact false comfort the
         // line exists to prevent. Same shape as the write-file line below.
         writeln!(
             out,

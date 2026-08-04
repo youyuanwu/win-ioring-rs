@@ -21,7 +21,7 @@
 //! verified: the cross-backend fairness check is only meaningful when every
 //! backend of a (scenario, depth) has put a trace in front of the same ledger,
 //! and a check that silently narrowed when someone typed a filter would be worth
-//! less than no check. So this target walks all thirty-six combinations whatever
+//! less than no check. So this target walks all forty combinations whatever
 //! the filter says. What a filter removes is the timing — Criterion never
 //! invokes the routine closure for a filtered-out benchmark, so no timed
 //! iteration runs, and the warm-up's trace is verified instead. Those
@@ -49,7 +49,7 @@ use win_ioring_bench::workload;
 
 /// How long each benchmark is warmed up for before Criterion starts sampling.
 ///
-/// Criterion's own default is three seconds, which thirty-six benchmarks
+/// Criterion's own default is three seconds, which forty benchmarks
 /// multiply well past the five-minute budget of SC-001. One second is enough
 /// here because [`measure_combination`] has already run an untimed warm-up of
 /// its own — outside anything Criterion sees — that pays for lazily created
@@ -58,9 +58,9 @@ const WARM_UP: Duration = Duration::from_secs(1);
 
 /// How long each benchmark is sampled over.
 ///
-/// Thirty-six benchmarks share five minutes, which leaves each about eight
-/// seconds all-in. Two seconds of sampling on top of one of warm-up leaves room
-/// for preparation, for the untimed warm-ups and for teardown.
+/// Forty benchmarks share five minutes, which leaves each about seven and a
+/// half seconds all-in. Two seconds of sampling on top of one of warm-up leaves
+/// room for preparation, for the untimed warm-ups and for teardown.
 ///
 /// Reduced from three seconds after measurement, not before it. This value is a
 /// *floor* on what a benchmark costs, not a cap: a benchmark cheap enough to fit
@@ -69,8 +69,9 @@ const WARM_UP: Duration = Duration::from_secs(1);
 /// Two thirds of the matrix is in the first regime and pays this number
 /// directly; the rest is in the second and is unaffected by it. Lowering it from
 /// three seconds to two therefore bought roughly twenty-four seconds — one per
-/// padded benchmark — and lowering it further would buy less each time while
-/// gathering every padded estimate over a shorter window.
+/// padded benchmark, when the matrix was thirty-six — and lowering it further
+/// would buy less each time while gathering every padded estimate over a shorter
+/// window.
 ///
 /// The statistical configuration is untouched: a hundred samples still drive
 /// every estimate. What changes is how many iterations each of those samples
@@ -257,7 +258,7 @@ fn run(c: &mut Criterion) -> Result<(), i32> {
         let mut group = c.benchmark_group(scenario.slug());
         group.warm_up_time(WARM_UP).measurement_time(MEASUREMENT);
 
-        for &depth in &config.depths {
+        for &depth in &config.depths_for(scenario) {
             let order = rotated_order(rotation);
             rotation += 1;
 
