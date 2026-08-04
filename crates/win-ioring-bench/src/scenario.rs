@@ -140,7 +140,7 @@ pub struct Outcome {
     /// put a number in the account that reads as "no batching" when the truth is
     /// "no ring".
     ///
-    /// Filled in by [`Prepared::one`], not here — the scenario runs against a
+    /// Filled in by [`crate::session::Prepared::one`], not here — the scenario runs against a
     /// generic `Backend` and cannot see the driver. Every construction site in
     /// this module leaves it `None`.
     pub submitted: Option<SubmissionCounts>,
