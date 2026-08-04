@@ -665,3 +665,87 @@ fn the_batching_figure_is_per_iteration_not_per_session() {
          per-iteration delta"
     );
 }
+
+/// SC-001: at configured depth N, every ring backend records exactly N entries
+/// per submission — in the rolling shape as much as the batched one.
+///
+/// This criterion was rewritten after measurement. It originally required the
+/// batched window to record several times what a rolling window did, predicting
+/// the rolling figure near 1 because a rolling refill was assumed to submit
+/// about once per operation. It does not: the executor drains every ready
+/// completion in one poll pass before the driver submits again, so against a
+/// warm page cache a rolling refill rebuilds the whole window and one
+/// submission covers all of it. Batching was already at full depth before the
+/// batched shape existed.
+///
+/// The test covers **both** ring backends. The equivalence was first seen on the
+/// plain one, and publishing it on that basis would generalise across the two
+/// configurations this suite exists to distinguish.
+///
+/// It stays falsifiable in four distinguishable directions: a rolling figure
+/// near 1 would restore the original premise; a bulk-read figure below N would
+/// mean batches are not assembling whole; a figure above N would mean the delta
+/// is capturing submissions from outside the measured iteration; and a figure
+/// that moved between runs would contradict determinism.
+#[test]
+fn every_ring_backend_submits_exactly_its_depth_in_both_shapes() {
+    if !ring_available() {
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("equivalence", &config);
+    let depth = 4;
+
+    for scenario in Scenario::all() {
+        // Write-then-read runs two phases against one trace, so entries per
+        // submission is not a single window's figure and this identity does not
+        // describe it.
+        if scenario == Scenario::WriteThenRead {
+            continue;
+        }
+        let (block, operations) = config.work(scenario);
+        for which in [Which::RingPlain, Which::RingRegistered] {
+            let mut ledger = Ledger::new();
+            let job = Job {
+                scenario,
+                read_path: &read_path,
+                write_path: &write_path,
+                block,
+                operations,
+                depth,
+            };
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .expect("one backend against its own ledger cannot disagree");
+            let Record::Measured { submitted, .. } = record else {
+                panic!("{which:?} did not measure {}: {record:?}", scenario.name());
+            };
+            let counts = submitted.expect("a ring backend reports submission counts");
+            assert_eq!(
+                counts.entries as usize,
+                operations,
+                "{which:?} on {} covered {} entries for {operations} operations",
+                scenario.name(),
+                counts.entries
+            );
+            assert_eq!(
+                counts.entries,
+                counts.submissions * depth as u64,
+                "{which:?} on {} ({:?}) recorded {} entries over {} submissions, which is {:.2} \
+                 per submission rather than the configured {depth}",
+                scenario.name(),
+                scenario.shape(),
+                counts.entries,
+                counts.submissions,
+                counts.entries as f64 / counts.submissions as f64,
+            );
+        }
+    }
+}

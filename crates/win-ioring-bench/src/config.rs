@@ -130,16 +130,20 @@ impl Config {
 
     /// The depths one scenario is benchmarked at.
     ///
-    /// Bulk read omits depth 1, because a batched window one operation wide is
-    /// a rolling window one operation wide — the same run under two names,
-    /// costing a benchmark cell to measure nothing new.
+    /// Bulk read is benchmarked at the highest depth only. It was added to make
+    /// submission batching happen; measurement showed batching was already
+    /// happening at full depth in every rolling scenario, so the cells whose
+    /// batching result is now exactly predictable do not earn their share of the
+    /// run-time budget. What bulk read still measures uniquely is the
+    /// drain-to-zero tail and the different depth profile that follows from it,
+    /// and one depth demonstrates that.
     ///
     /// This is a statement about which cells the *matrix* measures, not an
-    /// invariant of the runner: the batched shape is well defined at depth 1
-    /// and `tests/comparison.rs` legitimately drives every scenario there.
+    /// invariant of the runner: the batched shape is well defined at every depth
+    /// and `tests/comparison.rs` legitimately drives every scenario at depth 1.
     pub fn depths_for(&self, scenario: Scenario) -> Vec<usize> {
         match scenario {
-            Scenario::BulkRead => self.depths.iter().copied().filter(|&d| d > 1).collect(),
+            Scenario::BulkRead => self.depths.iter().copied().max().into_iter().collect(),
             _ => self.depths.clone(),
         }
     }
@@ -227,17 +231,22 @@ mod tests {
         }
     }
 
-    /// A batched window one operation wide is a rolling window one operation
-    /// wide. Measuring it would cost a benchmark cell to learn nothing.
+    /// Bulk read is benchmarked at one depth: the deepest the run configures.
+    ///
+    /// Not a free choice — the batching result at every other depth is now
+    /// exactly predictable, so the cells would spend the run-time budget to
+    /// confirm arithmetic. Depth 1 in particular would be a batched window one
+    /// operation wide, which is a rolling window one operation wide.
     #[test]
-    fn bulk_read_is_not_benchmarked_at_depth_one() {
+    fn bulk_read_is_benchmarked_at_the_deepest_depth_only() {
         for (label, config) in [("default", Config::default()), ("small", Config::small())] {
             let depths = config.depths_for(Scenario::BulkRead);
-            assert!(
-                !depths.contains(&1),
-                "{label}: bulk read's benchmark depths {depths:?} include 1"
+            let deepest = config.depths.iter().copied().max().expect("a depth");
+            assert_eq!(
+                depths,
+                vec![deepest],
+                "{label}: bulk read's benchmark depths should be exactly the deepest"
             );
-            assert!(!depths.is_empty(), "{label}: bulk read has no depths left");
             for scenario in Scenario::all() {
                 if scenario != Scenario::BulkRead {
                     assert_eq!(
