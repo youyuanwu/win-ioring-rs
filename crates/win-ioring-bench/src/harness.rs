@@ -12,7 +12,9 @@ use std::cell::RefCell;
 use std::io;
 use std::path::Path;
 
-use crate::concurrency::{Achieved, Depth};
+use win_ioring::runtime::SubmissionCounts;
+
+use crate::concurrency::{Achieved, Depth, ShapeCheck};
 use crate::config::Config;
 use crate::fairness::{FairnessFailure, Ledger};
 use crate::scenario::{Outcome, Scenario};
@@ -157,6 +159,8 @@ impl Evidence {
             self.first = Some(Outcome {
                 trace: outcome.trace.clone(),
                 achieved: outcome.achieved,
+                shape: outcome.shape,
+                submitted: outcome.submitted,
             });
         }
         self.last = Some(outcome);
@@ -190,6 +194,18 @@ pub enum Record {
         achieved: Achieved,
         /// What it issued and delivered.
         trace: Trace,
+        /// What the ring submitted during the reported iteration, or `None` for
+        /// a backend with no ring.
+        ///
+        /// A delta over that one iteration, not a session total: see
+        /// [`Prepared::one`]. Entries are not exactly operations — a
+        /// registration and a cancellation occupy entries too — so entries per
+        /// submission is a proxy for operations per submission, close but not
+        /// identical.
+        submitted: Option<SubmissionCounts>,
+        /// Whether the reported iteration achieved the depth its scenario's
+        /// shape predicts.
+        shape: ShapeCheck,
         /// How many measured iterations ran.
         iterations: usize,
         /// Whether the verified trace came out of a timed iteration.
@@ -342,6 +358,8 @@ pub fn measure_combination(
         configuration,
         achieved: outcome.achieved,
         trace: outcome.trace,
+        submitted: outcome.submitted,
+        shape: outcome.shape,
         iterations: evidence.iterations,
         timed,
     })

@@ -7,8 +7,10 @@
 use std::io;
 use std::path::Path;
 
+use win_ioring::runtime::SubmissionCounts;
+
 use crate::backend::{Backend, Buffer};
-use crate::concurrency::{Achieved, Depth, Runner, Shape};
+use crate::concurrency::{Achieved, Depth, Runner, Shape, ShapeCheck};
 use crate::verify::{Phase, Trace};
 
 /// A deterministic generator, so a randomised scenario issues the same sequence
@@ -123,6 +125,25 @@ pub struct Outcome {
     pub trace: Trace,
     /// What concurrency it achieved.
     pub achieved: Achieved,
+    /// Whether that concurrency is what the scenario's declared shape predicts.
+    ///
+    /// Produced by the [`Runner`] rather than recomputed downstream, because the
+    /// runner is the only thing that knows whether a buffer pool smaller than
+    /// the window bounded the run — the one circumstance under which a
+    /// disagreement is forgivable.
+    pub shape: ShapeCheck,
+    /// What the ring submitted during this one iteration, if the backend has a
+    /// ring at all.
+    ///
+    /// `None` for the `tokio::fs` backends, which submit nothing: the figure is
+    /// not applicable to them rather than zero, and reporting it as zero would
+    /// put a number in the account that reads as "no batching" when the truth is
+    /// "no ring".
+    ///
+    /// Filled in by [`Prepared::one`], not here — the scenario runs against a
+    /// generic `Backend` and cannot see the driver. Every construction site in
+    /// this module leaves it `None`.
+    pub submitted: Option<SubmissionCounts>,
 }
 
 /// The seed every randomised scenario uses.
@@ -224,7 +245,13 @@ where
         .await?;
 
     let achieved = runner.achieved(operations);
-    Ok(Outcome { trace, achieved })
+    let shape_check = runner.shape_check(operations);
+    Ok(Outcome {
+        trace,
+        achieved,
+        shape: shape_check,
+        submitted: None,
+    })
 }
 
 /// Writes a file, commits it, then reads it back — both phases in `shape`.
@@ -283,5 +310,11 @@ async fn write_then_read<B: Backend>(
         .await?;
 
     let achieved = runner.achieved(operations);
-    Ok(Outcome { trace, achieved })
+    let shape_check = runner.shape_check(operations);
+    Ok(Outcome {
+        trace,
+        achieved,
+        shape: shape_check,
+        submitted: None,
+    })
 }

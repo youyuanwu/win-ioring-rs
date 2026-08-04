@@ -26,7 +26,7 @@ use std::io;
 use std::pin::pin;
 
 use futures::future::Either;
-use win_ioring::runtime::{Driver, Handle};
+use win_ioring::runtime::{Driver, Handle, SubmissionCounts};
 
 use crate::backend::Backend;
 use crate::backends::ioring;
@@ -170,11 +170,46 @@ impl Prepared {
     /// not, the backend is wrapped in a [`Weakened`] before the scenario ever
     /// sees it, so a deliberately weakened run travels this identical path
     /// rather than a parallel implementation a test wrote for itself.
+    ///
+    /// # Why the submission counts are differenced here
+    ///
+    /// The counter on the driver is cumulative over the session, and a session
+    /// spans preparation — which submits the registered backend's buffer
+    /// registration — an untimed warm-up, every timed iteration, and a shutdown
+    /// that submits cancellations. A single reading taken at the end would be a
+    /// session total diluted by all of that, and would answer a question nobody
+    /// asked.
+    ///
+    /// Bracketing the run here makes the figure a delta over **exactly the
+    /// iteration whose [`Outcome`] carries it** — the same iteration whose
+    /// achieved depth and trace are reported — and gives the warm-up its own
+    /// delta for free, which matters because a combination that ran no timed
+    /// iteration reports the warm-up's outcome.
     pub async fn one(&self, job: &Job<'_>, weakness: Weakness) -> io::Result<Outcome> {
-        match self {
+        let before = self.submission_counts();
+        let mut outcome = match self {
             Prepared::Pool(backend) => run_job(backend, job, weakness).await,
             Prepared::Plain { backend, .. } => run_job(backend, job, weakness).await,
             Prepared::Registered { backend, .. } => run_job(backend, job, weakness).await,
+        }?;
+        outcome.submitted = match (before, self.submission_counts()) {
+            (Some(before), Some(after)) => Some(SubmissionCounts {
+                submissions: after.submissions - before.submissions,
+                entries: after.entries - before.entries,
+            }),
+            _ => None,
+        };
+        Ok(outcome)
+    }
+
+    /// What this backend's ring has submitted so far, cumulatively, or `None`
+    /// for a backend that has no ring.
+    fn submission_counts(&self) -> Option<SubmissionCounts> {
+        match self {
+            Prepared::Pool(_) => None,
+            Prepared::Plain { handle, .. } | Prepared::Registered { handle, .. } => {
+                Some(handle.submission_counts())
+            }
         }
     }
 

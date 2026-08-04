@@ -602,3 +602,66 @@ fn each_scenario_drives_the_shape_it_declares() {
         }
     }
 }
+
+/// FR-004: the reported batching figure is a delta over one iteration, not a
+/// running total for the session.
+///
+/// A cumulative reading would grow with the number of timed iterations and
+/// would be diluted by the registered backend's buffer registration and by the
+/// cancellations shutdown submits — a whole-session average answering a
+/// question nobody asked. Running the same job at two iteration counts and
+/// requiring the same figure is what distinguishes the two: a session total
+/// cannot hold still while the session grows.
+#[test]
+fn the_batching_figure_is_per_iteration_not_per_session() {
+    if !ring_available() {
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("delta", &config);
+    let scenario = Scenario::BulkRead;
+    let (block, operations) = config.work(scenario);
+
+    let mut figures = Vec::new();
+    for iterations in [2, 16] {
+        let mut ledger = Ledger::new();
+        let job = Job {
+            scenario,
+            read_path: &read_path,
+            write_path: &write_path,
+            block,
+            operations,
+            depth: 4,
+        };
+        let mut timer = Untimed { iterations };
+        let record = measure_combination(
+            Which::RingPlain,
+            Weakness::None,
+            &config,
+            &job,
+            &mut ledger,
+            &mut timer,
+        )
+        .expect("one backend against its own ledger cannot disagree");
+        let Record::Measured { submitted, .. } = record else {
+            panic!("the ring backend did not measure: {record:?}");
+        };
+        let counts = submitted.expect("a ring backend reports submission counts");
+        assert!(
+            counts.submissions > 0,
+            "no submissions were counted over {iterations} iterations, so the figure is vacuous"
+        );
+        assert_eq!(
+            counts.entries as usize, operations,
+            "one iteration of {operations} operations covered {} entries",
+            counts.entries
+        );
+        figures.push(counts);
+    }
+
+    assert_eq!(
+        figures[0], figures[1],
+        "the figure changed with the iteration count, so it is a session total rather than a \
+         per-iteration delta"
+    );
+}
