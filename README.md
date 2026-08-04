@@ -142,15 +142,17 @@ println!("{:?}", &buffer[..result?  as usize]);
 
 Measured, in [docs/performance.md](docs/performance.md), and the short answer is
 **sometimes, and only at low concurrency**. At one operation in flight this crate
-now edges ahead of `tokio::fs` on random reads and on write-then-read; at eight
-and sixty-four operations in flight, and on 64 KiB sequential reads, `tokio::fs`
-is still ahead — by 1.18x to 1.90x with owned buffers, up to 2.04x with
-registered ones.
+is ahead of `tokio::fs` in all three scenarios — random reads at 0.55x,
+write-then-read at 0.86x, sequential reads at 0.81x. At eight and sixty-four
+operations in flight `tokio::fs` is still ahead, by 1.10x to 1.75x with owned
+buffers and 1.10x to 1.76x with registered ones.
 
-Run it yourself with `cargo run -p win-ioring-bench --release`; the harness runs
-one piece of application logic against every backend and rejects any run that did
-not do identical work. Treat the absolute figures as one host on one day — that
-document explains why, at some length.
+Run it yourself with `cargo bench -p win-ioring-bench`; one piece of application
+logic runs against every backend and any run that did not do identical work is
+rejected rather than reported. Every figure comes with a confidence interval, and
+`-- --save-baseline` and `-- --baseline` compare two runs. Treat the absolute
+figures as one host on one day — that document explains why, at some length, and
+explains which of the numbers above it declines to claim as an improvement.
 
 ## The unsafe layer
 

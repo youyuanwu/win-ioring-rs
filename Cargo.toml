@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace.dependencies]
 win-ioring = { path = "crates/win-ioring" }
+criterion = "0.8"
 futures = "0.3"
 bitflags = "2"
 tokio = { version = "1", features = ["time", "rt", "macros"] }

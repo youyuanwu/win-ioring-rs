@@ -125,6 +125,24 @@ its next pass.
 
 ## API consistency
 
+### The comparison's registered backend reports a registration it never made
+
+`IoRingRegistered::configuration()` prints "single-threaded driver; registered
+buffers and file handle; registration-naming operations", and the fairness
+account and `docs/performance.md` both quote it. The middle clause is false:
+`IoRingRegistered::register_file` exists and is never called, so
+`registered_file` stays `false`, `target()` always yields `FileTarget::Owned`,
+and the backend runs registered buffers against an owned handle.
+
+Harmless to the measurement — every backend in the comparison passes an owned
+handle, so the four are alike in exactly the way a comparison needs — but the
+printed configuration overstates what was measured, which is the one thing a
+fairness account exists not to do. Either call `register_file` during
+preparation, and accept that the registered backend then differs from its peers
+in two ways rather than one, or correct the string. It is listed here rather than
+fixed inside the Criterion migration because it changes what is measured, and
+that migration's whole premise is that what is measured did not change.
+
 ### SQE flags are not available on every path
 
 `read_with_flags` / `write_with_options` / `flush_with_options` expose
@@ -164,20 +182,43 @@ timer that would fix the submission retry above would fix this.
 
 ## Wake path
 
-### There is no committed guard on park cost
+### The guard on park cost is indirect, and is not wired to CI
 
 The driver's park machinery was measured at **13.99 µs per operation above the
 synchronous ring floor** at one operation in flight, and rewritten down to
 **2.46 µs**. Both figures came from a probe that was deleted afterwards, by
 decision: a benchmark nobody runs is a benchmark nobody maintains.
 
-The consequence is that nothing in this repository would catch a regression in
-that path. The comparison harness would notice a large one, but it cannot
-separate park cost from ring cost, so a small regression disappears into the
-difference between backends. Restoring the probe as a test with a threshold was
-considered and rejected as too brittle to be worth its maintenance; a
-lower-variance measurement of the same quantity would be the thing to build if
-this becomes a recurring worry.
+What now exists, which did not before: the comparison benchmark stores and
+compares against a **baseline**, so `cargo bench -p win-ioring-bench --
+--save-baseline pre` followed by the same command with `-- --baseline pre`
+reports, per benchmark, a change interval and a verdict. That is a committed
+guard on **end-to-end per-operation cost**, and a regression in the park path
+large enough to move the depth-1 figures would show up in it — the wake-path work
+moved random read at depth 1 by 38%, against a null run of this host whose change
+intervals reached −18% to +24% on an unchanged tree. So 38% is larger than
+anything the noise produced, but by roughly a factor of 1.6, not by an order of
+magnitude: this guard catches a regression of that size and would not reliably
+catch one half of it. (This sentence previously compared 38% against "the ±17%
+this host's own run-to-run noise produces". That figure is not what the null run
+measured — see [performance.md](performance.md) — and it was doing load-bearing
+work here, which is why it is corrected rather than dropped.)
+
+Three things it still does not do, and all three matter:
+
+- It **cannot attribute** a change to the park path. It measures the whole
+  per-operation cost, so a park regression and a ring regression look identical.
+- It is **not wired to CI**. `cargo test --benches` runs the target in test mode,
+  one iteration per benchmark against a small configuration, which proves the
+  measurement path works but times nothing. Nobody's build fails on a
+  performance change.
+- Its **baselines are local**. They live under `target/criterion` and are lost
+  with the `target` directory, so the comparison is between two runs somebody
+  chose to make on one machine, not against a recorded history.
+
+Restoring the probe as a test with a threshold was considered and rejected as too
+brittle to be worth its maintenance; a lower-variance measurement of the same
+quantity would be the thing to build if this becomes a recurring worry.
 
 ### Two faster dispatch mechanisms were measured and not taken
 
@@ -205,19 +246,39 @@ and sixty-four operations in flight — per-operation cost fell at both — but 
 a real cost that a workload with very high completion rates and a rarely-parked
 driver would pay.
 
-### The harness and a direct probe disagree by about 4 µs per operation
+### The comparison and a direct probe disagree by about 4 µs per operation
 
-At sixty-four operations in flight on random reads, the comparison harness
-reports roughly 9.3 µs per operation for this crate where a direct probe over the
-same shape of work measures roughly 5.1 µs. Both were measured on the same host.
-The difference belongs to something in the harness — trace recording, the
+At sixty-four operations in flight on random reads, the comparison benchmark
+reported roughly 9.3 µs per operation for this crate where a direct probe over
+the same shape of work measured roughly 5.1 µs. Both were measured on the same
+host, by the harness that has since been replaced.
+
+The difference belongs to something in the measurement — trace recording, the
 verification digest, the work loop's own bookkeeping — and has not been chased
-down. It does not affect the harness's *comparisons*, since every backend pays
-it, but it means the harness's absolute figures are not a measurement of the
-crate alone.
+down. It does not affect the *comparisons*, since every backend pays it, but it
+means the absolute figures are not a measurement of the crate alone.
+
+The move to Criterion did not resolve this and was not expected to: the same
+recording and digesting happen inside the timed closure, by design, because a
+comparison that verified outside the timed region would not be verifying what it
+timed. The current figure for that cell is 10.1 µs per I/O, which is the same
+quantity under a different instrument and not a new datum on this question.
 
 ## Test coverage gaps
 
+- **The weakening tests never weaken a ring backend.** The three tests in
+  `crates/win-ioring-bench/tests/fairness.rs` that require a weakened run to be
+  rejected take fixed positions from the available-backend list, and the two
+  `tokio::fs` backends are always first, so `tokio-pool-1` and `tokio-pool-512`
+  are the only backends ever weakened — on a host with an I/O ring as much as on
+  one without. The rejection they establish is a property of
+  `harness::measure_combination`, which is backend-agnostic, and the honest
+  control case does run all four; but `Weakness::HollowDelivery` exists because
+  the *registered* backend once reported transfer counts with nothing readable
+  behind them, and that is the backend the weakening never reaches. Looping the
+  weakening over every available backend, weakening backend *i* against an honest
+  reference, would close it, at the cost of the extra combinations' run time in
+  every `cargo test`.
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and
   `register_buffers`, but not for `register_files`, `read_registered` or
   `write_registered` — all three implement the check.
@@ -233,6 +294,18 @@ crate alone.
 
 ## Minor
 
+- **`cargo bench -p win-ioring-bench -- --list` builds the full working set.**
+  `--list` sets `bench=true, test=false`, so `test_mode()` correctly reports a
+  benchmark run and `Config::default()` is selected; Criterion's list mode then
+  never invokes a routine. The result is that merely asking which benchmarks
+  exist creates the 256 MiB read file, walks all thirty-six combinations through
+  preparation, warm-up, verification and teardown, and reports every one of them
+  as verified but not timed — minutes of I/O for a list of names. Detecting
+  `--list` alongside `--test` and using `Config::small()`, or returning before
+  preparation, would fix it. Not fixed inside the Criterion migration because
+  every additional argument `test_mode()` reads is another way for a benchmark
+  run to be misclassified as a test run, which is the failure that would silently
+  publish figures from the small configuration.
 - `cancel_holds` is a `Vec` cleared with a linear `retain` on every cancel
   completion. O(n) per completion; a `HashMap` would be O(1). Only matters at
   high cancel volume.

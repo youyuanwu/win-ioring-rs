@@ -9,7 +9,8 @@
 //!   deliberately not compared.
 //! - the **delivery digest**: a fold over what each operation actually put into
 //!   application-visible memory. Folded commutatively — the per-operation hashes
-//!   are combined with exclusive-or — so completion order cannot enter it.
+//!   are combined with wrapping addition, for the reason [`Trace::delivered`]
+//!   gives — so completion order cannot enter it.
 //!
 //! A backend that issues fewer operations, or delivers different bytes, differs
 //! in one of these and the run is rejected rather than reported.

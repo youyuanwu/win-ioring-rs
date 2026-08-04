@@ -13,7 +13,12 @@ use std::path::{Path, PathBuf};
 ///
 /// Under `target/`, which the repository already ignores, so a 256 MiB file
 /// never becomes a candidate for accidental commit. They persist between runs so
-/// repeated invocations are cheap, and `--clean` removes them.
+/// repeated invocations are cheap; deleting `target/bench-data` removes them.
+///
+/// There is deliberately no `clean` function here. The one entry point is
+/// Criterion's, and Criterion owns its argument surface; a `--clean` this crate
+/// could not offer through that surface would be a public function nothing
+/// calls, which is the second path FR-014 exists to reject.
 pub fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/bench-data")
@@ -69,15 +74,6 @@ pub fn warm(path: &Path) -> io::Result<u64> {
         total += n as u64;
     }
     Ok(total)
-}
-
-/// Removes the working files.
-pub fn clean() -> io::Result<()> {
-    let dir = data_dir();
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)?;
-    }
-    Ok(())
 }
 
 /// How much physical memory the operating system reports as available.

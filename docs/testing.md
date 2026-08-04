@@ -132,10 +132,105 @@ Getting that split wrong in either direction breaks the benchmark: comparing
 completion order makes it flaky, and not comparing delivered bytes lets a backend
 report transfers whose data never reached anywhere readable.
 
-Two tests deliberately weaken a backend — one issuing fewer operations, one
-reporting transfers with nothing readable behind them — and both must be
-*rejected* rather than reported. Without those, every other check is an
-assumption.
+Two tests in `crates/win-ioring-bench/tests/fairness.rs` deliberately weaken a
+backend and require the run to be **rejected** rather than reported. Each takes a
+*real* backend, wraps it so that it either skips one read in four or reports full
+transfers whose bytes never reach anywhere readable, and drives it through
+`harness::measure_combination`, which is the function a measured benchmark calls.
+The weakening is applied by `Prepared::one`, the same call the timed closure
+makes, so there is no second path a test could be passing on. Each asserts
+*which* mismatch came back, so a run that fell over for an unrelated reason is
+not counted as a pass, and a further test proves both weakenings change what was
+delivered rather than what was issued — otherwise the two above could be passing
+on the issue-trace comparison alone. A control case runs the matrix unweakened
+and asserts it agrees and that it delivered a non-zero number of bytes, because
+"everything agreed" is satisfied by everything doing nothing.
+
+**Which backend is weakened, precisely.** The weakening tests take fixed
+positions from the available list, and the two `tokio::fs` backends are always
+first, so on every host — with an I/O ring or without one — the backend weakened
+is `tokio-pool-1` or `tokio-pool-512` and never a ring one. This paragraph used
+to say each test took "every one the host can build, so a machine without an I/O
+ring still runs them against two", which reads as though a ring host runs them
+against four. It does not, and never did. What the tests establish is that
+`measure_combination` *rejects* a run that delivered less, and that function is
+backend-agnostic — the weakening is injected above it, in a wrapper that knows
+nothing about which backend it wraps. That the ring backends deliver what they
+report is established by the control case, which does run all four. Extending the
+weakening across the whole list is recorded in
+[pending-work.md](pending-work.md).
+
+**Two further tests fix *which run* is verified.** `measure_combination` runs an
+untimed warm-up and then the timed iterations, and verifies the last timed
+iteration rather than the warm-up. Every weakening above is uniform across runs,
+so all of them are caught either way and none can tell the two apart — a
+measurement that verified the warm-up would leave the whole suite green. So
+`Weakness::HollowFromRun` weakens from a given run onward: from the first timed
+iteration, leaving the warm-up honest, which is rejected only if a timed
+iteration's trace reached the ledger; and from the last iteration alone, against
+a ledger with nothing else in it, which nothing but the first-versus-last
+comparison inside `measure_combination` can reject. Both were checked by
+mutation, and each fails when its own line is removed.
+
+**The first of those paragraphs used to describe tests that did not exist in that
+form.** Until this was rewritten it said "Two tests deliberately weaken a backend
+… and both must fail the run", and the tests it named built traces by hand and
+compared them. They exercised the comparator; they never ran a backend and never touched
+the measurement path, so a measurement that had stopped consulting the comparator
+entirely would have left both passing. `docs/performance.md` carried the same
+overstatement and is corrected the same way.
+
+**This guarantee is held by mutation, not by inspection.** Two checks, both
+recorded verbatim in the workflow artifacts for the Criterion migration:
+`Ledger::observe` was deleted from its single call site, and `Weakness::SkipsWork`
+was made a no-op. Neither alone is sufficient. The first establishes that the
+comparator is consulted on the measured path; the second establishes that there
+was a real difference for it to catch, which is what stops the first from being
+satisfied by a test that would have failed anyway. Run both again if you move
+where the ledger is consulted.
+
+Two further mutations were checked when the run-order tests above were added, and
+both were live defects in the coverage until then: replacing the verified outcome
+with the warm-up's (`evidence.last.unwrap_or(warm)` → `warm`), and deleting the
+first-versus-last trace comparison. Each is now caught by exactly one test and by
+nothing else in the workspace.
+
+**What this establishes is that the four backends did the same work — not that
+the published timings are of that work.** The two are bound together by
+`Timer::time`, whose production implementation is `CriterionTimer` in
+`benches/comparison.rs`: it decides what Criterion measures, while the trace that
+gets verified is populated by whatever the closure it was handed actually runs.
+An implementation that ran that closure a few times and separately timed
+something else would produce a fully green fairness account over timings of
+nothing. The library's own tests cannot close this, because they all use
+`Untimed`, which by design times nothing. Two things stand in for a test: the
+binding is about ten reviewable lines in one file, and an unfiltered test-mode run
+fails if any measured combination comes back **not timed**, which is what a timer
+that stopped driving the closure would produce. Neither establishes that
+Criterion timed *that* closure; that rests on reading those ten lines.
+
+`cargo test --benches` runs the Criterion target in **test mode** — one iteration
+per benchmark, against `Config::small()` and a working directory of its own — so
+`cargo test --workspace --all-targets` exercises preparation, warm-up,
+verification and teardown end to end for **twenty-four** combinations: every
+scenario × backend pair, at two of the three depths. `Config::small()` has depths
+`[1, 4]` where the benchmark configuration has `[1, 8, 64]`, so 3 scenarios × 2
+depths × 4 backends is 24, not the 36 a benchmark run walks. (This paragraph said
+thirty-six until it was checked against `config.rs`; the path is the same one, but
+a dozen fewer combinations travel it.) The bench target detects test mode by
+Criterion's own rule rather than by testing for `--test` alone: a target that read
+it wrongly would build a 256 MiB working file inside the test suite.
+
+The bench crate also carries a driver-count observation seam, `drivers_built()`,
+which is a plain counter and deliberately **not** `#[cfg(test)]`. What it observes
+— how many drivers a run built, against how many ring combinations it measured —
+is a property of a *benchmark run*, and a seam compiled out of the benchmark could
+not observe it. Note what settles that property and what does not: the integration
+test asserts a **lower** bound, because the counter is process-global and the test
+binary is multi-threaded, so it excludes a driver being shared or skipped and
+cannot see an excess. The excess — a driver per iteration — is caught by the
+fairness account, which prints both numbers and marks them when they differ, and
+by a full `cargo bench` run in a process that builds nothing else.
 
 ### Proving that memory is *not* freed
 
@@ -201,6 +296,15 @@ the pattern recurs, not because the specific tests matter.
   still parks once per poll, so the count rises either way. It needed a separate
   *pass* counter. Found by mutating `take_nudge` to consume the flag without
   reporting it; two tests caught that mutation before the fix and four after.
+- **A test that proves a check is consulted does not prove there was anything to
+  catch.** Deleting `Ledger::observe` from the benchmark's measured path fails
+  the weakened-backend tests, which looks conclusive — but it would fail equally
+  for a weakening that did nothing, since a test asserting "this run is rejected"
+  fails whenever the run is not rejected, for any reason. The second mutation is
+  what closes it: making `Weakness::SkipsWork` a no-op must fail the test that
+  depends on it and *pass* the one that does not, which is only possible if the
+  weakening was real and specific. Both mutations are recorded verbatim in the
+  workflow artifacts, and neither is worth running without the other.
 
 ### Proving a wakeup cannot be lost
 

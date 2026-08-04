@@ -1,20 +1,28 @@
-//! Every backend, over every scenario, through the one entry point.
+//! Every backend, over every scenario, through the one seam that measures them.
 //!
 //! The point of these is not performance — a test host's timings are worthless —
 //! but the properties the comparison rests on: that the same logic runs against
-//! each backend, that they all do the same work, and that a backend which does
-//! *not* is rejected rather than reported.
+//! each backend, that they all do the same work, and that the facts a reader
+//! needs beside a timing are the ones a real measurement produced. That a
+//! backend which does *less* is rejected rather than reported is settled in
+//! `tests/fairness.rs`, by a backend that really does less.
+
+use std::io;
+use std::path::PathBuf;
 
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
 use win_ioring_bench::config::Config;
-use win_ioring_bench::harness::{Job, Which, run_one};
+use win_ioring_bench::fairness::Ledger;
+use win_ioring_bench::harness::{Job, Record, Timed, Timer, Untimed, Which, measure_combination};
 use win_ioring_bench::scenario::{Rng, Scenario};
-use win_ioring_bench::verify::{Phase, Trace};
+use win_ioring_bench::session::Prepared;
+use win_ioring_bench::verify::{Mismatch, Trace};
+use win_ioring_bench::weaken::Weakness;
 use win_ioring_bench::workload;
 
 /// Prepares a small working set for the tests.
-fn prepare(tag: &str, config: &Config) -> (std::path::PathBuf, std::path::PathBuf) {
+fn prepare(tag: &str, config: &Config) -> (PathBuf, PathBuf) {
     let dir = workload::data_dir().join(format!("test-{tag}"));
     std::fs::create_dir_all(&dir).unwrap();
     let read_path = dir.join("read.dat");
@@ -28,28 +36,23 @@ fn ring_available() -> bool {
     matches!(ioring::availability(), Availability::Available)
 }
 
-/// The block size and operation count each scenario uses in these tests.
-fn shape(config: &Config, scenario: Scenario) -> (u32, usize) {
-    let (block, total) = match scenario {
-        Scenario::SequentialRead => (config.sequential_block, config.read_file_bytes),
-        Scenario::RandomRead => (config.random_block, config.read_file_bytes / 8),
-        Scenario::WriteThenRead => (config.write_block, config.write_file_bytes),
-    };
-    (block, config.operations(total, block))
-}
-
-/// SC-014: every backend is instantiated from one common entry point and runs
-/// every scenario, with no scenario code naming an implementation.
+/// FR-001: one shared piece of application logic runs against every backend,
+/// with no scenario code naming an implementation.
+///
+/// Driven through `measure_combination`, the same function the benchmark target
+/// calls, with a timer that runs iterations and times nothing.
 #[test]
 fn every_backend_runs_every_scenario() {
     let config = Config::small();
     let (read_path, write_path) = prepare("all", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = shape(&config, scenario);
+        let (block, operations) = config.shape(scenario);
+        // One ledger for this (scenario, depth), shared across its backends.
+        let mut ledger = Ledger::new();
 
         for which in Which::all() {
-            if !ring_available() && matches!(which, Which::RingPlain | Which::RingRegistered) {
+            if !ring_available() && which.builds_a_driver() {
                 continue;
             }
             let job = Job {
@@ -60,32 +63,46 @@ fn every_backend_runs_every_scenario() {
                 operations,
                 depth: 1,
             };
-            let run = run_one(which, &config, &job);
-            let measured = run
-                .measured
-                .unwrap_or_else(|e| panic!("{} failed on {}: {e}", run.name, scenario.name()));
-            assert_eq!(
-                measured.samples.len(),
-                config.repeats,
-                "{} produced the wrong number of repeats",
-                run.name
-            );
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .unwrap_or_else(|f| panic!("{which:?} was rejected on {}: {f}", scenario.name()));
+            // What the deleted `samples.len() == config.repeats` assertion was
+            // standing in for: `Untimed` collects no samples and `Config` no
+            // longer carries a repeat count, so the property that survives is
+            // that the combination produced a measurement whose trace issued
+            // something.
+            let Record::Measured { name, trace, .. } = &record else {
+                panic!(
+                    "{which:?} did not produce a measurement on {}: {record:?}",
+                    scenario.name()
+                );
+            };
             assert!(
-                measured.trace.operations() > 0,
-                "{} issued nothing on {}",
-                run.name,
+                trace.operations() > 0,
+                "{name} issued nothing on {}",
                 scenario.name()
             );
         }
     }
 }
 
-/// SC-016 and SC-022: every backend issues the same operations and delivers the
+/// FR-002 and FR-003: the issue trace and the delivery digest are compared as
+/// part of a run, so every backend issues the same operations and delivers the
 /// same bytes.
 ///
 /// The property the whole comparison rests on. It is also what catches a backend
 /// that reports a transfer without putting the data anywhere the application can
 /// read — the exact hazard the registered path used to have.
+///
+/// The agreement is asserted through the ledger the measurement itself consults,
+/// rather than through a copy of that comparison written here.
 #[test]
 fn every_backend_does_the_same_work() {
     if !ring_available() {
@@ -95,9 +112,10 @@ fn every_backend_does_the_same_work() {
     let (read_path, write_path) = prepare("same", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = shape(&config, scenario);
+        let (block, operations) = config.shape(scenario);
 
-        let mut reference: Option<(String, Trace)> = None;
+        let mut ledger = Ledger::new();
+        let mut last_trace: Option<Trace> = None;
         for which in Which::all() {
             let job = Job {
                 scenario,
@@ -107,25 +125,23 @@ fn every_backend_does_the_same_work() {
                 operations,
                 depth: 4,
             };
-            let run = run_one(which, &config, &job);
-            let measured = run
-                .measured
-                .unwrap_or_else(|e| panic!("{} failed on {}: {e}", run.name, scenario.name()));
-            match &reference {
-                None => reference = Some((run.name, measured.trace)),
-                Some((ref_name, ref_trace)) => {
-                    if let Err(mismatch) = ref_trace.agrees_with(&measured.trace) {
-                        panic!(
-                            "{} disagreed with {ref_name} on {}: {mismatch}",
-                            run.name,
-                            scenario.name()
-                        );
-                    }
-                }
-            }
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .unwrap_or_else(|f| panic!("{which:?} disagreed on {}: {f}", scenario.name()));
+            let Record::Measured { trace, .. } = record else {
+                panic!("{which:?} did not run on {}", scenario.name());
+            };
+            last_trace = Some(trace);
         }
 
-        let (_, trace) = reference.expect("at least one backend ran");
+        let trace = last_trace.expect("at least one backend ran");
         assert!(
             trace.delivered_total() > 0,
             "{} delivered no bytes at all",
@@ -134,9 +150,73 @@ fn every_backend_does_the_same_work() {
     }
 }
 
-/// SC-021: a randomised scenario issues an identical sequence on two runs.
+/// The gate on the ledger being shared across a combination's backends rather
+/// than constructed per call.
 ///
-/// Without this the random scenario would compare different work each time, and
+/// Two real runs of the same backend through `measure_combination`, the second
+/// asked to do half the work, against one ledger: the rejection has to come out
+/// of the measured path. A ledger constructed per call — inside
+/// `measure_combination` itself — would make each run its own reference, no
+/// comparison could ever fail, and the cross-backend check would be gone with
+/// nothing to notice it.
+#[test]
+fn a_backend_that_ran_a_different_job_is_rejected() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("rejected", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
+    let depth = 1;
+    // The thread-pool backend, so this gate holds on a host without a ring.
+    let which = Which::TokioOne;
+
+    let mut ledger = Ledger::new();
+
+    let job = Job {
+        scenario,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth,
+    };
+    let mut timer = Untimed { iterations: 2 };
+    let first = measure_combination(
+        which,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("the first observation has nothing to disagree with");
+    assert!(
+        matches!(first, Record::Measured { .. }),
+        "the reference run did not produce a measurement"
+    );
+
+    let halved = Job {
+        operations: operations / 2,
+        ..job.clone()
+    };
+    let mut timer = Untimed { iterations: 2 };
+    let failure = measure_combination(
+        which,
+        Weakness::None,
+        &config,
+        &halved,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect_err("half the operations is not the same work");
+    assert!(
+        matches!(failure.mismatch, Mismatch::OperationCount { .. }),
+        "rejected for the wrong reason: {failure}"
+    );
+}
+
+/// A fixed seed issues an identical sequence on two runs.
+///
+/// Without it the random scenario would compare different work on each run, and
 /// every other check would be meaningless for it.
 #[test]
 fn the_random_scenario_is_reproducible() {
@@ -151,48 +231,286 @@ fn the_random_scenario_is_reproducible() {
     );
 }
 
-/// SC-017: a backend deliberately made to do less work is rejected, not
-/// reported. The check has to bite, or none of the others mean anything.
+/// SC-008: a backend the host cannot provide is reported as unavailable, not
+/// measured and not silently absent.
+///
+/// **Vacuous on a host that has a ring**, and it says so rather than pretending
+/// otherwise: there is no way to withdraw the platform's ring support from
+/// inside a test. The half of SC-008 that is never vacuous —
+/// prepared-then-failed — is the next test.
 #[test]
-fn a_backend_that_does_less_work_is_rejected() {
-    let mut honest = Trace::new();
-    let mut lazy = Trace::new();
-
-    for i in 0..8_u64 {
-        honest.issued(i * 64, 64);
-        lazy.issued(i * 64, 64);
+fn an_unavailable_backend_is_reported_not_measured() {
+    if ring_available() {
+        eprintln!(
+            "skipped: this host provides an I/O ring, so there is no unavailable backend to \
+             observe. The prepared-then-failed half of SC-008 is covered by \
+             a_backend_that_fails_after_preparing_is_reported_not_timed."
+        );
+        return;
     }
-    for i in 0..8_u64 {
-        honest.delivered(Phase::Read, i * 64, 64, &[7_u8; 64]);
-        // Skips the last two: fewer completions, less delivered.
-        if i < 6 {
-            lazy.delivered(Phase::Read, i * 64, 64, &[7_u8; 64]);
-        }
-    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("unavailable", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
 
+    let mut ledger = Ledger::new();
+    let job = Job {
+        scenario,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth: 1,
+    };
+    let mut timer = Untimed { iterations: 1 };
+    let record = measure_combination(
+        Which::RingPlain,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("an unavailable backend has no trace to disagree with");
+    let Record::Unavailable { name, reason } = &record else {
+        panic!("a host without a ring reported {record:?}");
+    };
+    assert!(!name.is_empty(), "an unavailable backend still has a name");
+    assert!(!reason.is_empty(), "and the platform's reason for it");
+}
+
+/// SC-008: a backend that prepares and then fails is reported as failed, never
+/// as a fast time.
+///
+/// The read path points at a file that does not exist. `prepare` still succeeds
+/// — nothing in it opens a working file — and the failure arrives in the
+/// **warm-up**, which is short-circuited to a `Record::Failed` before the timer
+/// ever runs.
+///
+/// This covers the warm-up half of the post-`prepare` failure path and **only**
+/// that half: because the missing file fails deterministically on the first
+/// call, no timed iteration runs and the error slot is never written. That slot
+/// is covered by `a_failure_inside_a_timed_iteration_fills_the_error_slot`.
+#[test]
+fn a_backend_that_fails_after_preparing_is_reported_not_timed() {
+    let config = Config::small();
+    let (_, write_path) = prepare("missing", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
+    let absent = workload::data_dir().join("test-missing").join("absent.dat");
+
+    let mut ledger = Ledger::new();
+    let job = Job {
+        scenario,
+        read_path: &absent,
+        write_path: &write_path,
+        block,
+        operations,
+        depth: 1,
+    };
+    let mut timer = Untimed { iterations: 3 };
+    let record = measure_combination(
+        Which::TokioOne,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("a backend that never produced a trace cannot disagree with one");
+    let Record::Failed { error, .. } = &record else {
+        panic!("a missing read file produced {record:?}");
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::NotFound,
+        "the failure carried the wrong reason: {error}"
+    );
+    // And the ledger holds nothing for this combination, so the next backend
+    // becomes the reference rather than being compared against a run that never
+    // happened.
     assert!(
-        honest.agrees_with(&lazy).is_err(),
-        "a backend completing fewer operations must be rejected"
+        ledger.reference(scenario, 1).is_none(),
+        "a failed run must not become the reference"
     );
 }
 
-/// The subtler form: the same operations, the same counts, but the bytes never
-/// reached anywhere the application could read them.
+/// The other half of the post-`prepare` failure path, and the only test that
+/// exercises the error slot a timed iteration writes into.
+///
+/// The failure has to arrive *after* a successful warm-up, so it has to be
+/// introduced between the warm-up and the iterations — and the only seam between
+/// them is the [`Timer`], which is `pub` for exactly this reason. This timer
+/// renames the read file aside, runs one iteration, and puts it back;
+/// `Prepared::one`'s open then fails **inside the timed region**, where the
+/// iteration closure has no way to return an error and records it into the slot
+/// instead. Without this test that slot is dead weight whose removal no test
+/// would notice.
 #[test]
-fn a_backend_that_delivers_nothing_readable_is_rejected() {
-    let mut honest = Trace::new();
-    let mut hollow = Trace::new();
+fn a_failure_inside_a_timed_iteration_fills_the_error_slot() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("vanishing", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
 
-    for i in 0..4_u64 {
-        honest.issued(i * 64, 64);
-        hollow.issued(i * 64, 64);
-        honest.delivered(Phase::Read, i * 64, 64, &[3_u8; 64]);
-        // Reports the same transfer count, but the application sees nothing.
-        hollow.delivered(Phase::Read, i * 64, 64, &[]);
+    /// Runs one iteration with the read file moved out of the way.
+    struct Vanishing {
+        /// The file to move aside for the duration of the iteration.
+        path: PathBuf,
+        /// Where to move it.
+        aside: PathBuf,
     }
 
+    impl Timer for Vanishing {
+        fn time<F, Fut>(&mut self, _timed: &Timed, prepared: &Prepared, mut one: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            std::fs::rename(&self.path, &self.aside).expect("the read file exists to be moved");
+            prepared.block_on(async {
+                one().await;
+            });
+            std::fs::rename(&self.aside, &self.path).expect("and is put back");
+        }
+    }
+
+    let mut ledger = Ledger::new();
+    let job = Job {
+        scenario,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth: 1,
+    };
+    let mut timer = Vanishing {
+        path: read_path.clone(),
+        aside: read_path.with_extension("aside"),
+    };
+    let record = measure_combination(
+        Which::TokioOne,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("a run whose iteration failed has no trace to compare");
+    let Record::Failed { error, .. } = &record else {
+        panic!("a read file that vanished mid-run produced {record:?}");
+    };
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::NotFound,
+        "the failure carried the wrong reason: {error}"
+    );
+    assert!(read_path.exists(), "the timer must put the file back");
+}
+
+/// SC-015 in miniature: repeated iterations do not grow the write file.
+///
+/// The write scenario truncates on open and writes one iteration's bytes from
+/// offset zero, so five iterations must leave exactly what one wrote. A file
+/// that grew would mean each iteration measured a larger job than the last.
+/// Phase 5 checks the same property on a full run.
+#[test]
+fn the_write_file_does_not_grow_across_iterations() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("growth", &config);
+    let scenario = Scenario::WriteThenRead;
+    let (block, operations) = config.shape(scenario);
+
+    let mut ledger = Ledger::new();
+    let job = Job {
+        scenario,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth: 1,
+    };
+    let mut timer = Untimed { iterations: 5 };
+    let record = measure_combination(
+        Which::TokioOne,
+        Weakness::None,
+        &config,
+        &job,
+        &mut ledger,
+        &mut timer,
+    )
+    .expect("five identical iterations must agree with each other");
     assert!(
-        honest.agrees_with(&hollow).is_err(),
-        "a backend that delivers no readable bytes must be rejected"
+        matches!(record, Record::Measured { .. }),
+        "the write scenario did not run: {record:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&write_path).unwrap().len(),
+        config.write_file_bytes(),
+        "five iterations left more than one iteration's bytes"
+    );
+}
+
+/// SC-014: a driver is built once per combination, not once per iteration.
+///
+/// **A lower bound, and one that excludes only the too-few case.**
+/// `drivers_built()` is a process-global counter and this binary runs its tests
+/// on several threads at once, so other tests here that build ring backends bump
+/// it between this test's two reads. An exact delta would fail intermittently,
+/// and a test that fails for reasons unrelated to its subject teaches a reader to
+/// ignore it. The price is that this assertion cannot see an *excess*: under a
+/// driver-per-iteration implementation `built` would be far larger than
+/// `combinations` and `built >= combinations` would hold just as happily. What
+/// it establishes is that a driver is not shared between combinations or skipped
+/// altogether — the failure a per-combination design invites in the other
+/// direction.
+///
+/// The too-many case is settled outside this test, deliberately: by the full
+/// `cargo bench` run in Phase 5, in a process that builds nothing else, and by
+/// the fairness account's own line, which prints drivers built against ring
+/// combinations measured and marks the two when they differ.
+#[test]
+fn one_driver_is_built_per_combination() {
+    if !ring_available() {
+        eprintln!("skipped: this host provides no I/O ring, so no driver is ever built");
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("drivers", &config);
+    let scenario = Scenario::SequentialRead;
+    let (block, operations) = config.shape(scenario);
+
+    let before = ioring::drivers_built();
+    let mut combinations = 0_usize;
+    for which in [Which::RingPlain, Which::RingRegistered] {
+        let mut ledger = Ledger::new();
+        let job = Job {
+            scenario,
+            read_path: &read_path,
+            write_path: &write_path,
+            block,
+            operations,
+            depth: 1,
+        };
+        let mut timer = Untimed { iterations: 8 };
+        let record = measure_combination(
+            which,
+            Weakness::None,
+            &config,
+            &job,
+            &mut ledger,
+            &mut timer,
+        )
+        .expect("one backend against its own ledger cannot disagree");
+        assert!(
+            matches!(record, Record::Measured { .. }),
+            "{which:?} did not run: {record:?}"
+        );
+        combinations += 1;
+    }
+    let built = ioring::drivers_built() - before;
+    assert!(
+        built >= combinations,
+        "{built} drivers for {combinations} ring combinations — fewer than one each"
     );
 }

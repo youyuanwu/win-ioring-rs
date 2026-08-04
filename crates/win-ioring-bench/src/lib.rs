@@ -14,15 +14,47 @@
 //! backend cannot look fast by issuing fewer operations or by putting the bytes
 //! somewhere the application cannot read them.
 //!
+//! # The seam
+//!
+//! [`harness::measure_combination`] is the one function that prepares a backend,
+//! warms it, measures it and consults the comparator, and everything that
+//! measures anything calls it. A [`session::Prepared`] holds the backend and,
+//! for the ring backends, the driver that must outlive every iteration; a
+//! [`harness::Timer`] decides only *how* the iterations are timed; and a
+//! [`fairness::Ledger`], owned by the caller and shared across one (scenario,
+//! depth)'s backends, is what every trace is put in front of. Because there is
+//! exactly one call site for the comparator, removing it breaks a test rather
+//! than quietly removing the check.
+//!
+//! That last claim is settled rather than asserted: [`weaken::Weakened`] is a
+//! backend that really does less, and `tests/fairness.rs` drives it through
+//! [`harness::measure_combination`] — the same function a measurement calls —
+//! and watches the run fail.
+//!
+//! # One entry point
+//!
+//! This crate has no binary. Its measurements run under Criterion, through
+//! `benches/comparison.rs`, invoked as `cargo bench -p win-ioring-bench`. That
+//! is deliberate: a second entry point of our own would be a second timing
+//! implementation to keep honest, and the reason to adopt a measurement
+//! framework at all is to stop maintaining one. Criterion supplies the
+//! statistics — warm-up, sampling, outlier classification, intervals, and
+//! comparison against a stored baseline — and this crate supplies what a timing
+//! cannot carry: [`account::Account`] records the achieved concurrency, the
+//! cache premise, the run order, the backend availability and the fairness
+//! verdict beside every figure, and writes them to `target/bench-data/`.
+//!
 //! See `docs/performance.md` for what the measurements do and do not tell you.
 
+pub mod account;
 pub mod backend;
 pub mod backends;
 pub mod concurrency;
 pub mod config;
+pub mod fairness;
 pub mod harness;
-pub mod measure;
-pub mod report;
 pub mod scenario;
+pub mod session;
 pub mod verify;
+pub mod weaken;
 pub mod workload;
