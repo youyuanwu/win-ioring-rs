@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 
 use crate::backend::{Backend, Buffer};
-use crate::concurrency::{Achieved, Depth, Runner};
+use crate::concurrency::{Achieved, Depth, Runner, Shape};
 use crate::verify::{Phase, Trace};
 
 /// A deterministic generator, so a randomised scenario issues the same sequence
@@ -158,7 +158,7 @@ where
         trace.issued(offset_of(i, block), block);
     }
 
-    let mut runner = Runner::new(backend, depth);
+    let mut runner = Runner::new(backend, depth, Shape::Rolling);
     runner
         .run(operations, Phase::Read, &mut trace, |i| {
             let offset = offset_of(i, block);
@@ -193,7 +193,7 @@ async fn write_then_read<B: Backend>(
     {
         let file = backend.open_write(path)?;
         let file = &file;
-        let mut runner = Runner::new(backend, depth);
+        let mut runner = Runner::new(backend, depth, Shape::Rolling);
         runner
             .run(operations, Phase::Write, &mut trace, |i| {
                 let offset = (i as u64) * block as u64;
@@ -212,7 +212,7 @@ async fn write_then_read<B: Backend>(
 
     let file = backend.open_read(path)?;
     let file = &file;
-    let mut runner = Runner::new(backend, depth);
+    let mut runner = Runner::new(backend, depth, Shape::Rolling);
     runner
         .run(operations, Phase::Read, &mut trace, |i| {
             let offset = (i as u64) * block as u64;
