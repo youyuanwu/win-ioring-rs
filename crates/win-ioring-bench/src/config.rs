@@ -267,11 +267,17 @@ mod tests {
         );
         assert_eq!(
             default.work(Scenario::BulkRead),
-            (default.sequential_block, default.operations_per_iteration.sequential),
+            (
+                default.sequential_block,
+                default.operations_per_iteration.sequential
+            ),
         );
         assert_eq!(
             small.work(Scenario::BulkRead),
-            (small.sequential_block, small.operations_per_iteration.sequential),
+            (
+                small.sequential_block,
+                small.operations_per_iteration.sequential
+            ),
         );
     }
 

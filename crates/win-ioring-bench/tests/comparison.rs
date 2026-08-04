@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
-use win_ioring_bench::config::Config;
 use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
+use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
 use win_ioring_bench::harness::{Job, Record, Timed, Timer, Untimed, Which, measure_combination};
 use win_ioring_bench::scenario::{Rng, Scenario};
@@ -536,11 +536,26 @@ fn each_scenario_drives_the_shape_it_declares() {
     let (read_path, write_path) = prepare("shape", &config);
     let depth = 4;
 
-    for (scenario, expected) in [
+    let table = [
         (Scenario::SequentialRead, Shape::Rolling),
         (Scenario::RandomRead, Shape::Rolling),
+        (Scenario::WriteThenRead, Shape::Rolling),
         (Scenario::BulkRead, Shape::Batched),
-    ] {
+    ];
+    assert_eq!(
+        table.len(),
+        Scenario::all().len(),
+        "a scenario was added without a row here, so its declared shape is unchecked"
+    );
+    for scenario in Scenario::all() {
+        assert!(
+            table.iter().any(|&(s, _)| s == scenario),
+            "{} has no row here, so its declared shape is unchecked",
+            scenario.name()
+        );
+    }
+
+    for (scenario, expected) in table {
         assert_eq!(
             scenario.shape(),
             expected,
@@ -578,7 +593,8 @@ fn each_scenario_drives_the_shape_it_declares() {
                 panic!("{which:?} did not measure {}: {record:?}", scenario.name());
             };
             assert_eq!(
-                achieved.mean, predicted,
+                achieved.mean,
+                predicted,
                 "{which:?} on {} at depth {depth} achieved {} where {expected:?} predicts {predicted}",
                 scenario.name(),
                 achieved.mean,

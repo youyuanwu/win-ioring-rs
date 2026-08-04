@@ -467,31 +467,26 @@ mod tests {
         let handed_out = std::cell::Cell::new(0_usize);
         let built = std::cell::Cell::new(0_usize);
 
-        let result = futures::executor::block_on(runner.run(
-            count,
-            Phase::Read,
-            &mut trace,
-            |i| {
-                // Buffers are returned to the pool as operations complete, so
-                // "supply" bounds how many may be outstanding at once, not how
-                // many the run may issue in total.
-                if handed_out.get() >= supply {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        let result = futures::executor::block_on(runner.run(count, Phase::Read, &mut trace, |i| {
+            // Buffers are returned to the pool as operations complete, so
+            // "supply" bounds how many may be outstanding at once, not how
+            // many the run may issue in total.
+            if handed_out.get() >= supply {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            handed_out.set(handed_out.get() + 1);
+            built.set(built.get() + 1);
+            let handed_out = &handed_out;
+            let built = &built;
+            let first = &built_when_first_polled;
+            Ok(async move {
+                if first.get().is_none() {
+                    first.set(Some(built.get()));
                 }
-                handed_out.set(handed_out.get() + 1);
-                built.set(built.get() + 1);
-                let handed_out = &handed_out;
-                let built = &built;
-                let first = &built_when_first_polled;
-                Ok(async move {
-                    if first.get().is_none() {
-                        first.set(Some(built.get()));
-                    }
-                    handed_out.set(handed_out.get() - 1);
-                    (i as u64, Ok((0_u32, FakeBuf::default())))
-                })
-            },
-        ));
+                handed_out.set(handed_out.get() - 1);
+                (i as u64, Ok((0_u32, FakeBuf::default())))
+            })
+        }));
         result.expect("the fake backend never fails an operation");
         (
             runner.achieved(count),
@@ -612,7 +607,10 @@ mod tests {
         // The rolling shape is the contrast: it awaits with the window full,
         // then tops it up one at a time.
         let (_, _, rolling) = drive(Shape::Rolling, 64, 8, usize::MAX);
-        assert_eq!(rolling, 8, "the rolling window also fills before its first await");
+        assert_eq!(
+            rolling, 8,
+            "the rolling window also fills before its first await"
+        );
     }
 
     /// A pool too small for a whole batch bounds depth without failing the run.
@@ -638,7 +636,10 @@ mod tests {
             Shortfall::Expected,
             "and its shortfall must be the expected kind"
         );
-        assert!(achieved.peak <= 3, "depth cannot exceed what the pool supplied");
+        assert!(
+            achieved.peak <= 3,
+            "depth cannot exceed what the pool supplied"
+        );
     }
 
     /// A run whose measured depth disagrees with its declared shape is caught.

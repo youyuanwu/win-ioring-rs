@@ -171,7 +171,15 @@ pub async fn run<B: Backend>(
             .await
         }
         Scenario::WriteThenRead => {
-            write_then_read(backend, write_path, block, operations, depth).await
+            write_then_read(
+                backend,
+                write_path,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+            )
+            .await
         }
     }
 }
@@ -183,7 +191,6 @@ pub async fn run<B: Backend>(
 /// batches. It is the only difference between sequential read and bulk read,
 /// and it is applied identically to every backend — there is no per-backend
 /// branch anywhere below this point.
-#[allow(clippy::too_many_arguments)]
 async fn positional_reads<B, F>(
     backend: &B,
     path: &Path,
@@ -220,12 +227,17 @@ where
     Ok(Outcome { trace, achieved })
 }
 
+/// Writes a file, commits it, then reads it back — both phases in `shape`.
+///
+/// `achieved` describes the read phase only: the write phase's runner is
+/// dropped, so its samples do not reach the report.
 async fn write_then_read<B: Backend>(
     backend: &B,
     path: &Path,
     block: u32,
     operations: usize,
     depth: Depth,
+    shape: Shape,
 ) -> io::Result<Outcome> {
     let pattern: Vec<u8> = (0..block).map(|i| (i % 251) as u8).collect();
     let mut trace = Trace::new();
@@ -239,7 +251,7 @@ async fn write_then_read<B: Backend>(
     {
         let file = backend.open_write(path)?;
         let file = &file;
-        let mut runner = Runner::new(backend, depth, Shape::Rolling);
+        let mut runner = Runner::new(backend, depth, shape);
         runner
             .run(operations, Phase::Write, &mut trace, |i| {
                 let offset = (i as u64) * block as u64;
@@ -258,7 +270,7 @@ async fn write_then_read<B: Backend>(
 
     let file = backend.open_read(path)?;
     let file = &file;
-    let mut runner = Runner::new(backend, depth, Shape::Rolling);
+    let mut runner = Runner::new(backend, depth, shape);
     runner
         .run(operations, Phase::Read, &mut trace, |i| {
             let offset = (i as u64) * block as u64;
