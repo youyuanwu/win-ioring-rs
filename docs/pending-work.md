@@ -264,6 +264,63 @@ comparison that verified outside the timed region would not be verifying what it
 timed. The current figure for that cell is 10.1 µs per I/O, which is the same
 quantity under a different instrument and not a new datum on this question.
 
+## Benchmark blind spots
+
+### The suite never exercises submission batching, which is the crate's central claim
+
+`submit_pending` issues a single `SubmitIoRing` covering every entry built since
+the last call — see "Submission is batched implicitly" in [design.md](design.md),
+and the assertion *"one SubmitIoRing must cover every entry built since the last
+one"* in `runtime/mod.rs`. That amortisation is the main thing a completion-based
+design offers over a thread pool.
+
+**No benchmark has ever engaged it.** `Runner::run` in
+`crates/win-ioring-bench/src/concurrency.rs` is a rolling window: it fills to the
+configured depth, then awaits *one* completion and refills *one*. Only the first
+poll of the `FuturesUnordered` issues a full batch; from then on operations are
+issued a few at a time, so a submission covers far fewer entries than the depth
+suggests. How many is not deterministic — it depends on how many completions are
+ready when the runner next yields — which is itself worth measuring.
+
+The published figures show the consequence, and the shape is diagnostic:
+
+| scenario | depth 1 | depth 8 | depth 64 |
+|---|---|---|---|
+| sequential read | 0.81x | 1.10x | 1.22x |
+| random read | 0.55x | 1.50x | 1.75x |
+| write then read | 0.86x | 1.16x | 1.12x |
+
+This crate wins every scenario at one operation in flight and loses every one of
+them, by a widening margin, as concurrency rises. That is backwards for a design
+whose advantage is supposed to *grow* with the number of operations outstanding.
+The depth-1 wins come from avoiding `tokio::fs`'s `spawn_blocking` hop, not from
+batching — at depth 1 there is nothing to batch. As depth rises the thread pool
+gains real parallelism while this crate stays on one thread paying close to one
+submission per operation, and the mechanism that should answer that never runs.
+
+**A bulk-read scenario would engage it**: issue N reads with no await between
+them, await all N, repeat. Every operation in a batch is then built before the
+driver's next pass, so one submission covers all N — which is precisely the case
+`design.md` describes and nothing measures.
+
+Three cautions for whoever picks this up:
+
+- **This is not a search for a flattering scenario.** The harness's whole
+  principle is one application logic across every backend, so `tokio::fs` would
+  get the same batch shape — and a 512-thread pool handed N tasks at once may
+  well do them in parallel. This crate could still lose. The answer is unknown,
+  which is the reason to measure rather than the reason to expect a win.
+- **A batched window is a different shape, not a better one.** It drains to zero
+  at each boundary, leaving the ring idle at the tail where a rolling window
+  stays full. Bulk read is a real application pattern — load a file in chunks,
+  scatter-read an index — but so is the rolling window, and both belong.
+- **Achieved-depth reporting needs teaching.** `Runner`'s `starved` flag trips
+  whenever outstanding falls below configured, which in a batched window happens
+  at every batch tail, so it would report a shortfall on every run.
+
+The fairness machinery needs no changes: issue order and delivered bytes are
+unaffected, so the trace and the digest work as they stand.
+
 ## Test coverage gaps
 
 - **The weakening tests never weaken a ring backend.** The three tests in
