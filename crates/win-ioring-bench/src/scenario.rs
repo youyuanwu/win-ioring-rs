@@ -225,7 +225,7 @@ where
     B: Backend,
     F: Fn(usize, u32) -> u64,
 {
-    let file = backend.open_read(path)?;
+    let file = backend.open_read(path).await?;
     let file = &file;
     let mut trace = Trace::new();
     for i in 0..operations {
@@ -276,7 +276,7 @@ async fn write_then_read<B: Backend>(
     }
 
     {
-        let file = backend.open_write(path)?;
+        let file = backend.open_write(path).await?;
         let file = &file;
         let mut runner = Runner::new(backend, depth, shape);
         runner
@@ -295,7 +295,7 @@ async fn write_then_read<B: Backend>(
         backend.sync(file).await?;
     }
 
-    let file = backend.open_read(path)?;
+    let file = backend.open_read(path).await?;
     let file = &file;
     let mut runner = Runner::new(backend, depth, shape);
     runner

@@ -412,10 +412,10 @@ mod tests {
         fn configuration(&self) -> String {
             "fake".into()
         }
-        fn open_read(&self, _path: &std::path::Path) -> io::Result<Self::File> {
+        async fn open_read(&self, _path: &std::path::Path) -> io::Result<Self::File> {
             Ok(())
         }
-        fn open_write(&self, _path: &std::path::Path) -> io::Result<Self::File> {
+        async fn open_write(&self, _path: &std::path::Path) -> io::Result<Self::File> {
             Ok(())
         }
         fn take_buffer(&self, _capacity: usize) -> io::Result<Self::Buf> {
