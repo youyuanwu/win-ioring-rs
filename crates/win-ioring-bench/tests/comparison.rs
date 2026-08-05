@@ -877,8 +877,8 @@ fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
 /// **1.79 to 2.06 times the floor**, so the floor is not the constraint; twice
 /// the floor is. A matrix whose floor exceeds half the budget will overrun it in
 /// practice while still looking affordable on paper, which is exactly the
-/// mistake this check exists to prevent. At forty benchmarks the floor is 120
-/// seconds against a 150-second limit, leaving room for about two more
+/// mistake this check exists to prevent. At fifty benchmarks the floor is 150
+/// seconds against a 180-second limit, leaving room for about two more
 /// combinations before something has to be traded away.
 #[test]
 fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
@@ -897,8 +897,10 @@ fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
         floor <= limit,
         "{benchmarks} benchmarks have a floor of {floor:?} against a {limit:?} limit, which is \
          half the {RUN_BUDGET:?} budget; recorded runs cost 1.8x to 2.1x their floor, so this \
-         matrix would overrun the budget in practice. Drop a scenario or a depth rather than \
-         raising the budget"
+         matrix would overrun the budget in practice. The multiplier is measured and the limit \
+         derived from it, so neither is the thing to change. RUN_BUDGET was raised once, from \
+         300 to 360 seconds, to admit a fifth backend; raising it again should be a decision \
+         someone argues for in the same terms rather than the reflex when this fires"
     );
 }
 
@@ -911,7 +913,7 @@ fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
 /// of this test: at forty-eight benchmarks the floor is 144 seconds, still
 /// inside the limit, so only the count noticed.
 #[test]
-fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
+fn the_matrix_is_fifty_benchmarks_costing_two_and_a_half_minutes_of_floor() {
     let config = Config::default();
     let benchmarks: usize = Scenario::all()
         .iter()
@@ -919,12 +921,12 @@ fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
         .sum();
 
     assert_eq!(
-        benchmarks, 40,
-        "the matrix is ten combinations of four backends"
+        benchmarks, 50,
+        "the matrix is ten combinations of five backends"
     );
     assert_eq!(
         Budget::CHOSEN.floor(benchmarks),
-        Duration::from_secs(120),
-        "forty benchmarks at one second of warm-up and two of measurement"
+        Duration::from_secs(150),
+        "fifty benchmarks at one second of warm-up and two of measurement"
     );
 }

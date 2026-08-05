@@ -35,8 +35,8 @@ use crate::workload::CachePremise;
 /// The time budget the run was given.
 ///
 /// Reported because two of these three moved from Criterion's defaults to fit
-/// the five-minute budget, and a reader comparing intervals needs to know how
-/// long each estimate was gathered over.
+/// the run budget, and a reader comparing intervals needs to know how long each
+/// estimate was gathered over.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     /// How long each benchmark is warmed up for.
@@ -56,9 +56,27 @@ pub struct Budget {
 /// small an iteration is, so the floor is `benchmarks * (warm_up +
 /// measurement)` and shrinking the per-iteration work cannot get under it.
 ///
-/// Five minutes is not a property of the machine. It is how long a run may take
-/// before people stop doing them, which is the only budget that matters.
-pub const RUN_BUDGET: Duration = Duration::from_secs(300);
+/// Six minutes is not a property of the machine. It is how long a run may take
+/// before people stop doing them, which is the only budget that matters — and
+/// being a chosen number rather than a measured one is exactly why it was the
+/// thing that moved.
+///
+/// It was five minutes until a fifth backend was added, growing the matrix 25%.
+/// The alternative was to cut the matrix or shorten the windows. Shortening the
+/// windows would have widened every published confidence interval, degrading
+/// every result in the report to protect a number nobody measured — and it
+/// would have done the most damage to the deep-queue comparisons, which is the
+/// exact question the fifth backend was added to answer. Dropping a scenario or
+/// a depth would have paid a real data point for a saving that still did not
+/// close the gap. So the chosen number moved, once, deliberately, and says here
+/// that it did.
+///
+/// What did **not** move is the empirically grounded half. `RUN_BUDGET / 2` as
+/// the affordability limit (`tests/comparison.rs`) is derived from measured
+/// floor-to-wall multipliers of 1.79x, 1.83x and 2.06x, and [`Budget::CHOSEN`]
+/// below is unchanged. Raising a chosen number is a decision; changing a
+/// measured one would be a claim.
+pub const RUN_BUDGET: Duration = Duration::from_secs(360);
 
 impl Budget {
     /// The budget this suite actually runs at.
@@ -618,10 +636,10 @@ fn depth_of(achieved: &Achieved) -> String {
 /// shape verdict without the figure does not say what batching actually
 /// happened.
 ///
-/// Reported as **not applicable** rather than zero for the `tokio::fs` backends.
-/// They submit nothing because they have no ring, and a zero here would read as
-/// "this backend batches nothing", which is a claim about a mechanism it does
-/// not have.
+/// Reported as **not applicable** rather than zero for the backends without a
+/// ring — the two `tokio::fs` configurations and compio. They submit nothing
+/// because they have no ring, and a zero here would read as "this backend
+/// batches nothing", which is a claim about a mechanism it does not have.
 ///
 /// Entries are not exactly operations: a buffer registration and a shutdown
 /// cancellation occupy entries too. The delta is taken around one iteration, so
@@ -897,9 +915,10 @@ mod tests {
     /// FR-005: the batching figure is reported for backends that have a ring and
     /// marked not applicable for those that do not.
     ///
-    /// A `tokio::fs` backend submits nothing because it has no ring. Rendering
-    /// that as `0.0 entries per submission` would read as a claim that it
-    /// batches nothing, which is a statement about a mechanism it does not have.
+    /// A `tokio::fs` or compio backend submits nothing because it has no ring.
+    /// Rendering that as `0.0 entries per submission` would read as a claim that
+    /// it batches nothing, which is a statement about a mechanism it does not
+    /// have.
     #[test]
     fn the_batching_figure_is_rendered_for_rings_and_marked_absent_otherwise() {
         let mut account = account();
