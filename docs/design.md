@@ -129,6 +129,16 @@ its driver accumulates submission queue entries and submits them with one
 because an operation that has not been issued yet cannot be batched with one that
 has.
 
+**How much this actually amortises is now measured, not assumed.**
+`Handle::submission_counts` reports submissions and the entries they covered, and
+the benchmark publishes the ratio per cell. It is exactly the configured
+concurrency in the warm-cache benchmark — 256 entries over 4 submissions at
+depth 64 — for a rolling window as well as an explicitly batched one, which was
+not the expected result and which is why the counter exists. See
+[performance.md](performance.md). The equivalence is a warm-cache finding: it
+rests on every completion in a window being ready in the same poll pass, and a
+cold cache has not been measured.
+
 ### Registration lends buffers, it does not take them
 
 The platform has no unregister entry point, and gives no signal that it has

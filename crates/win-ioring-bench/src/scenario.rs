@@ -7,8 +7,10 @@
 use std::io;
 use std::path::Path;
 
+use win_ioring::runtime::SubmissionCounts;
+
 use crate::backend::{Backend, Buffer};
-use crate::concurrency::{Achieved, Depth, Runner};
+use crate::concurrency::{Achieved, Depth, Runner, Shape, ShapeCheck};
 use crate::verify::{Phase, Trace};
 
 /// A deterministic generator, so a randomised scenario issues the same sequence
@@ -54,6 +56,14 @@ pub enum Scenario {
     RandomRead,
     /// Writes a file, commits it, then reads it back.
     WriteThenRead,
+    /// Reads a large file in batched windows: a whole window is built, then
+    /// drained to nothing before the next is built.
+    ///
+    /// Appended last deliberately. The benchmark rotates backend order on a
+    /// counter over the scenario/depth matrix, and appending keeps the counter
+    /// each of the other combinations receives exactly what it received before
+    /// this scenario existed.
+    BulkRead,
 }
 
 impl Scenario {
@@ -63,6 +73,23 @@ impl Scenario {
             Scenario::SequentialRead => "sequential read",
             Scenario::RandomRead => "random read",
             Scenario::WriteThenRead => "write then read",
+            Scenario::BulkRead => "bulk read",
+        }
+    }
+
+    /// The window shape this scenario drives.
+    ///
+    /// A declaration with a home, rather than something a reader has to infer
+    /// from which arm of [`run`] happens to be taken. The harness reads it to
+    /// compute the depth the run should achieve, so a scenario that quietly
+    /// drove a different shape than it declares is a checkable error rather
+    /// than an invisible one.
+    pub fn shape(self) -> Shape {
+        match self {
+            Scenario::SequentialRead | Scenario::RandomRead | Scenario::WriteThenRead => {
+                Shape::Rolling
+            }
+            Scenario::BulkRead => Shape::Batched,
         }
     }
 
@@ -77,15 +104,17 @@ impl Scenario {
             Scenario::SequentialRead => "sequential-read",
             Scenario::RandomRead => "random-read",
             Scenario::WriteThenRead => "write-then-read",
+            Scenario::BulkRead => "bulk-read",
         }
     }
 
     /// Every scenario, in report order.
-    pub fn all() -> [Scenario; 3] {
+    pub fn all() -> [Scenario; 4] {
         [
             Scenario::SequentialRead,
             Scenario::RandomRead,
             Scenario::WriteThenRead,
+            Scenario::BulkRead,
         ]
     }
 }
@@ -96,6 +125,25 @@ pub struct Outcome {
     pub trace: Trace,
     /// What concurrency it achieved.
     pub achieved: Achieved,
+    /// Whether that concurrency is what the scenario's declared shape predicts.
+    ///
+    /// Produced by the [`Runner`] rather than recomputed downstream, because the
+    /// runner is the only thing that knows whether a buffer pool smaller than
+    /// the window bounded the run — the one circumstance under which a
+    /// disagreement is forgivable.
+    pub shape: ShapeCheck,
+    /// What the ring submitted during this one iteration, if the backend has a
+    /// ring at all.
+    ///
+    /// `None` for the `tokio::fs` backends, which submit nothing: the figure is
+    /// not applicable to them rather than zero, and reporting it as zero would
+    /// put a number in the account that reads as "no batching" when the truth is
+    /// "no ring".
+    ///
+    /// Filled in by [`crate::session::Prepared::one`], not here — the scenario runs against a
+    /// generic `Backend` and cannot see the driver. Every construction site in
+    /// this module leaves it `None`.
+    pub submitted: Option<SubmissionCounts>,
 }
 
 /// The seed every randomised scenario uses.
@@ -114,10 +162,16 @@ pub async fn run<B: Backend>(
     depth: Depth,
 ) -> io::Result<Outcome> {
     match scenario {
-        Scenario::SequentialRead => {
-            positional_reads(backend, read_path, block, operations, depth, |i, _| {
-                (i as u64) * block as u64
-            })
+        Scenario::SequentialRead | Scenario::BulkRead => {
+            positional_reads(
+                backend,
+                read_path,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+                |i, _| (i as u64) * block as u64,
+            )
             .await
         }
         Scenario::RandomRead => {
@@ -126,25 +180,45 @@ pub async fn run<B: Backend>(
             let offsets: Vec<u64> = (0..operations)
                 .map(|_| rng.below(blocks) * block as u64)
                 .collect();
-            positional_reads(backend, read_path, block, operations, depth, move |i, _| {
-                offsets[i]
-            })
+            positional_reads(
+                backend,
+                read_path,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+                move |i, _| offsets[i],
+            )
             .await
         }
         Scenario::WriteThenRead => {
-            write_then_read(backend, write_path, block, operations, depth).await
+            write_then_read(
+                backend,
+                write_path,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+            )
+            .await
         }
     }
 }
 
 /// The shape both read scenarios share: `operations` positional reads, at
 /// offsets a closure decides, with at most `depth` outstanding.
+///
+/// `shape` decides whether that window rolls or is drained to nothing between
+/// batches. It is the only difference between sequential read and bulk read,
+/// and it is applied identically to every backend — there is no per-backend
+/// branch anywhere below this point.
 async fn positional_reads<B, F>(
     backend: &B,
     path: &Path,
     block: u32,
     operations: usize,
     depth: Depth,
+    shape: Shape,
     offset_of: F,
 ) -> io::Result<Outcome>
 where
@@ -158,7 +232,7 @@ where
         trace.issued(offset_of(i, block), block);
     }
 
-    let mut runner = Runner::new(backend, depth);
+    let mut runner = Runner::new(backend, depth, shape);
     runner
         .run(operations, Phase::Read, &mut trace, |i| {
             let offset = offset_of(i, block);
@@ -171,15 +245,26 @@ where
         .await?;
 
     let achieved = runner.achieved(operations);
-    Ok(Outcome { trace, achieved })
+    let shape_check = runner.shape_check(operations);
+    Ok(Outcome {
+        trace,
+        achieved,
+        shape: shape_check,
+        submitted: None,
+    })
 }
 
+/// Writes a file, commits it, then reads it back — both phases in `shape`.
+///
+/// `achieved` describes the read phase only: the write phase's runner is
+/// dropped, so its samples do not reach the report.
 async fn write_then_read<B: Backend>(
     backend: &B,
     path: &Path,
     block: u32,
     operations: usize,
     depth: Depth,
+    shape: Shape,
 ) -> io::Result<Outcome> {
     let pattern: Vec<u8> = (0..block).map(|i| (i % 251) as u8).collect();
     let mut trace = Trace::new();
@@ -193,7 +278,7 @@ async fn write_then_read<B: Backend>(
     {
         let file = backend.open_write(path)?;
         let file = &file;
-        let mut runner = Runner::new(backend, depth);
+        let mut runner = Runner::new(backend, depth, shape);
         runner
             .run(operations, Phase::Write, &mut trace, |i| {
                 let offset = (i as u64) * block as u64;
@@ -212,7 +297,7 @@ async fn write_then_read<B: Backend>(
 
     let file = backend.open_read(path)?;
     let file = &file;
-    let mut runner = Runner::new(backend, depth);
+    let mut runner = Runner::new(backend, depth, shape);
     runner
         .run(operations, Phase::Read, &mut trace, |i| {
             let offset = (i as u64) * block as u64;
@@ -225,5 +310,11 @@ async fn write_then_read<B: Backend>(
         .await?;
 
     let achieved = runner.achieved(operations);
-    Ok(Outcome { trace, achieved })
+    let shape_check = runner.shape_check(operations);
+    Ok(Outcome {
+        trace,
+        achieved,
+        shape: shape_check,
+        submitted: None,
+    })
 }

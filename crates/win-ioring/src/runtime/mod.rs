@@ -412,6 +412,34 @@ pub(crate) struct DriverInner {
     /// be injected here.
     #[cfg(test)]
     fail_next_registration: bool,
+    /// How many submissions the driver has completed successfully.
+    ///
+    /// Paired with [`DriverInner::submitted_entries`] to make the crate's
+    /// central design claim — that one `SubmitIoRing` covers every entry built
+    /// since the last one — an *observed* number rather than an asserted one.
+    /// The design documentation presents that amortisation as the main thing a
+    /// completion-based design offers over a thread pool, and until these two
+    /// counters existed nothing outside this module could tell a submission
+    /// covering sixty-four entries from sixty-four submissions covering one.
+    ///
+    /// Present in normal builds, not behind `#[cfg(test)]`, precisely because
+    /// the benchmark crate compiles `win-ioring` as an ordinary dependency and
+    /// is where the observation is wanted. **This is not dead weight: it is the
+    /// only seam through which batching is visible from outside.**
+    ///
+    /// A plain `u64` rather than an atomic or a `Cell`: `DriverInner` is
+    /// `!Send` and `!Sync` — it holds `Rc`, `Weak` and `RefCell` — so it is
+    /// reachable from exactly one thread, and every mutation here happens under
+    /// the `&mut self` of a single `RefCell` borrow. `u64` rather than `u32`
+    /// because entries accumulate across a whole benchmark run rather than
+    /// counting passes.
+    submissions: u64,
+    /// How many entries those submissions covered in total.
+    ///
+    /// See [`DriverInner::submissions`]. Dividing this by that yields the mean
+    /// number of entries a submission carried, which is the figure the batching
+    /// claim is about.
+    submitted_entries: u64,
 }
 
 impl DriverInner {
@@ -487,7 +515,13 @@ impl DriverInner {
         }
 
         match self.ring.submit(0, 0) {
-            Ok(_) => {
+            Ok(entries) => {
+                // The one place batching becomes observable. Recorded before
+                // anything else in this arm so the count cannot be skipped by a
+                // later early return, and with no branch of its own: the
+                // submission path's behaviour must be exactly what it was.
+                self.submissions += 1;
+                self.submitted_entries += u64::from(entries);
                 self.pending_submit = false;
                 self.submit_failures = 0;
                 self.slab.promote_built_to_submitted();
@@ -1263,6 +1297,8 @@ impl Driver {
                     passes: 0,
                     #[cfg(test)]
                     fail_next_registration: false,
+                    submissions: 0,
+                    submitted_entries: 0,
                 })
             }),
             on_error: observer,
@@ -1640,6 +1676,19 @@ impl Drop for ShutdownComplete {
     }
 }
 
+/// How much work the driver's submissions to the kernel have carried.
+///
+/// Returned by [`Handle::submission_counts`]. The ratio of `entries` to
+/// `submissions` is the mean number of entries one `SubmitIoRing` covered,
+/// which is the quantity the crate's batching claim is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmissionCounts {
+    /// How many submissions to the kernel have succeeded.
+    pub submissions: u64,
+    /// How many entries those submissions covered in total.
+    pub entries: u64,
+}
+
 /// A cloneable, single-threaded reference to a [`Driver`].
 #[derive(Clone)]
 pub struct Handle {
@@ -1729,6 +1778,32 @@ impl Handle {
     /// Returns the number of operations the driver is still tracking.
     pub fn outstanding(&self) -> usize {
         self.strong.borrow().slab.outstanding()
+    }
+
+    /// Returns how much work each submission to the kernel has carried.
+    ///
+    /// The driver batches implicitly: entries are built as operations are
+    /// started and handed to the kernel by a single `SubmitIoRing` covering
+    /// every entry built since the last one. That amortisation is the main
+    /// thing this design offers over a thread pool, and this accessor is the
+    /// **only way to see it from outside the runtime** — without it, a
+    /// submission covering sixty-four entries and sixty-four submissions
+    /// covering one entry each are indistinguishable to any observer.
+    ///
+    /// Deliberately available in normal builds rather than behind a test
+    /// configuration, because the caller that wants it is the benchmark
+    /// harness, which compiles this crate as an ordinary dependency. It exists
+    /// to make batching measurable; it is not dead weight.
+    ///
+    /// Counts accumulate over the driver's whole life and never decrease, so
+    /// callers interested in one interval should read the value at each end and
+    /// take the difference.
+    pub fn submission_counts(&self) -> SubmissionCounts {
+        let inner = self.strong.borrow();
+        SubmissionCounts {
+            submissions: inner.submissions,
+            entries: inner.submitted_entries,
+        }
     }
 
     /// Reads from `file` at `offset` into `buffer`.
@@ -3861,6 +3936,90 @@ mod tests {
         );
 
         drop((a, b, c));
+        drain(&driver);
+        handle.shutdown();
+    }
+
+    /// One submission covers every entry built since the last one — *counted*.
+    ///
+    /// The sibling test above can only assert that nothing is left owed, which a
+    /// driver submitting once per entry would also satisfy: it would clear
+    /// `pending_submit` too, just after three syscalls instead of one. Only the
+    /// entries-per-submission ratio separates those two behaviours, and this is
+    /// the test that would fail if the driver stopped batching.
+    #[test]
+    fn one_submission_covers_every_entry_built_since_the_last() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let before = handle.submission_counts();
+
+        // Four reads issued without awaiting any of them, so the driver has had
+        // no opportunity to submit in between.
+        let futures: Vec<_> = (0..4)
+            .map(|i| handle.read(&file, vec![0_u8; 64], 8, i * 8))
+            .collect();
+        assert_eq!(
+            driver.inner.borrow().slab.outstanding(),
+            4,
+            "all four must be built before anything is submitted"
+        );
+
+        driver.inner.borrow_mut().submit_pending();
+
+        let after = handle.submission_counts();
+        assert_eq!(
+            after.submissions - before.submissions,
+            1,
+            "four operations built together must cost exactly one submission"
+        );
+        assert_eq!(
+            after.entries - before.entries,
+            4,
+            "that one submission must have covered all four entries"
+        );
+
+        drop(futures);
+        drain(&driver);
+        handle.shutdown();
+    }
+
+    /// The counters start at zero and never decrease.
+    #[test]
+    fn submission_counts_start_at_zero_and_only_grow() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let file = readme();
+
+        let initial = handle.submission_counts();
+        assert_eq!(
+            initial,
+            SubmissionCounts {
+                submissions: 0,
+                entries: 0
+            },
+            "a driver that has submitted nothing must report nothing"
+        );
+
+        let mut previous = initial;
+        let mut futures = Vec::new();
+        for round in 0..3 {
+            futures.push(handle.read(&file, vec![0_u8; 64], 8, round * 8));
+            driver.inner.borrow_mut().submit_pending();
+            let now = handle.submission_counts();
+            assert!(
+                now.submissions >= previous.submissions && now.entries >= previous.entries,
+                "counts must never decrease: {previous:?} then {now:?}"
+            );
+            previous = now;
+        }
+        assert!(
+            previous.submissions > 0 && previous.entries > 0,
+            "three submitted rounds must have moved both counters"
+        );
+
+        drop(futures);
         drain(&driver);
         handle.shutdown();
     }

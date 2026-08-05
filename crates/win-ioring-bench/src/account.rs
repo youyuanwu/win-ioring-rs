@@ -24,7 +24,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::concurrency::{Achieved, Depth, Shortfall};
+use win_ioring::runtime::SubmissionCounts;
+
+use crate::concurrency::{Achieved, Depth, ShapeCheck, Shortfall};
 use crate::config::Config;
 use crate::harness::Record;
 use crate::scenario::Scenario;
@@ -45,6 +47,50 @@ pub struct Budget {
     pub sample_size: usize,
 }
 
+/// How long a full `cargo bench` run is allowed to take.
+///
+/// This existed only as prose until the matrix grew, at which point it needed
+/// to be a number something could check. It is the constraint that fixed
+/// [`Budget::warm_up`] and [`Budget::measurement`] below Criterion's defaults:
+/// a benchmark costs at least its warm-up plus its measurement window however
+/// small an iteration is, so the floor is `benchmarks * (warm_up +
+/// measurement)` and shrinking the per-iteration work cannot get under it.
+///
+/// Five minutes is not a property of the machine. It is how long a run may take
+/// before people stop doing them, which is the only budget that matters.
+pub const RUN_BUDGET: Duration = Duration::from_secs(300);
+
+impl Budget {
+    /// The budget this suite actually runs at.
+    ///
+    /// Every *statistical* parameter is Criterion's own — confidence level,
+    /// resampling count, noise threshold. The two timing parameters moved
+    /// because they had to: at Criterion's defaults of 3 s and 5 s this matrix
+    /// is over [`RUN_BUDGET`] before a single I/O is issued.
+    ///
+    /// It lives here rather than in the benchmark so that a test can check the
+    /// matrix still fits, which a constant in the bench target could not be
+    /// reached to do.
+    pub const CHOSEN: Self = Self {
+        warm_up: Duration::from_secs(1),
+        measurement: Duration::from_secs(2),
+        sample_size: 100,
+    };
+
+    /// The least time a matrix of `benchmarks` can take under this budget.
+    ///
+    /// Criterion's `measurement_time` is a floor, not a cap: a benchmark whose
+    /// samples fit inside the window is padded back up with extra iterations to
+    /// fill it, and one whose samples do not fit overruns it. So this is a lower
+    /// bound that no amount of shrinking the workload can beat, not an estimate
+    /// — real runs land well above it. Preparation, file creation and Criterion's
+    /// own analysis are all on top.
+    #[must_use]
+    pub fn floor(&self, benchmarks: usize) -> Duration {
+        (self.warm_up + self.measurement) * u32::try_from(benchmarks).unwrap_or(u32::MAX)
+    }
+}
+
 /// What one backend did in one combination.
 #[derive(Debug)]
 pub enum Standing {
@@ -56,6 +102,11 @@ pub enum Standing {
         io_count: usize,
         /// How many measured iterations ran.
         iterations: usize,
+        /// What the ring submitted during that iteration, or `None` for a
+        /// backend with no ring.
+        submitted: Option<SubmissionCounts>,
+        /// Whether the achieved depth is what the declared shape predicts.
+        shape: ShapeCheck,
     },
     /// It was prepared, warmed and verified, but the timer ran no iterations.
     ///
@@ -67,6 +118,14 @@ pub enum Standing {
         achieved: Achieved,
         /// How many I/Os one iteration issued.
         io_count: usize,
+        /// What the ring submitted during the warm-up.
+        ///
+        /// A real datum rather than a hole: the warm-up is bracketed by the same
+        /// mechanism a timed iteration is, so a combination the timer declined
+        /// still reports a figure belonging to an iteration that really ran.
+        submitted: Option<SubmissionCounts>,
+        /// Whether the achieved depth is what the declared shape predicts.
+        shape: ShapeCheck,
     },
     /// The host cannot provide this backend.
     Unavailable {
@@ -102,6 +161,8 @@ impl Entry {
                 trace,
                 iterations,
                 timed,
+                submitted,
+                shape,
             } => Entry {
                 backend: name.clone(),
                 configuration: configuration.clone(),
@@ -110,11 +171,15 @@ impl Entry {
                         achieved: *achieved,
                         io_count: trace.operations(),
                         iterations: *iterations,
+                        submitted: *submitted,
+                        shape: *shape,
                     }
                 } else {
                     Standing::VerifiedNotTimed {
                         achieved: *achieved,
                         io_count: trace.operations(),
+                        submitted: *submitted,
+                        shape: *shape,
                     }
                 },
             },
@@ -240,13 +305,26 @@ impl Account {
         let mut failures = Vec::new();
         for combination in &self.combinations {
             for entry in &combination.entries {
-                if let Standing::Failed { error } = &entry.standing {
-                    failures.push(format!(
-                        "{} at {} depth {}: {error}",
-                        entry.backend,
-                        combination.scenario.name(),
-                        combination.depth
-                    ));
+                let at = format!(
+                    "{} at {} depth {}",
+                    entry.backend,
+                    combination.scenario.name(),
+                    combination.depth
+                );
+                match &entry.standing {
+                    Standing::Failed { error } => failures.push(format!("{at}: {error}")),
+                    Standing::Timed { shape, .. } | Standing::VerifiedNotTimed { shape, .. } => {
+                        if shape.is_failure() {
+                            failures.push(format!(
+                                "{at}: achieved a mean depth of {} where its shape predicts {} — \
+                                 the run did not drive the shape it declared, so its timing \
+                                 measures something other than what it is labelled",
+                                shape.measured(),
+                                shape.predicted()
+                            ));
+                        }
+                    }
+                    Standing::Unavailable { .. } => {}
                 }
             }
         }
@@ -288,7 +366,7 @@ impl Account {
         )
         .unwrap();
         for scenario in Scenario::all() {
-            let (block, operations) = self.config.shape(scenario);
+            let (block, operations) = self.config.work(scenario);
             writeln!(
                 out,
                 "- {}: {operations} operations of {} per iteration, touching {}",
@@ -381,23 +459,32 @@ impl Account {
                         achieved,
                         io_count,
                         iterations,
+                        submitted,
+                        shape,
                     } => writeln!(
                         out,
                         "- **{}** — timed, {io_count} I/Os per iteration, {iterations} \
-                         iteration{}, achieved depth {}\n  - {}",
+                         iteration{}, achieved depth {}\n  - {}\n  - {}",
                         entry.backend,
                         if *iterations == 1 { "" } else { "s" },
                         depth_of(achieved),
-                        entry.configuration
+                        entry.configuration,
+                        batching_of(submitted, shape)
                     )
                     .unwrap(),
-                    Standing::VerifiedNotTimed { achieved, io_count } => writeln!(
+                    Standing::VerifiedNotTimed {
+                        achieved,
+                        io_count,
+                        submitted,
+                        shape,
+                    } => writeln!(
                         out,
                         "- **{}** — **verified but not timed** (filtered out), {io_count} I/Os \
-                         per iteration, achieved depth {}\n  - {}",
+                         per iteration, achieved depth {}\n  - {}\n  - {}",
                         entry.backend,
                         depth_of(achieved),
-                        entry.configuration
+                        entry.configuration,
+                        batching_of(submitted, shape)
                     )
                     .unwrap(),
                     Standing::Unavailable { reason } => {
@@ -419,14 +506,14 @@ impl Account {
         writeln!(out, "## Teardown and provenance").unwrap();
         writeln!(out).unwrap();
         // Against the ring combinations, not against all of them: the two
-        // thread-pool backends build no driver, so 36 measured combinations
-        // build 18 drivers and reading SC-014 against 36 would fail a correct
+        // thread-pool backends build no driver, so 40 measured combinations
+        // build 20 drivers and reading SC-014 against 40 would fail a correct
         // run.
         //
         // The narrative clause is conditional on the two numbers, because the
         // reassuring version of this line is the one a reader would most want to
         // be able to trust: printing "one per combination, not one per
-        // iteration" beside 1800 and 18 would be the exact false comfort the
+        // iteration" beside 2000 and 20 would be the exact false comfort the
         // line exists to prevent. Same shape as the write-file line below.
         writeln!(
             out,
@@ -523,6 +610,54 @@ fn depth_of(achieved: &Achieved) -> String {
     }
 }
 
+/// What one iteration's submissions say about batching, and whether the run
+/// drove the shape it declared.
+///
+/// The two belong on one line because neither is worth much alone: a batching
+/// figure from a run that drove the wrong shape describes the wrong thing, and a
+/// shape verdict without the figure does not say what batching actually
+/// happened.
+///
+/// Reported as **not applicable** rather than zero for the `tokio::fs` backends.
+/// They submit nothing because they have no ring, and a zero here would read as
+/// "this backend batches nothing", which is a claim about a mechanism it does
+/// not have.
+///
+/// Entries are not exactly operations: a buffer registration and a shutdown
+/// cancellation occupy entries too. The delta is taken around one iteration, so
+/// neither of those falls inside it, but the figure remains entries per
+/// submission used as a proxy for operations per submission.
+fn batching_of(submitted: &Option<SubmissionCounts>, shape: &ShapeCheck) -> String {
+    let batching = match submitted {
+        None => "batching: not applicable (no ring)".to_owned(),
+        Some(counts) if counts.submissions == 0 => {
+            "batching: no submissions in the measured iteration".to_owned()
+        }
+        Some(counts) => format!(
+            "batching: {:.1} entries per submission ({} entries over {} submissions)",
+            counts.entries as f64 / counts.submissions as f64,
+            counts.entries,
+            counts.submissions
+        ),
+    };
+    let verdict = match shape {
+        ShapeCheck::Matched { predicted, .. } => {
+            format!("shape: as predicted ({predicted:.2})")
+        }
+        ShapeCheck::PoolBound {
+            predicted,
+            measured,
+        } => format!(
+            "shape: {measured:.2} against a predicted {predicted:.2}, bounded by the buffer pool"
+        ),
+        ShapeCheck::Mismatched {
+            predicted,
+            measured,
+        } => format!("shape: **MISMATCHED** — {measured:.2} against a predicted {predicted:.2}"),
+    };
+    format!("{batching}; {verdict}")
+}
+
 /// A byte count a reader can scan.
 fn bytes(count: u64) -> String {
     const MIB: u64 = 1024 * 1024;
@@ -551,6 +686,23 @@ mod tests {
             peak: 4,
             mean: 3.9,
             shortfall: Shortfall::None,
+        }
+    }
+
+    /// A shape verdict that agrees, for the cases not about shape checking.
+    fn matched() -> ShapeCheck {
+        ShapeCheck::Matched {
+            predicted: 3.9,
+            measured: 3.9,
+        }
+    }
+
+    /// A shape verdict that disagrees and is not forgiven — what a run that
+    /// drove a different shape than it declared produces.
+    fn mismatched() -> ShapeCheck {
+        ShapeCheck::Mismatched {
+            predicted: 32.5,
+            measured: 56.125,
         }
     }
 
@@ -588,6 +740,8 @@ mod tests {
                         achieved: achieved(),
                         io_count: 64,
                         iterations: 100,
+                        submitted: None,
+                        shape: matched(),
                     },
                 },
                 Entry {
@@ -676,5 +830,122 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("broken"), "{failures:?}");
         assert!(failures[0].contains("the file vanished"), "{failures:?}");
+    }
+
+    /// A run that did not drive the shape it declared fails the suite, through
+    /// the same path a backend error takes — which is the path that writes the
+    /// account before returning non-zero. A mismatch that only annotated a line
+    /// would leave a wrongly-shaped run to be published as a measurement of the
+    /// shape it claimed.
+    #[test]
+    fn a_run_that_drove_the_wrong_shape_is_a_failure() {
+        let mut account = account();
+        account.record(Combination {
+            scenario: Scenario::BulkRead,
+            depth: 64,
+            order: vec![Which::RingPlain.slug()],
+            reference: Some("win-ioring (plain)".to_owned()),
+            entries: vec![Entry {
+                backend: "win-ioring (plain)".to_owned(),
+                configuration: "a ring".to_owned(),
+                standing: Standing::Timed {
+                    achieved: achieved(),
+                    io_count: 256,
+                    iterations: 100,
+                    submitted: Some(SubmissionCounts {
+                        submissions: 256,
+                        entries: 256,
+                    }),
+                    shape: mismatched(),
+                },
+            }],
+        });
+
+        let failures = account.failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("bulk read"), "{failures:?}");
+        assert!(failures[0].contains("56.125"), "{failures:?}");
+        assert!(failures[0].contains("32.5"), "{failures:?}");
+    }
+
+    /// A shape verdict that agrees is not a failure, or every run would fail and
+    /// the check would carry no information.
+    #[test]
+    fn a_run_that_drove_its_declared_shape_is_not_a_failure() {
+        let mut account = account();
+        account.record(Combination {
+            scenario: Scenario::BulkRead,
+            depth: 64,
+            order: vec![Which::RingPlain.slug()],
+            reference: Some("win-ioring (plain)".to_owned()),
+            entries: vec![Entry {
+                backend: "win-ioring (plain)".to_owned(),
+                configuration: "a ring".to_owned(),
+                standing: Standing::Timed {
+                    achieved: achieved(),
+                    io_count: 256,
+                    iterations: 100,
+                    submitted: None,
+                    shape: matched(),
+                },
+            }],
+        });
+
+        assert!(account.failures().is_empty(), "{:?}", account.failures());
+    }
+
+    /// FR-005: the batching figure is reported for backends that have a ring and
+    /// marked not applicable for those that do not.
+    ///
+    /// A `tokio::fs` backend submits nothing because it has no ring. Rendering
+    /// that as `0.0 entries per submission` would read as a claim that it
+    /// batches nothing, which is a statement about a mechanism it does not have.
+    #[test]
+    fn the_batching_figure_is_rendered_for_rings_and_marked_absent_otherwise() {
+        let mut account = account();
+        account.record(Combination {
+            scenario: Scenario::BulkRead,
+            depth: 64,
+            order: vec![Which::TokioOne.slug(), Which::RingPlain.slug()],
+            reference: Some("tokio::fs (blocking pool 1)".to_owned()),
+            entries: vec![
+                Entry {
+                    backend: "tokio::fs (blocking pool 1)".to_owned(),
+                    configuration: "a pool of one".to_owned(),
+                    standing: Standing::Timed {
+                        achieved: achieved(),
+                        io_count: 256,
+                        iterations: 100,
+                        submitted: None,
+                        shape: matched(),
+                    },
+                },
+                Entry {
+                    backend: "win-ioring (plain)".to_owned(),
+                    configuration: "a ring".to_owned(),
+                    standing: Standing::Timed {
+                        achieved: achieved(),
+                        io_count: 256,
+                        iterations: 100,
+                        submitted: Some(SubmissionCounts {
+                            submissions: 4,
+                            entries: 256,
+                        }),
+                        shape: matched(),
+                    },
+                },
+            ],
+        });
+
+        let rendered = account.render();
+        assert!(
+            rendered.contains("batching: not applicable (no ring)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("batching: 64.0 entries per submission (256 entries over 4 submissions)"),
+            "{rendered}"
+        );
     }
 }

@@ -39,7 +39,10 @@ Operations already coalesce: `submit_pending` issues one `SubmitIoRing` covering
 every entry built since the last call, so N operations started before the driver
 task next runs cost a single submission. This matches how `tokio-uring` behaves —
 it has no user-facing batch API either, and its driver accumulates submission
-queue entries and submits them with one `io_uring_enter`.
+queue entries and submits them with one `io_uring_enter`. That coalescing is now
+measured rather than asserted, and in the benchmark it reaches the full
+configured concurrency — see the entry on batching under "Benchmark blind spots"
+below, which lowers the priority of this one further.
 
 What is *not* possible is batching across await points: a caller who awaits each
 operation in turn gets one submission each, because there is nothing to batch
@@ -266,60 +269,75 @@ quantity under a different instrument and not a new datum on this question.
 
 ## Benchmark blind spots
 
-### The suite never exercises submission batching, which is the crate's central claim
+### Why this crate loses as depth rises is unknown; it is not a batching shortfall
 
-`submit_pending` issues a single `SubmitIoRing` covering every entry built since
-the last call — see "Submission is batched implicitly" in [design.md](design.md),
-and the assertion *"one SubmitIoRing must cover every entry built since the last
-one"* in `runtime/mod.rs`. That amortisation is the main thing a completion-based
-design offers over a thread pool.
+**This entry previously claimed that no benchmark engaged submission batching.
+That claim was wrong, on both of its factual counts, and the correction is worth
+more than the original suspicion was.**
 
-**No benchmark has ever engaged it.** `Runner::run` in
-`crates/win-ioring-bench/src/concurrency.rs` is a rolling window: it fills to the
-configured depth, then awaits *one* completion and refills *one*. Only the first
-poll of the `FuturesUnordered` issues a full batch; from then on operations are
-issued a few at a time, so a submission covers far fewer entries than the depth
-suggests. How many is not deterministic — it depends on how many completions are
-ready when the runner next yields — which is itself worth measuring.
+What it said: that `Runner::run`'s rolling window issues a full batch only on the
+first poll of its `FuturesUnordered`, so "a submission covers far fewer entries
+than the depth suggests", and that "how many is not deterministic".
 
-The published figures show the consequence, and the shape is diagnostic:
+What was measured. A counter on the driver — `Handle::submission_counts`, added
+for this — reports how many `SubmitIoRing` calls a run made and how many entries
+they covered. Across the default matrix, every ring cell:
 
 | scenario | depth 1 | depth 8 | depth 64 |
 |---|---|---|---|
-| sequential read | 0.81x | 1.10x | 1.22x |
-| random read | 0.55x | 1.50x | 1.75x |
-| write then read | 0.86x | 1.16x | 1.12x |
+| sequential read (256 ops) | 1.0 | 8.0 | 64.0 |
+| random read (512 ops) | 1.0 | 8.0 | 64.0 |
+| write then read (257 entries) | 1.0 | 7.8 | 51.4 |
+| bulk read (256 ops) | — | — | 64.0 |
 
-This crate wins every scenario at one operation in flight and loses every one of
-them, by a widening margin, as concurrency rises. That is backwards for a design
-whose advantage is supposed to *grow* with the number of operations outstanding.
-The depth-1 wins come from avoiding `tokio::fs`'s `spawn_blocking` hop, not from
-batching — at depth 1 there is nothing to batch. As depth rises the thread pool
-gains real parallelism while this crate stays on one thread paying close to one
-submission per operation, and the mechanism that should answer that never runs.
+Entries per submission. The rolling window batches at **exactly the configured
+depth**: 256 entries over 4 submissions at depth 64, not "far fewer". Where the
+figure is not the depth it is arithmetic, not shortfall — write-then-read's 257
+entries are four submissions of 64 and one of 1. And it is not indeterminate:
+three full runs produced **bit-identical** figures in all twenty ring cells, for
+both ring backends.
 
-**A bulk-read scenario would engage it**: issue N reads with no await between
-them, await all N, repeat. Every operation in a batch is then built before the
-driver's next pass, so one submission covers all N — which is precisely the case
-`design.md` describes and nothing measures.
+Why the original reasoning failed: it stopped at the first poll. The executor
+drains every ready completion in one pass before the driver submits again, so
+against a warm page cache — which is the documented condition these benchmarks
+run under — a rolling refill rebuilds the whole window before the next
+`submit_pending`, and one submission covers all of it. That is a property of the
+measurement conditions, not of the code; a cold cache would stagger completions
+and could well produce the ragged batches this entry assumed.
 
-Three cautions for whoever picks this up:
+The bulk-read scenario was added anyway, and earns its place by settling the
+question rather than by changing the answer. At depth 64 it batches 64.0 entries
+per submission — the same 256 entries over 4 submissions as the rolling
+sequential read, digit for digit — while reaching a mean depth of 32.5 against
+the rolling 56.1, so it is demonstrably a different shape that produces identical
+batching. Its timings sit inside the rolling band: 1.15x-1.28x against
+`tokio::fs`, where rolling sequential read at the same depth is 0.92x-1.61x.
 
-- **This is not a search for a flattering scenario.** The harness's whole
-  principle is one application logic across every backend, so `tokio::fs` would
-  get the same batch shape — and a 512-thread pool handed N tasks at once may
-  well do them in parallel. This crate could still lose. The answer is unknown,
-  which is the reason to measure rather than the reason to expect a win.
-- **A batched window is a different shape, not a better one.** It drains to zero
-  at each boundary, leaving the ring idle at the tail where a rolling window
-  stays full. Bulk read is a real application pattern — load a file in chunks,
-  scatter-read an index — but so is the rolling window, and both belong.
-- **Achieved-depth reporting needs teaching.** `Runner`'s `starved` flag trips
-  whenever outstanding falls below configured, which in a batched window happens
-  at every batch tail, so it would report a shortfall on every run.
+**What this leaves open.** The published figures still run the wrong way — this
+crate wins at depth 1 and loses by a widening margin as depth rises — and the
+explanation this document previously offered for that, "paying close to one
+submission per operation", is now known to be false. The crate's central claimed
+advantage was already fully in effect in every figure ever published here, and it
+loses anyway. Nothing currently establishes why. Candidates worth measuring, none
+of them supported by evidence yet: single-threaded completion processing becoming
+the bottleneck where a 512-thread pool gains real parallelism; per-completion
+dequeue cost; the cache effects raised in the wake-path entries above. Picking
+one of these to write down without measuring it would repeat the mistake this
+correction exists to fix.
 
-The fairness machinery needs no changes: issue order and delivered bytes are
-unaffected, so the trace and the digest work as they stand.
+The remaining measurement gap is a **cold-cache run**. Every figure here is
+warm-cache by design, and the batching equivalence above is explicitly a
+warm-cache result. Whether the shapes still coincide when completions arrive
+staggered is unmeasured, and it is the one condition under which the original
+suspicion could still turn out to be right.
+
+A correction to a second claim in the original entry: it said `Runner`'s
+`starved` flag "would report a shortfall on every run" in a batched window. It
+would not, because it could not report anything. Achieved depth was decoration —
+`Shortfall` annotates the account and fails nothing, at any shape. The check that
+now bites is `ShapeCheck`, which compares measured mean depth against a
+closed-form prediction for the declared shape and routes a mismatch through
+`Account::failures`.
 
 ## Test coverage gaps
 
@@ -355,7 +373,7 @@ unaffected, so the trace and the digest work as they stand.
   `--list` sets `bench=true, test=false`, so `test_mode()` correctly reports a
   benchmark run and `Config::default()` is selected; Criterion's list mode then
   never invokes a routine. The result is that merely asking which benchmarks
-  exist creates the 256 MiB read file, walks all thirty-six combinations through
+  exist creates the 256 MiB read file, walks all forty combinations through
   preparation, warm-up, verification and teardown, and reports every one of them
   as verified but not timed — minutes of I/O for a list of names. Detecting
   `--list` alongside `--test` and using `Config::small()`, or returning before

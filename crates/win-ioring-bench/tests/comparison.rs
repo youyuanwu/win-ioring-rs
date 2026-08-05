@@ -9,9 +9,12 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use win_ioring_bench::account::{Budget, RUN_BUDGET};
 use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring;
+use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
 use win_ioring_bench::harness::{Job, Record, Timed, Timer, Untimed, Which, measure_combination};
@@ -47,7 +50,7 @@ fn every_backend_runs_every_scenario() {
     let (read_path, write_path) = prepare("all", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = config.shape(scenario);
+        let (block, operations) = config.work(scenario);
         // One ledger for this (scenario, depth), shared across its backends.
         let mut ledger = Ledger::new();
 
@@ -112,7 +115,7 @@ fn every_backend_does_the_same_work() {
     let (read_path, write_path) = prepare("same", &config);
 
     for scenario in Scenario::all() {
-        let (block, operations) = config.shape(scenario);
+        let (block, operations) = config.work(scenario);
 
         let mut ledger = Ledger::new();
         let mut last_trace: Option<Trace> = None;
@@ -164,7 +167,7 @@ fn a_backend_that_ran_a_different_job_is_rejected() {
     let config = Config::small();
     let (read_path, write_path) = prepare("rejected", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
     let depth = 1;
     // The thread-pool backend, so this gate holds on a host without a ring.
     let which = Which::TokioOne;
@@ -251,7 +254,7 @@ fn an_unavailable_backend_is_reported_not_measured() {
     let config = Config::small();
     let (read_path, write_path) = prepare("unavailable", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let mut ledger = Ledger::new();
     let job = Job {
@@ -296,7 +299,7 @@ fn a_backend_that_fails_after_preparing_is_reported_not_timed() {
     let config = Config::small();
     let (_, write_path) = prepare("missing", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
     let absent = workload::data_dir().join("test-missing").join("absent.dat");
 
     let mut ledger = Ledger::new();
@@ -351,7 +354,7 @@ fn a_failure_inside_a_timed_iteration_fills_the_error_slot() {
     let config = Config::small();
     let (read_path, write_path) = prepare("vanishing", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     /// Runs one iteration with the read file moved out of the way.
     struct Vanishing {
@@ -419,7 +422,7 @@ fn the_write_file_does_not_grow_across_iterations() {
     let config = Config::small();
     let (read_path, write_path) = prepare("growth", &config);
     let scenario = Scenario::WriteThenRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let mut ledger = Ledger::new();
     let job = Job {
@@ -478,7 +481,7 @@ fn one_driver_is_built_per_combination() {
     let config = Config::small();
     let (read_path, write_path) = prepare("drivers", &config);
     let scenario = Scenario::SequentialRead;
-    let (block, operations) = config.shape(scenario);
+    let (block, operations) = config.work(scenario);
 
     let before = ioring::drivers_built();
     let mut combinations = 0_usize;
@@ -512,5 +515,416 @@ fn one_driver_is_built_per_combination() {
     assert!(
         built >= combinations,
         "{built} drivers for {combinations} ring combinations — fewer than one each"
+    );
+}
+
+/// FR-007: the shape a scenario declares is the shape it actually drives.
+///
+/// Runs bulk read and sequential read through the same seam, at the same depth,
+/// over the same number of operations, and holds each to the closed-form mean
+/// its shape predicts. The two predictions differ (2.5 against 3.90625 at depth
+/// 4 over 64 operations), so a bulk read that quietly rolled — or a sequential
+/// read that quietly batched — fails here rather than being reported as a
+/// measurement of something it is not.
+///
+/// The expected shape is written out here rather than read from
+/// [`Scenario::shape`]. Deriving it would move both sides of the comparison
+/// together, and a scenario that declared the wrong shape *and* drove it would
+/// pass: the test would confirm only that the runner is self-consistent, which
+/// was never in doubt.
+#[test]
+fn each_scenario_drives_the_shape_it_declares() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("shape", &config);
+    let depth = 4;
+
+    let table = [
+        (Scenario::SequentialRead, Shape::Rolling),
+        (Scenario::RandomRead, Shape::Rolling),
+        (Scenario::WriteThenRead, Shape::Rolling),
+        (Scenario::BulkRead, Shape::Batched),
+    ];
+    assert_eq!(
+        table.len(),
+        Scenario::all().len(),
+        "a scenario was added without a row here, so its declared shape is unchecked"
+    );
+    for scenario in Scenario::all() {
+        assert!(
+            table.iter().any(|&(s, _)| s == scenario),
+            "{} has no row here, so its declared shape is unchecked",
+            scenario.name()
+        );
+    }
+
+    for (scenario, expected) in table {
+        assert_eq!(
+            scenario.shape(),
+            expected,
+            "{} declares {:?}, not the {expected:?} this test measures it against",
+            scenario.name(),
+            scenario.shape()
+        );
+        let (block, operations) = config.work(scenario);
+        let predicted = predicted_mean_depth(expected, operations, depth);
+        let mut ledger = Ledger::new();
+
+        for which in Which::all() {
+            if !ring_available() && which.builds_a_driver() {
+                continue;
+            }
+            let job = Job {
+                scenario,
+                read_path: &read_path,
+                write_path: &write_path,
+                block,
+                operations,
+                depth,
+            };
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .unwrap_or_else(|f| panic!("{which:?} was rejected on {}: {f}", scenario.name()));
+            let Record::Measured { achieved, .. } = record else {
+                panic!("{which:?} did not measure {}: {record:?}", scenario.name());
+            };
+            assert_eq!(
+                achieved.mean,
+                predicted,
+                "{which:?} on {} at depth {depth} achieved {} where {expected:?} predicts {predicted}",
+                scenario.name(),
+                achieved.mean,
+            );
+        }
+    }
+}
+
+/// FR-004: the reported batching figure is a delta over one iteration, not a
+/// running total for the session.
+///
+/// A cumulative reading would grow with the number of timed iterations and
+/// would be diluted by the registered backend's buffer registration and by the
+/// cancellations shutdown submits — a whole-session average answering a
+/// question nobody asked. Running the same job at two iteration counts and
+/// requiring the same figure is what distinguishes the two: a session total
+/// cannot hold still while the session grows.
+#[test]
+fn the_batching_figure_is_per_iteration_not_per_session() {
+    if !ring_available() {
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("delta", &config);
+    let scenario = Scenario::BulkRead;
+    let (block, operations) = config.work(scenario);
+
+    let mut figures = Vec::new();
+    for iterations in [2, 16] {
+        let mut ledger = Ledger::new();
+        let job = Job {
+            scenario,
+            read_path: &read_path,
+            write_path: &write_path,
+            block,
+            operations,
+            depth: 4,
+        };
+        let mut timer = Untimed { iterations };
+        let record = measure_combination(
+            Which::RingPlain,
+            Weakness::None,
+            &config,
+            &job,
+            &mut ledger,
+            &mut timer,
+        )
+        .expect("one backend against its own ledger cannot disagree");
+        let Record::Measured { submitted, .. } = record else {
+            panic!("the ring backend did not measure: {record:?}");
+        };
+        let counts = submitted.expect("a ring backend reports submission counts");
+        assert!(
+            counts.submissions > 0,
+            "no submissions were counted over {iterations} iterations, so the figure is vacuous"
+        );
+        assert_eq!(
+            counts.entries as usize, operations,
+            "one iteration of {operations} operations covered {} entries",
+            counts.entries
+        );
+        figures.push(counts);
+    }
+
+    assert_eq!(
+        figures[0], figures[1],
+        "the figure changed with the iteration count, so it is a session total rather than a \
+         per-iteration delta"
+    );
+}
+
+/// SC-001: at configured depth N, every ring backend records exactly N entries
+/// per submission — in the rolling shape as much as the batched one.
+///
+/// This criterion was rewritten after measurement. It originally required the
+/// batched window to record several times what a rolling window did, predicting
+/// the rolling figure near 1 because a rolling refill was assumed to submit
+/// about once per operation. It does not: the executor drains every ready
+/// completion in one poll pass before the driver submits again, so against a
+/// warm page cache a rolling refill rebuilds the whole window and one
+/// submission covers all of it. Batching was already at full depth before the
+/// batched shape existed.
+///
+/// The test covers **both** ring backends. The equivalence was first seen on the
+/// plain one, and publishing it on that basis would generalise across the two
+/// configurations this suite exists to distinguish.
+///
+/// **The two shapes are held to different standards, and deliberately so.**
+///
+/// The batched shape is held to equality. It builds all N operations with no
+/// await between them, so all N are pending before the driver's next pass
+/// whatever the relative speed of the application and the kernel. One submission
+/// must cover the window; that is structural, and it is asserted as such.
+///
+/// The rolling shape is held to bounds rather than to equality, because its
+/// figure is not structural in the same way. A rolling window awaits one
+/// completion and refills one, so in principle a completion could arrive between
+/// two refills and the driver submit in between, splitting the window across
+/// submissions. Every measurement taken so far — three release `cargo bench`
+/// runs, bit-identical, and twenty debug runs — shows one submission covering
+/// the whole window, so that race has never been observed to bite. It is not
+/// asserted as an invariant because nothing in the design forbids it.
+///
+/// What is asserted for rolling is the property the scenario exists to measure:
+/// a submission covers *more than one* entry. That is the difference between
+/// batching and not batching, it is what a regression would destroy, and it is
+/// not implied by anything else in this test — the upper bound of `depth` is,
+/// since `entries` is pinned to `operations` above and the window never holds
+/// more than `depth` outstanding, so the upper bound is kept only as a sanity
+/// rail and carries no weight on its own.
+///
+/// This test has caught a broken `submit_pending` for real, not just under a
+/// deliberate mutation: a stale `win-ioring` rlib carrying an earlier mutation
+/// survived into a later build, and this assertion reported the resulting 1.00
+/// entries per submission. See `docs/testing.md` on rebuilding after mutation
+/// testing.
+///
+/// The release-build rolling figure is a published measurement, not a test
+/// assertion — see `docs/performance.md`. It is taken from `cargo bench`, which
+/// is the only build whose numbers this repository publishes.
+#[test]
+fn every_ring_backend_batches_its_submissions_in_both_shapes() {
+    if !ring_available() {
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("equivalence", &config);
+    let depth = 4;
+
+    for scenario in Scenario::all() {
+        // Write-then-read runs two phases against one trace, so entries per
+        // submission is not a single window's figure and this identity does not
+        // describe it.
+        if scenario == Scenario::WriteThenRead {
+            continue;
+        }
+        let (block, operations) = config.work(scenario);
+        for which in [Which::RingPlain, Which::RingRegistered] {
+            let mut ledger = Ledger::new();
+            let job = Job {
+                scenario,
+                read_path: &read_path,
+                write_path: &write_path,
+                block,
+                operations,
+                depth,
+            };
+            let mut timer = Untimed { iterations: 2 };
+            let record = measure_combination(
+                which,
+                Weakness::None,
+                &config,
+                &job,
+                &mut ledger,
+                &mut timer,
+            )
+            .expect("one backend against its own ledger cannot disagree");
+            let Record::Measured { submitted, .. } = record else {
+                panic!("{which:?} did not measure {}: {record:?}", scenario.name());
+            };
+            let counts = submitted.expect("a ring backend reports submission counts");
+            assert_eq!(
+                counts.entries as usize,
+                operations,
+                "{which:?} on {} covered {} entries for {operations} operations",
+                scenario.name(),
+                counts.entries
+            );
+
+            let per_submission = counts.entries as f64 / counts.submissions as f64;
+            match scenario.shape() {
+                Shape::Batched => assert_eq!(
+                    counts.entries,
+                    counts.submissions * depth as u64,
+                    "{which:?} on {} is batched, so one submission must cover the whole window \
+                     however fast the kernel is; it recorded {} entries over {} submissions, \
+                     which is {per_submission:.2} per submission rather than the configured \
+                     {depth}",
+                    scenario.name(),
+                    counts.entries,
+                    counts.submissions,
+                ),
+                Shape::Rolling => assert!(
+                    counts.entries > counts.submissions
+                        && counts.submissions * depth as u64 >= counts.entries,
+                    "{which:?} on {} is rolling, so a submission must cover more than one \
+                     entry — batching is the thing being measured — and no more than {depth}, \
+                     because the window never holds more than {depth} outstanding. It recorded \
+                     {} entries over {} submissions, which is {per_submission:.2} per \
+                     submission; 1.00 means batching stopped happening, and above {depth} \
+                     means more entries were counted than the window can hold",
+                    scenario.name(),
+                    counts.entries,
+                    counts.submissions,
+                ),
+            }
+        }
+    }
+}
+
+/// The matrix is exactly what the per-scenario depth lists say it is, and
+/// appending bulk read did not disturb the backend rotation of any combination
+/// that existed before it.
+///
+/// The benchmark advances a rotation counter once per (scenario, depth) in
+/// scenario-major order and rotates the backend running order by it, so that no
+/// backend is always first. Inserting a scenario anywhere but the end, or giving
+/// bulk read more than one depth, would shift the counter every later
+/// combination sees and silently re-order backends against every stored
+/// Criterion baseline.
+#[test]
+fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
+    let config = Config::default();
+
+    let mut cells = Vec::new();
+    for scenario in Scenario::all() {
+        for depth in config.depths_for(scenario) {
+            cells.push((scenario, depth));
+        }
+    }
+    assert_eq!(
+        cells.len(),
+        10,
+        "the matrix should be nine rolling cells plus one bulk-read cell: {cells:?}"
+    );
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|(s, _)| *s == Scenario::BulkRead)
+            .count(),
+        1,
+        "bulk read should occupy exactly one cell"
+    );
+
+    // The expected walk, written out rather than re-derived. Rebuilding it from
+    // Scenario::all() and depths_for -- the two things under test -- would move
+    // both sides of the comparison together: reordering the rolling scenarios
+    // shifts every rotation index and re-orders backends against every stored
+    // baseline, and a re-derived expectation would shift with it and notice
+    // nothing.
+    let expected = vec![
+        (Scenario::SequentialRead, 1),
+        (Scenario::SequentialRead, 8),
+        (Scenario::SequentialRead, 64),
+        (Scenario::RandomRead, 1),
+        (Scenario::RandomRead, 8),
+        (Scenario::RandomRead, 64),
+        (Scenario::WriteThenRead, 1),
+        (Scenario::WriteThenRead, 8),
+        (Scenario::WriteThenRead, 64),
+        (Scenario::BulkRead, 64),
+    ];
+    assert_eq!(
+        cells, expected,
+        "the rotation counter advances once per combination in this order, and the backend \
+         running order is that counter rotated; any change here re-orders backends against \
+         every stored Criterion baseline"
+    );
+
+    // Bulk read takes the last rotation, so it is the only combination whose
+    // backend order was newly assigned when it was added.
+    assert_eq!(
+        cells.last().map(|(s, _)| *s),
+        Some(Scenario::BulkRead),
+        "bulk read must be last, or it would displace an existing combination's rotation"
+    );
+}
+
+/// The matrix still fits the run budget, with the margin real runs need.
+///
+/// The floor is what Criterion charges before any I/O happens: warm-up plus
+/// measurement, per benchmark, whatever an iteration costs. Real runs land well
+/// above it — 247, 219 and 215 seconds were measured against a 120-second floor
+/// at forty benchmarks — because preparation, the untimed warm-ups, Criterion's
+/// analysis and the benchmarks that overrun their window are all on top.
+///
+/// The ratio matters more than the difference. Those three runs came in at
+/// **1.79 to 2.06 times the floor**, so the floor is not the constraint; twice
+/// the floor is. A matrix whose floor exceeds half the budget will overrun it in
+/// practice while still looking affordable on paper, which is exactly the
+/// mistake this check exists to prevent. At forty benchmarks the floor is 120
+/// seconds against a 150-second limit, leaving room for about two more
+/// combinations before something has to be traded away.
+#[test]
+fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
+    let config = Config::default();
+    let benchmarks: usize = Scenario::all()
+        .iter()
+        .map(|scenario| config.depths_for(*scenario).len() * Which::all().len())
+        .sum();
+
+    let floor = Budget::CHOSEN.floor(benchmarks);
+
+    // Three recorded runs cost 1.79x, 1.83x and 2.06x their floor. Half the
+    // budget is the largest floor that survives that multiplier.
+    let limit = RUN_BUDGET / 2;
+    assert!(
+        floor <= limit,
+        "{benchmarks} benchmarks have a floor of {floor:?} against a {limit:?} limit, which is \
+         half the {RUN_BUDGET:?} budget; recorded runs cost 1.8x to 2.1x their floor, so this \
+         matrix would overrun the budget in practice. Drop a scenario or a depth rather than \
+         raising the budget"
+    );
+}
+
+/// What the matrix costs today, recorded so a change to it is visible.
+///
+/// Separate from the budget check on purpose. Folding the two together would put
+/// an exact-count assertion in front of the affordability one, and the count
+/// would then fire first on every matrix change — leaving the budget check
+/// unable to fail for the reason it exists. Which was true of an earlier draft
+/// of this test: at forty-eight benchmarks the floor is 144 seconds, still
+/// inside the limit, so only the count noticed.
+#[test]
+fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
+    let config = Config::default();
+    let benchmarks: usize = Scenario::all()
+        .iter()
+        .map(|scenario| config.depths_for(*scenario).len() * Which::all().len())
+        .sum();
+
+    assert_eq!(
+        benchmarks, 40,
+        "the matrix is ten combinations of four backends"
+    );
+    assert_eq!(
+        Budget::CHOSEN.floor(benchmarks),
+        Duration::from_secs(120),
+        "forty benchmarks at one second of warm-up and two of measurement"
     );
 }

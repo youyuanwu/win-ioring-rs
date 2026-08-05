@@ -212,14 +212,22 @@ Criterion timed *that* closure; that rests on reading those ten lines.
 `cargo test --benches` runs the Criterion target in **test mode** — one iteration
 per benchmark, against `Config::small()` and a working directory of its own — so
 `cargo test --workspace --all-targets` exercises preparation, warm-up,
-verification and teardown end to end for **twenty-four** combinations: every
-scenario × backend pair, at two of the three depths. `Config::small()` has depths
-`[1, 4]` where the benchmark configuration has `[1, 8, 64]`, so 3 scenarios × 2
-depths × 4 backends is 24, not the 36 a benchmark run walks. (This paragraph said
-thirty-six until it was checked against `config.rs`; the path is the same one, but
-a dozen fewer combinations travel it.) The bench target detects test mode by
+verification and teardown end to end for **twenty-eight** combinations.
+`Config::small()` has depths `[1, 4]` where the benchmark configuration has
+`[1, 8, 64]`, so the three rolling scenarios contribute 3 × 2 × 4 = 24, and bulk
+read — which runs at the deepest configured depth alone — contributes 1 × 1 × 4 =
+4. That is 28 against the 40 a benchmark run walks. (This paragraph said
+thirty-six until it was checked against `config.rs`, then twenty-four until bulk
+read was added; the path is the same one, but a dozen fewer combinations travel
+it.) The bench target detects test mode by
 Criterion's own rule rather than by testing for `--test` alone: a target that read
 it wrongly would build a 256 MiB working file inside the test suite.
+
+The depths `Config::small()` resolves to are the ones with teeth. They are what
+every `cargo test` actually checks, so the closed-form depth predictions are
+asserted at *those* values — a rolling mean of 3.90625 at 64 operations and depth
+4, a batched mean of 2.5 — and not only at the default configuration's, which
+nothing but a full benchmark run ever evaluates.
 
 The bench crate also carries a driver-count observation seam, `drivers_built()`,
 which is a plain counter and deliberately **not** `#[cfg(test)]`. What it observes
@@ -305,6 +313,20 @@ the pattern recurs, not because the specific tests matter.
   depends on it and *pass* the one that does not, which is only possible if the
   weakening was real and specific. Both mutations are recorded verbatim in the
   workflow artifacts, and neither is worth running without the other.
+- **A mutation you think you reverted can outlive the revert.** Restoring a file
+  in a way that preserves its old modification time — `Move-Item` of a `.bak`
+  copy will do it — leaves Cargo with no reason to rebuild, so the mutated
+  artifact stays in `target/` and every later run measures it. This has produced
+  two false findings in this repository: a matrix size read as 52 when it is 28,
+  and an entries-per-submission figure read as 1.00 when it is the configured
+  depth. The second survived a code review and most of a day's investigation,
+  because it was stable on every run and flipped whenever anything forced a
+  rebuild — adding a package to `-p`, toggling an unrelated feature, inserting a
+  `println!` — which reads exactly like codegen sensitivity and is nothing of the
+  kind. After reverting a mutation, force the rebuild (touch the file, or restore
+  by content rather than by moving a file over it) and re-take any measurement
+  made since. If a result changes when you add an observer that cannot affect it,
+  suspect a stale artifact before you believe the result.
 
 ### Proving a wakeup cannot be lost
 
