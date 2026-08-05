@@ -142,17 +142,31 @@ println!("{:?}", &buffer[..result?  as usize]);
 
 Measured, in [docs/performance.md](docs/performance.md), and the short answer is
 **sometimes, and only at low concurrency**. At one operation in flight this crate
-is ahead of `tokio::fs` in all three scenarios — random reads at 0.55x,
-write-then-read at 0.86x, sequential reads at 0.81x. At eight and sixty-four
-operations in flight `tokio::fs` is still ahead, by 1.10x to 1.75x with owned
-buffers and 1.10x to 1.76x with registered ones.
+is ahead of `tokio::fs` on both read scenarios — random reads at 0.58x, sequential
+reads at 0.83x — and ahead on write-then-read with owned buffers at 0.91x. At
+eight and sixty-four operations in flight `tokio::fs` is still ahead, by 1.06x to
+1.40x with owned buffers and 1.11x to 1.47x with registered ones.
 
-Run it yourself with `cargo bench -p win-ioring-bench`; one piece of application
-logic runs against every backend and any run that did not do identical work is
-rejected rather than reported. Every figure comes with a confidence interval, and
-`-- --save-baseline` and `-- --baseline` compare two runs. Treat the absolute
-figures as one host on one day — that document explains why, at some length, and
-explains which of the numbers above it declines to claim as an improvement.
+**And the loss is not the I/O ring's fault.** The comparison now runs five
+backends, the fifth being [`compio`](https://github.com/compio-rs/compio) — which
+is completion-based on Windows but reaches the kernel through I/O completion
+ports, not through a ring. It loses to `tokio::fs` in the same cells, where the
+comparison resolves, by margins matching this crate's own, and of the twenty
+comparisons between it and this crate, all fourteen at
+depth 8 and depth 64 are statistically unresolved. It also wins where this crate
+wins — it beats `tokio::fs` at depth 1 on both read scenarios, and is the
+fastest backend in the matrix at depth 1 on random read. Two implementations sharing no
+code and no kernel interface land inside each other's noise wherever the loss
+happens, so whatever causes it is not this crate's ring code and not the ring
+API. That document says what it does and does not narrow.
+
+Run it yourself with `cargo bench -p win-ioring-bench` — about five minutes; one
+piece of application logic runs against every backend and any run that did not do
+identical work is rejected rather than reported. Every figure comes with a
+confidence interval, and `-- --save-baseline` and `-- --baseline` compare two
+runs. Treat the absolute figures as one host on one day — that document explains
+why, at some length, and explains which of the numbers above it declines to claim
+as an improvement.
 
 ## The unsafe layer
 

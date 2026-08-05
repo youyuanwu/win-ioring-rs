@@ -295,6 +295,32 @@ Whether to go further and adopt compio's unsized-plus-blanket factoring (which
 would give `Rc<[u8]>`, `Arc<[u8]>` and friends for free) is a separate and
 larger question, since it changes the trait's shape rather than adding impls.
 
+## A measured note on compio's fill length
+
+Everything above about compio's `IoBuf`/`IoBufMut` is read from its source. One
+thing this repository has now *measured*, while building the compio comparison
+backend, is worth recording beside it because it is not visible in the trait
+definitions.
+
+**compio's `read_at` takes no length. It fills to the buffer's capacity.** For a
+`Vec` that is `capacity()`, not `len()` — a 4096-byte request against a buffer
+holding 8192 bytes of capacity transfers **8192**. The bound is `Slice`:
+`buffer.slice(..len)` limits the fill to `min(len, capacity)`. This is measured,
+not inferred, and it is pinned by the
+`over_capacity_reads_are_bounded_by_the_request` test in
+`crates/win-ioring-bench/src/backends/compio.rs`, which fails on both the
+transferred count and the recovered length if the slice is removed.
+
+The recovered length is the second half of it. On completion compio applies
+`SetLen::advance_to`, which sets the length **only if the new length is greater
+than the current one**
+(`compio-buf-0.8.3/src/io_buf.rs:759-767`) — so the length after a read is
+`max(pre-read length, delivered)` rather than the delivered count. A caller that
+reads the buffer's length to find out how much arrived will be wrong whenever the
+read was short. The transfer count in the operation's result is the authoritative
+figure, which is the same rule this document states for `set_buf_init` above, met
+from the other direction.
+
 ## Sources
 
 - `tokio-uring/src/buf/io_buf.rs`, `src/buf/io_buf_mut.rs`,
