@@ -291,7 +291,8 @@ impl OpenCost {
     /// Summarises one set of per-open samples.
     ///
     /// Sorts in place. The 90th percentile is taken at index `len * 9 / 10`,
-    /// clamped to the last element, which for 200 samples is the 180th — a
+    /// clamped to the last element, which for 200 samples is index 180 — the
+    /// 181st value — a
     /// nearest-rank percentile, not an interpolated one, because interpolating
     /// between two adjacent measured durations invents a value that was not
     /// observed.
@@ -643,7 +644,7 @@ impl Account {
         writeln!(
             out,
             "- drivers built: {} against {} ring combinations measured — {} (the thread-pool \
-             backends build none)",
+             and compio backends build none)",
             self.drivers_built,
             self.ring_combinations,
             if self.drivers_built == self.ring_combinations {

@@ -14,11 +14,17 @@ run it.
 ## The headline
 
 **`tokio::fs` is still faster than this crate on most of what is measured here,
-but not at one operation in flight.** At depth 1 this crate is ahead in the two
-read scenarios — random reads at 0.58x owned and 0.61x registered, sequential
-reads at 0.83x and 0.85x — and ahead with owned buffers in write-then-read at
-0.91x. At eight and sixty-four operations in flight it loses everywhere, by 1.06x
-to 1.40x with owned buffers and by 1.11x to 1.47x with registered ones.
+but not at one operation in flight.** At depth 1 this crate is ahead on random
+reads — 0.58x owned and 0.61x registered, and both resolve. Its other depth-1
+leads do not: sequential reads at 0.83x and 0.85x, and write-then-read with owned
+buffers at 0.91x, are all inside the null band, and no direction is claimed from
+them. At eight and sixty-four operations in flight every point estimate is a
+loss, ranging 1.06x to 1.40x with owned buffers and 1.11x to 1.47x with
+registered ones — but only **six of those fourteen comparisons resolve**: random
+reads at both depths (1.36x and 1.40x owned, 1.47x and 1.32x registered), and,
+with registered buffers only, sequential read and write-then-read at depth 64
+(1.25x and 1.31x). The direction is consistent across all fourteen; the evidence
+for it is much thinner than fourteen cells.
 
 **And a fifth backend now says the loss is not about the ring.** `compio`, which
 is completion-based on Windows but uses I/O completion ports rather than an I/O
@@ -942,9 +948,11 @@ scenario, and it is stated here so nobody discovers it from a wear indicator.
 
 ## What to take from it
 
-- **At depth 1 the crate is ahead on both read scenarios**, by 0.83x/0.85x on
-  sequential and 0.58x/0.61x on random reads, and ahead with owned buffers on
-  write-then-read at 0.91x. This is where the wake-path work landed: with one
+- **At depth 1 the crate is ahead on random reads**, by 0.58x/0.61x, and that
+  result resolves. Its sequential-read leads (0.83x/0.85x) and its owned-buffer
+  write-then-read lead (0.91x) are inside the null band and resolve nothing, so
+  read them as "no worse", not as wins. Depth 1 is where the wake-path work
+  landed: with one
   operation in flight there is nothing to amortise the cost of parking over, so
   the driver paid it in full on every operation. The exception is
   write-then-read with registered buffers, which read 1.64x here against 0.85x
@@ -968,8 +976,11 @@ scenario, and it is stated here so nobody discovers it from a wear indicator.
   nine and ahead in three in the previous one. Its own cost is excluded from
   these figures, so this is the per-operation comparison alone.
 - **Random reads are where the crate loses hardest above depth 1**, at 1.32x to
-  1.47x, with sequential reads at 1.20x to 1.25x and write-then-read at 1.06x to
-  1.31x. This bullet used to name sequential reads as the worst case at
+  1.47x, and random read is the only scenario whose losses resolve at *both*
+  depths and for *both* buffer modes. Sequential read runs 1.20x to 1.25x and
+  write-then-read 1.06x to 1.31x, but of those eight comparisons only two
+  resolve — sequential and write-then-read at depth 64, registered buffers only.
+  This bullet used to name sequential reads as the worst case at
   "1.10x to 1.25x", which was never what the table said: those are the smallest
   ratios above depth 1, not the largest. Sequential read is the most expensive
   scenario in *absolute* microseconds per I/O, because 64 KiB transfers are

@@ -142,10 +142,14 @@ println!("{:?}", &buffer[..result?  as usize]);
 
 Measured, in [docs/performance.md](docs/performance.md), and the short answer is
 **sometimes, and only at low concurrency**. At one operation in flight this crate
-is ahead of `tokio::fs` on both read scenarios — random reads at 0.58x, sequential
-reads at 0.83x — and ahead on write-then-read with owned buffers at 0.91x. At
-eight and sixty-four operations in flight `tokio::fs` is still ahead, by 1.06x to
-1.40x with owned buffers and 1.11x to 1.47x with registered ones.
+is ahead of `tokio::fs` on random reads at 0.58x — the one depth-1 result that
+resolves; its sequential-read and write-then-read leads (0.83x, 0.91x) sit inside
+the noise band and claim nothing. At
+eight and sixty-four operations in flight `tokio::fs` is ahead on every point
+estimate, by 1.06x to
+1.40x with owned buffers and 1.11x to 1.47x with registered ones, though only six
+of those fourteen comparisons resolve statistically. That document is careful
+about which is which.
 
 **And the loss is not the I/O ring's fault.** The comparison now runs five
 backends, the fifth being [`compio`](https://github.com/compio-rs/compio) — which

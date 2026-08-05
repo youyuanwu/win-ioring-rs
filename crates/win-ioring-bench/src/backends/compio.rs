@@ -135,7 +135,7 @@ impl Backend for Compio {
         // `.slice(..len)` bounds the fill to `min(len, capacity)`, so a request
         // larger than the buffer's capacity would be quietly short where
         // `TokioFs::read_at` resizes up to `len` first
-        // (`src/backends/tokio_fs.rs:169-171`). That cannot happen on the
+        // (`src/backends/tokio_fs.rs:178-179`). That cannot happen on the
         // harness path, but "cannot happen" is what this assertion is for:
         // `Backend::read_at`'s contract says it reads `len` bytes, and this
         // makes that structural rather than incidental.
@@ -153,7 +153,7 @@ impl Backend for Compio {
         // `max(pre-read length, delivered)` rather than the delivered count.
         //
         // That divergence is unobservable here, and both halves of that matter.
-        // Short reads are unreachable on the harness path: `session.rs:88`
+        // Short reads are unreachable on the harness path: `session.rs:94-95`
         // sizes the pool at `job.block`, the same value passed as `len`, and
         // every offset the scenarios issue is in bounds. And even if one
         // occurred, `Trace::delivered` clamps with

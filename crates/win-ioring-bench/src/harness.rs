@@ -94,8 +94,9 @@ impl Which {
 
     /// Whether this backend builds a driver.
     ///
-    /// The thread-pool backends do not, which is why the driver count of SC-014
-    /// is read against the ring combinations rather than against all of them.
+    /// The thread-pool and compio backends do not, which is why the driver count
+    /// of SC-014 is read against the ring combinations rather than against all of
+    /// them.
     pub fn builds_a_driver(self) -> bool {
         matches!(self, Which::RingPlain | Which::RingRegistered)
     }
@@ -419,10 +420,11 @@ mod tests {
 
     #[test]
     fn every_rotation_contains_every_backend_once() {
-        // Ten, not eight. The bound has to be a multiple of the backend count
-        // or the last partial cycle is untested; at eight it under-tested five
-        // backends while still passing, which is why it moved with the arity
-        // rather than being left alone.
+        // Ten, not eight. The bound is a multiple of the backend count so every
+        // rotation offset is covered the same number of times. Eight did cover
+        // all five offsets, but unevenly — and an arity-blind bound stops
+        // covering all of them the moment the backend count exceeds it, which is
+        // why this moved with the arity rather than being left alone.
         for index in 0..10 {
             let order = rotated_order(index);
             for which in Which::all() {
