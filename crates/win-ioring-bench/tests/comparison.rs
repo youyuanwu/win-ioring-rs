@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use win_ioring_bench::account::{Budget, RUN_BUDGET};
 use win_ioring_bench::backend::Availability;
-use win_ioring_bench::backends::ioring;
+use win_ioring_bench::backends::{compio, ioring};
 use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
@@ -39,6 +39,34 @@ fn ring_available() -> bool {
     matches!(ioring::availability(), Availability::Available)
 }
 
+/// Whether compio can run here.
+///
+/// Probes exactly what preparation will do — build a `compio` runtime, which is
+/// what acquires the completion port.
+///
+/// **The false branch is defensive and effectively unreachable on this
+/// platform.** IOCP is not an optional Windows facility and the probe builds a
+/// `compio` runtime, which needs only the completion port, so this is expected
+/// to be true on every host that can build the crate at all. It guards against
+/// a future host, not against a build configuration: `compio` is a hard
+/// dependency with `fs` on unconditionally (`Cargo.toml`), so a build without
+/// it does not compile rather than reporting `Unavailable`. It is stated that
+/// way rather than presented as a tested condition, because an untestable
+/// branch described as tested is worse than an honest comment. The gate exists
+/// because without it compio would go *red* on a host where the ring backends
+/// merely go quiet, and that inconsistency would be introduced by this work.
+/// (`tests/fairness.rs` deliberately does the opposite and panics; that file's
+/// policy is to fail rather than skip, since a fairness check that quietly
+/// stops running is the thing it exists to prevent.)
+fn compio_available() -> bool {
+    matches!(compio::availability(), Availability::Available)
+}
+
+/// Whether this backend should be skipped on this host.
+fn unavailable_here(which: Which) -> bool {
+    (!ring_available() && which.builds_a_driver()) || (!compio_available() && which == Which::Compio)
+}
+
 /// FR-001: one shared piece of application logic runs against every backend,
 /// with no scenario code naming an implementation.
 ///
@@ -55,7 +83,7 @@ fn every_backend_runs_every_scenario() {
         let mut ledger = Ledger::new();
 
         for which in Which::all() {
-            if !ring_available() && which.builds_a_driver() {
+            if unavailable_here(which) {
                 continue;
             }
             let job = Job {
@@ -108,7 +136,7 @@ fn every_backend_runs_every_scenario() {
 /// rather than through a copy of that comparison written here.
 #[test]
 fn every_backend_does_the_same_work() {
-    if !ring_available() {
+    if !ring_available() || !compio_available() {
         return;
     }
     let config = Config::small();
@@ -570,7 +598,7 @@ fn each_scenario_drives_the_shape_it_declares() {
         let mut ledger = Ledger::new();
 
         for which in Which::all() {
-            if !ring_available() && which.builds_a_driver() {
+            if unavailable_here(which) {
                 continue;
             }
             let job = Job {

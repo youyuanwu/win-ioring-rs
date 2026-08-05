@@ -62,16 +62,18 @@ unmodified against each backend. Each run records:
 
 A run whose trace disagrees with the others is **rejected, not reported**.
 
-Two tests in `crates/win-ioring-bench/tests/fairness.rs` hold that to account.
+Four tests in `crates/win-ioring-bench/tests/fairness.rs` hold that to account.
 Each takes a **real** backend, wraps it so that it either skips one read in four
 or reports full transfers whose bytes never reach anywhere readable, and drives
 it through `harness::measure_combination` — the same function a measured
 benchmark calls, applying the weakening at the same call site the timed closure
-uses. Both require the run to be **rejected**, and both assert *which* mismatch
-was reported, so a run falling over for an unrelated reason does not count as a
-pass. A third test proves the weakenings change what was delivered rather than
-what was issued, so the two above cannot be passing on the issue-trace comparison
-alone.
+uses. All four require the run to be **rejected**, and all four assert *which*
+mismatch was reported, so a run falling over for an unrelated reason does not
+count as a pass. Two of them weaken a thread-pool backend and two weaken
+`compio-iocp`; no test weakens a ring backend, which is recorded in
+`docs/pending-work.md`. A further test proves the weakenings change what was
+delivered rather than what was issued, so the four above cannot be passing on
+the issue-trace comparison alone.
 
 **That paragraph used to say something stronger than was true.** Until this
 document was rewritten it read "Two tests deliberately weaken a backend … and

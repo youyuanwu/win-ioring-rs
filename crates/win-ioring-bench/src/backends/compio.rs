@@ -60,17 +60,22 @@ impl Compio {
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         self.runtime.block_on(f)
     }
+}
 
-    /// Reports whether this backend can run here.
-    ///
-    /// Building the runtime is the test, because that is what acquires the
-    /// completion port. A host that refuses one says so here rather than
-    /// failing every operation later.
-    pub fn availability() -> Availability {
-        match ::compio::runtime::Runtime::new() {
-            Ok(_) => Availability::Available,
-            Err(e) => Availability::Unavailable(format!("the platform refused a runtime: {e}")),
-        }
+/// Reports whether this backend can run here.
+///
+/// Building the runtime is the test, because that is what acquires the
+/// completion port. A host that refuses one says so here rather than failing
+/// every operation later.
+///
+/// A free function rather than an associated one, matching
+/// [`crate::backends::ioring::availability`], because the callers that need it
+/// are asking whether the backend can be built at all — which is precisely the
+/// question they cannot answer by holding one.
+pub fn availability() -> Availability {
+    match ::compio::runtime::Runtime::new() {
+        Ok(_) => Availability::Available,
+        Err(e) => Availability::Unavailable(format!("the platform refused a runtime: {e}")),
     }
 }
 

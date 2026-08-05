@@ -341,19 +341,34 @@ closed-form prediction for the declared shape and routes a mismatch through
 
 ## Test coverage gaps
 
-- **The weakening tests never weaken a ring backend.** The three tests in
+- **The weakening tests never weaken a ring backend.** Five of the tests in
   `crates/win-ioring-bench/tests/fairness.rs` that require a weakened run to be
   rejected take fixed positions from the available-backend list, and the two
   `tokio::fs` backends are always first, so `tokio-pool-1` and `tokio-pool-512`
-  are the only backends ever weakened — on a host with an I/O ring as much as on
-  one without. The rejection they establish is a property of
+  are the only backends those five ever weaken — on a host with an I/O ring as
+  much as on one without. The rejection they establish is a property of
   `harness::measure_combination`, which is backend-agnostic, and the honest
-  control case does run all four; but `Weakness::HollowDelivery` exists because
-  the *registered* backend once reported transfer counts with nothing readable
-  behind them, and that is the backend the weakening never reaches. Looping the
-  weakening over every available backend, weakening backend *i* against an honest
-  reference, would close it, at the cost of the extra combinations' run time in
-  every `cargo test`.
+  control case does run every available backend; but `Weakness::HollowDelivery`
+  exists because the *registered* backend once reported transfer counts with
+  nothing readable behind them, and that is the backend the weakening never
+  reaches. Looping the weakening over every available backend, weakening backend
+  *i* against an honest reference, would close it, at the cost of the extra
+  combinations' run time in every `cargo test`.
+
+  **This gap survives the addition of the compio backend.** Two tests added with
+  that backend do weaken it directly — `a_weakened_compio_backend_fails_on_the_delivered_byte_count`
+  and `a_weakened_compio_backend_fails_on_the_digest`, which select compio by
+  identity rather than by index — so the machinery is now known to reach a
+  completion-based backend rather than only the thread-pool ones. That is a
+  narrower thing than closing the gap. **Neither ring backend is weakened by any
+  test, and the specific backend whose historical defect motivated
+  `HollowDelivery` is still the one never exercised.** The compio tests were
+  scoped that way deliberately: the run-time cost of looping every backend, given
+  as the reason above for leaving this open, should not be paid by the work that
+  adds a backend. For scale, those two tests alone add 48 measured combinations
+  to every `cargo test` (2 tests × 4 scenarios × 2 backends × 3 runs), and
+  enrolling compio in the control case adds 12 more — 60 in total. Looping the
+  weakening across all five backends would multiply the first figure again.
 - Post-shutdown rejection is asserted for `read`, `write`, `flush` and
   `register_buffers`, but not for `register_files`, `read_registered` or
   `write_registered` — all three implement the check.

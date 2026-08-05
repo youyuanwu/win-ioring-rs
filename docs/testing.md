@@ -146,18 +146,22 @@ on the issue-trace comparison alone. A control case runs the matrix unweakened
 and asserts it agrees and that it delivered a non-zero number of bytes, because
 "everything agreed" is satisfied by everything doing nothing.
 
-**Which backend is weakened, precisely.** The weakening tests take fixed
+**Which backend is weakened, precisely.** Five of the weakening tests take fixed
 positions from the available list, and the two `tokio::fs` backends are always
-first, so on every host — with an I/O ring or without one — the backend weakened
-is `tokio-pool-1` or `tokio-pool-512` and never a ring one. This paragraph used
-to say each test took "every one the host can build, so a machine without an I/O
-ring still runs them against two", which reads as though a ring host runs them
-against four. It does not, and never did. What the tests establish is that
+first, so on every host — with an I/O ring or without one — the backend those
+five weaken is `tokio-pool-1` or `tokio-pool-512` and never a ring one. This
+paragraph used to say each test took "every one the host can build, so a machine
+without an I/O ring still runs them against two", which reads as though a ring
+host runs them against four. It does not, and never did. Two further tests,
+added with the compio backend, select their backend *by identity* rather than by
+position and so do weaken `compio-iocp` directly — that is what establishes the
+machinery reaches a completion-based backend and not only the thread-pool ones.
+Neither ring backend is weakened by any test. What the tests establish is that
 `measure_combination` *rejects* a run that delivered less, and that function is
 backend-agnostic — the weakening is injected above it, in a wrapper that knows
 nothing about which backend it wraps. That the ring backends deliver what they
-report is established by the control case, which does run all four. Extending the
-weakening across the whole list is recorded in
+report is established by the control case, which does run every available
+backend. Extending the weakening across the whole list is recorded in
 [pending-work.md](pending-work.md).
 
 **Two further tests fix *which run* is verified.** `measure_combination` runs an
