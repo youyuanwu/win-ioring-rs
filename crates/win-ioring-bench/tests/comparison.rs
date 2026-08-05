@@ -64,7 +64,8 @@ fn compio_available() -> bool {
 
 /// Whether this backend should be skipped on this host.
 fn unavailable_here(which: Which) -> bool {
-    (!ring_available() && which.builds_a_driver()) || (!compio_available() && which == Which::Compio)
+    (!ring_available() && which.builds_a_driver())
+        || (!compio_available() && which == Which::Compio)
 }
 
 /// FR-001: one shared piece of application logic runs against every backend,

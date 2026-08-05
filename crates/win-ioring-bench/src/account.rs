@@ -238,6 +238,102 @@ pub struct Combination {
     pub entries: Vec<Entry>,
 }
 
+/// What one file open costs on each runtime, measured on the host that ran.
+///
+/// Reported because the comparison is not perfectly fair and this is the size of
+/// the unfairness. Every scenario opens its file **inside** the timed iteration,
+/// so compio pays its runtime's open cost where `std::fs::File::open` pays a
+/// syscall — once for the read scenarios, twice for write-then-read.
+///
+/// **The direction matters more than the magnitude, and it is not symmetric.**
+/// compio's open is the slower of the two, so the bias inflates every compio
+/// timing by a fixed amount that does not scale with depth. That makes this
+/// measurement **conservative** for any conclusion of the form "compio is also
+/// slower here" — the real gap is smaller than published — and
+/// **anti-conservative** for any conclusion of the form "compio scales well",
+/// because a fixed per-iteration cost is proportionally largest at depth 1,
+/// where iterations are shortest, and shrinks as depth rises. A small share of
+/// an iteration is not licence to ignore it in the second case. That asymmetry
+/// is the reason this is measured rather than waved at.
+///
+/// **These are medians, not means, and that was forced by measurement.** An
+/// arithmetic mean over 200 opens has no defence against one stalled open: a
+/// single 3 ms hiccup moves it by 15 µs, which is the whole `std` figure. Fifteen
+/// consecutive runs of the probe produced fourteen agreeing results and one where
+/// `std`'s mean doubled to 28.9 µs against a 14.3–15.4 µs floor — enough to fail
+/// the probe's own ratio check on an honest tree. The median of the same samples
+/// is unmoved by a handful of outliers, which is what makes the check safe to run
+/// in front of a six-minute benchmark.
+///
+/// [`OpenCost::std_p90`] and [`OpenCost::compio_p90`] are carried alongside so a
+/// reader can see the spread rather than only a point estimate. The two differ
+/// substantially for compio and barely at all for `std`, which is itself the
+/// finding: the async open's cost is variable in a way the syscall's is not.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenCost {
+    /// Median `std::fs::File::open` over [`OpenCost::SAMPLES`] opens.
+    pub std_median: Duration,
+    /// Median `compio::fs::File::open` over [`OpenCost::SAMPLES`] opens.
+    pub compio_median: Duration,
+    /// The 90th percentile of the same `std` samples.
+    pub std_p90: Duration,
+    /// The 90th percentile of the same compio samples.
+    pub compio_p90: Duration,
+}
+
+impl OpenCost {
+    /// How many opens each figure is taken over.
+    ///
+    /// 200, matching the out-of-tree probe that produced the expected band, so
+    /// the in-tree figure is comparable with it rather than merely similar.
+    pub const SAMPLES: usize = 200;
+
+    /// Summarises one set of per-open samples.
+    ///
+    /// Sorts in place. The 90th percentile is taken at index `len * 9 / 10`,
+    /// clamped to the last element, which for 200 samples is the 180th — a
+    /// nearest-rank percentile, not an interpolated one, because interpolating
+    /// between two adjacent measured durations invents a value that was not
+    /// observed.
+    ///
+    /// Returns `None` for an empty slice rather than picking a value out of the
+    /// air, which is what indexing an empty slice would otherwise panic over.
+    #[must_use]
+    pub fn summarise(samples: &mut [Duration]) -> Option<(Duration, Duration)> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)];
+        Some((median, p90))
+    }
+
+    /// What compio's open costs over `std`'s, per open, at the median.
+    ///
+    /// Saturating rather than wrapping: if compio ever came out faster this
+    /// returns zero instead of an enormous number, and the ratio printed
+    /// alongside it is what would show the reversal.
+    #[must_use]
+    pub fn extra(&self) -> Duration {
+        self.compio_median.saturating_sub(self.std_median)
+    }
+
+    /// How many times `std`'s open compio's costs, at the median.
+    ///
+    /// Zero if `std`'s median is zero, which cannot happen for a real syscall but
+    /// is not worth a panic in a reporting path.
+    #[must_use]
+    pub fn ratio(&self) -> f64 {
+        let std = self.std_median.as_secs_f64();
+        if std == 0.0 {
+            0.0
+        } else {
+            self.compio_median.as_secs_f64() / std
+        }
+    }
+}
+
 /// Everything the run established that is not a timing.
 pub struct Account {
     /// The parameters the run used.
@@ -262,6 +358,16 @@ pub struct Account {
     pub write_file_bytes: Option<u64>,
     /// How long preparing and warming the working files took.
     pub preparation: Duration,
+    /// What opening a file costs on each runtime, measured on this host.
+    ///
+    /// `None` for four distinct reasons, which the renderer distinguishes rather
+    /// than printing all of them as absence: a test run, where the dev profile
+    /// makes an absolute timing meaningless; a `compio` runtime that would not
+    /// build; a failed `std` open; a failed compio open. The last three are
+    /// reported as **NOT MEASURED**, because a benchmark account that quietly
+    /// omits a line it usually carries is indistinguishable from one where the
+    /// measurement was never attempted. See [`OpenCost`].
+    pub open_cost: Option<OpenCost>,
     /// How long everything after that took.
     pub measurement: Duration,
 }
@@ -281,6 +387,7 @@ impl Account {
             ring_combinations: 0,
             write_file_bytes: None,
             preparation: Duration::ZERO,
+            open_cost: None,
             measurement: Duration::ZERO,
         }
     }
@@ -577,6 +684,40 @@ impl Account {
             self.measurement.as_secs_f64()
         )
         .unwrap();
+        match self.open_cost {
+            Some(open) => writeln!(
+                out,
+                "- one file open: std {:.1}us (p90 {:.1}us), compio {:.1}us (p90 {:.1}us), \
+                 medians over {} opens each — compio costs {:.1}x, {:.1}us more per open. \
+                 Every scenario opens inside the timed iteration, so this inflates compio: \
+                 conservative where compio is reported slower, anti-conservative where it is \
+                 reported to scale well",
+                open.std_median.as_secs_f64() * 1e6,
+                open.std_p90.as_secs_f64() * 1e6,
+                open.compio_median.as_secs_f64() * 1e6,
+                open.compio_p90.as_secs_f64() * 1e6,
+                OpenCost::SAMPLES,
+                open.ratio(),
+                open.extra().as_secs_f64() * 1e6
+            )
+            .unwrap(),
+            // Said rather than left blank. A run whose probe failed and a run
+            // that never attempted one are different facts, and absence renders
+            // them identically — so a reader of a benchmark account would have
+            // no way to tell a measurement that was skipped from one that broke.
+            None if self.test_mode => writeln!(
+                out,
+                "- one file open: not measured — a test run, where the dev profile makes an \
+                 absolute timing meaningless"
+            )
+            .unwrap(),
+            None => writeln!(
+                out,
+                "- one file open: **NOT MEASURED** — the probe failed on this host, so the \
+                 async-open fairness caveat is unquantified for this run"
+            )
+            .unwrap(),
+        }
         writeln!(out).unwrap();
         writeln!(
             out,
@@ -966,5 +1107,148 @@ mod tests {
                 .contains("batching: 64.0 entries per submission (256 entries over 4 submissions)"),
             "{rendered}"
         );
+    }
+
+    /// A median is not a mean, and the difference is the point of using one.
+    ///
+    /// The sample set here is the shape the probe actually met: a tight cluster
+    /// with two stalls an order of magnitude out. Its mean is 128us and its
+    /// median 15us, and it was a stall of exactly this kind that aborted an
+    /// honest run when the probe divided a whole-loop elapsed. Asserting on the
+    /// mean too, so this test fails if someone "simplifies" the estimator back.
+    #[test]
+    fn one_stalled_open_moves_the_mean_and_not_the_median() {
+        let mut samples: Vec<Duration> = (0..18).map(|_| Duration::from_micros(15)).collect();
+        samples.push(Duration::from_micros(1_150));
+        samples.push(Duration::from_micros(1_150));
+
+        let mean = samples.iter().sum::<Duration>() / u32::try_from(samples.len()).unwrap();
+        let (median, p90) = OpenCost::summarise(&mut samples).expect("a non-empty sample set");
+
+        assert_eq!(
+            median,
+            Duration::from_micros(15),
+            "the median ignores the stalls"
+        );
+        assert_eq!(
+            p90,
+            Duration::from_micros(1_150),
+            "the p90 of twenty samples is the nineteenth, which is a stall — the spread is \
+             reported rather than smoothed away"
+        );
+        assert!(
+            mean > median * 7,
+            "the mean of this set is {mean:?} against a median of {median:?}; if these were \
+             close the sample set would no longer be testing what it was built to test"
+        );
+    }
+
+    /// An empty sample set has no median, and inventing one would be worse.
+    #[test]
+    fn an_empty_sample_set_has_no_summary() {
+        assert!(OpenCost::summarise(&mut []).is_none());
+    }
+
+    /// The reported figures are the ones the run measured, in the right slots.
+    ///
+    /// This is the test the swap mutation motivated. The probe's own assertion
+    /// runs only on the benchmark path, so nothing under `cargo test` would
+    /// otherwise notice the two figures being rendered into each other's places
+    /// — which is the same defect one layer below the one the assertion caught.
+    #[test]
+    fn the_open_cost_is_rendered_with_each_figure_in_its_own_place() {
+        let mut account = account();
+        account.test_mode = false;
+        account.open_cost = Some(OpenCost {
+            std_median: Duration::from_micros(15),
+            compio_median: Duration::from_micros(53),
+            std_p90: Duration::from_micros(17),
+            compio_p90: Duration::from_micros(84),
+        });
+
+        let rendered = account.render();
+
+        assert!(
+            rendered.contains("std 15.0us (p90 17.0us), compio 53.0us (p90 84.0us)"),
+            "each figure must render in its own slot; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("3.5x, 38.0us more per open"),
+            "the ratio and the extra are derived from the medians; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("anti-conservative where it is reported to scale well"),
+            "the direction of the bias travels with the number, not only with the docs"
+        );
+    }
+
+    /// A probe that failed and a probe that was never run are different facts.
+    ///
+    /// Both were rendered as absence once — no line at all — which made a broken
+    /// measurement on the benchmark path indistinguishable from a test run in
+    /// the published artifact.
+    #[test]
+    fn a_failed_probe_is_not_rendered_the_same_as_one_that_was_never_attempted() {
+        let mut skipped = account();
+        skipped.test_mode = true;
+        let skipped = skipped.render();
+
+        let mut failed = account();
+        failed.test_mode = false;
+        let failed = failed.render();
+
+        assert!(
+            skipped.contains("- one file open: not measured — a test run"),
+            "a test run says why it has no figure; got:\n{skipped}"
+        );
+        assert!(
+            failed.contains("- one file open: **NOT MEASURED**"),
+            "a failed probe is marked, not omitted; got:\n{failed}"
+        );
+        assert_ne!(
+            skipped.contains("**NOT MEASURED**"),
+            failed.contains("**NOT MEASURED**"),
+            "the two cases must be distinguishable in the artifact"
+        );
+    }
+
+    /// A reversal would be a finding, so it must render as one rather than wrap.
+    ///
+    /// Unreachable through the probe, whose assertion panics first. Tested here
+    /// because a saturating subtraction that is never exercised is a claim about
+    /// behaviour rather than a demonstration of it.
+    #[test]
+    fn a_faster_compio_open_saturates_rather_than_wrapping() {
+        let reversed = OpenCost {
+            std_median: Duration::from_micros(50),
+            compio_median: Duration::from_micros(15),
+            std_p90: Duration::from_micros(60),
+            compio_p90: Duration::from_micros(20),
+        };
+
+        assert_eq!(
+            reversed.extra(),
+            Duration::ZERO,
+            "no wrap to a vast duration"
+        );
+        assert!(
+            reversed.ratio() < 1.0,
+            "the ratio is what shows the reversal the extra cannot: {}",
+            reversed.ratio()
+        );
+    }
+
+    /// A zero denominator is a reporting path, not a place to panic.
+    #[test]
+    fn a_zero_std_median_yields_a_zero_ratio_rather_than_an_infinity() {
+        let impossible = OpenCost {
+            std_median: Duration::ZERO,
+            compio_median: Duration::from_micros(15),
+            std_p90: Duration::ZERO,
+            compio_p90: Duration::from_micros(15),
+        };
+
+        assert_eq!(impossible.ratio(), 0.0);
+        assert!(impossible.ratio().is_finite());
     }
 }
