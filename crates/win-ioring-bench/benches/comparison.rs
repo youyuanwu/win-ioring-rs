@@ -21,7 +21,7 @@
 //! verified: the cross-backend fairness check is only meaningful when every
 //! backend of a (scenario, depth) has put a trace in front of the same ledger,
 //! and a check that silently narrowed when someone typed a filter would be worth
-//! less than no check. So this target walks all forty combinations whatever
+//! less than no check. So this target walks all fifty combinations whatever
 //! the filter says. What a filter removes is the timing — Criterion never
 //! invokes the routine closure for a filtered-out benchmark, so no timed
 //! iteration runs, and the warm-up's trace is verified instead. Those
@@ -49,8 +49,8 @@ use win_ioring_bench::workload;
 
 /// How long each benchmark is warmed up for before Criterion starts sampling.
 ///
-/// Criterion's own default is three seconds, which forty benchmarks
-/// multiply well past the five-minute budget of SC-001. One second is enough
+/// Criterion's own default is three seconds, which fifty benchmarks
+/// multiply well past the six-minute budget of SC-001. One second is enough
 /// here because [`measure_combination`] has already run an untimed warm-up of
 /// its own — outside anything Criterion sees — that pays for lazily created
 /// threads and first-touch page faults.
@@ -58,8 +58,8 @@ const WARM_UP: Duration = Budget::CHOSEN.warm_up;
 
 /// How long each benchmark is sampled over.
 ///
-/// Forty benchmarks share five minutes, which leaves each about seven and a
-/// half seconds all-in. Two seconds of sampling on top of one of warm-up leaves
+/// Fifty benchmarks share six minutes, which leaves each about seven and a
+/// fifth seconds all-in. Two seconds of sampling on top of one of warm-up leaves
 /// room for preparation, for the untimed warm-ups and for teardown.
 ///
 /// Reduced from three seconds after measurement, not before it. This value is a
@@ -71,7 +71,9 @@ const WARM_UP: Duration = Budget::CHOSEN.warm_up;
 /// three seconds to two therefore bought roughly twenty-four seconds — one per
 /// padded benchmark, when the matrix was thirty-six — and lowering it further
 /// would buy less each time while gathering every padded estimate over a shorter
-/// window.
+/// window. That figure is left as the measurement that was actually made, at the
+/// size the matrix then was; the argument it supports is unchanged by the matrix
+/// having grown since.
 ///
 /// The statistical configuration is untouched: a hundred samples still drive
 /// every estimate. What changes is how many iterations each of those samples
@@ -108,7 +110,7 @@ impl AsyncExecutor for Exec<'_> {
 ///
 /// Borrows the group rather than owning it: a group borrows the `Criterion`
 /// mutably for as long as it lives, so only one may be open at a time and the
-/// caller keeps it across all four of a combination's backends.
+/// caller keeps it across all five of a combination's backends.
 struct CriterionTimer<'a, 'b> {
     /// The open group this combination's benchmark is added to.
     group: &'a mut BenchmarkGroup<'b, WallTime>,

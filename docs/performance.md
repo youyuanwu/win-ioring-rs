@@ -115,7 +115,7 @@ under two labels.
 **The registered backend registers buffers only.** The account prints its
 configuration as "registered buffers and file handle", which overstates: the code
 never registers a file, so every backend in the comparison passes an owned
-handle. Harmless to the measurement, since that makes all four alike, but the
+handle. Harmless to the measurement, since that makes all five alike, but the
 printed string is wrong; it is tracked in [pending-work.md](pending-work.md).
 
 ## Reading the numbers
@@ -226,7 +226,7 @@ where this crate is ahead.
 
 **Do not compare µs per I/O across scenarios.** A 64 KiB read moves sixteen times
 the bytes of a 4 KiB one, and write-then-read pays a file-system write path the
-read scenarios never touch. Compare down a group of four rows, not across them.
+read scenarios never touch. Compare down a group of five rows, not across them.
 
 **What a second full run reproduced, and what it did not.** The same binary was
 run again minutes later against this run as a stored baseline — the same binary
@@ -289,9 +289,10 @@ entries they covered. Across the whole default matrix, entries per submission:
 The rolling window batches at **exactly the configured depth** — 256 entries over
 4 submissions at depth 64. Where a figure is not the depth it is arithmetic:
 write-then-read's 257 entries are four submissions of 64 and one of 1. Both ring
-backends agree to the digit in all **twenty** ring cells — the other twenty rows
-of the matrix are `tokio::fs`, which has no ring and reports the figure as not
-applicable rather than as zero — and **three full runs produced bit-identical
+backends agree to the digit in all **twenty** ring cells — the other thirty rows
+of the matrix are `tokio::fs` and compio, neither of which has a ring, and both
+report the figure as not applicable rather than as zero — and **three full runs
+produced bit-identical
 figures**, so this is not an average over noise.
 
 The mechanism: the executor drains every ready completion in one pass before the
@@ -447,7 +448,7 @@ whatever was there before. The second names a baseline; the third compares
 against that name and prints, per benchmark, a change interval and a verdict.
 Baselines live under `target/criterion/<group>/<backend>/<depth>/<name>`, survive
 rebuilds, and are lost with the `target` directory. A filtered run times only the
-benchmarks matching the filter but still prepares, warms and verifies all forty
+benchmarks matching the filter but still prepares, warms and verifies all fifty
 combinations, so the fairness check never narrows because somebody typed a
 filter; the combinations it did not time are marked
 **verified but not timed** in the account.
@@ -491,7 +492,8 @@ proceeds, and in full to `target/bench-data/fairness.md` at the end. It carries
   concurrency, and whether it was **timed** or **verified but not timed**;
 - the reference backend and the agreement verdict per (scenario, depth);
 - the number of drivers built against the number of **ring** combinations
-  measured — 20 of the 40, because the two thread-pool backends build none;
+  measured — 20 of the 50, because the two thread-pool backends and compio
+  build none;
 - the write file's size after the run, and whether the first and last measured
   iteration issued and delivered the same work;
 - preparation and measurement wall clock.
@@ -503,12 +505,12 @@ backend serialising below it.
 
 ## Run order
 
-Backends are measured in a **rotated** order: the four are rotated left by the
+Backends are measured in a **rotated** order: the five are rotated left by the
 combination index, so each takes a turn going first. That is a decision, retained
 deliberately, not an inherited habit.
 
 Criterion's per-benchmark warm-up absorbs settling *within* a benchmark. It does
-nothing about drift *across* a three-minute run, which is what rotation is for:
+nothing about drift *across* a five-minute run, which is what rotation is for:
 without it, whichever backend is measured first is systematically measured on a
 cooler machine, in every group and in every run — a bias that repeats rather than
 averages out. It costs one line, it is deterministic so two runs compared through
@@ -527,21 +529,46 @@ level, resampling count and noise threshold are all Criterion's.
 
 The two that moved had to. A benchmark costs at least its warm-up plus its
 measurement window no matter how small an iteration is, and at Criterion's
-defaults of 3 s and 5 s, forty benchmarks are 320 seconds of floor against a
-five-minute budget — over it before a single I/O is issued. Reducing what an
+defaults of 3 s and 5 s, fifty benchmarks are 400 seconds of floor against a
+six-minute budget — over it before a single I/O is issued. Reducing what an
 iteration does cannot get below that floor; only the budget can.
 
 **The budget is a number, not an aspiration.** It used to exist only in this
 paragraph, which is no use as a constraint when somebody proposes a new scenario.
-`RUN_BUDGET` is 300 seconds and `Budget::CHOSEN` holds the two timing values, and
+`RUN_BUDGET` is 360 seconds and `Budget::CHOSEN` holds the two timing values, and
 a test computes the matrix's floor from the real depth lists and checks it. The
 check is against **half** the budget, not all of it: three recorded runs cost
 1.79x, 1.83x and 2.06x their floor once preparation, untimed warm-ups, analysis
 and window overruns are counted, so a matrix whose floor merely fits the budget
-will overrun it in practice. At forty benchmarks the floor is 120 seconds against
-a 150-second limit, which is room for about two more combinations. Past that,
+will overrun it in practice. At fifty benchmarks the floor is 150 seconds against
+a 180-second limit, which is room for about two more combinations. Past that,
 something has to be traded away — which is how bulk read came to run at depth 64
 alone.
+
+**Why the budget moved from 300 seconds to 360.** Adding compio as a fifth
+backend grew the matrix by 25%, from forty benchmarks to fifty, and took the
+floor from 120 seconds to 150. Under the old budget the limit was also 150
+seconds, so the matrix would have been affordable by exactly nothing — passing
+the check with zero margin, which is indistinguishable on paper from a matrix
+that is about to overrun.
+
+The budget was raised rather than the matrix trimmed, and the distinction that
+decided it is worth stating because it recurs. **`RUN_BUDGET` is a chosen
+number: how long a run may take before people stop doing them.** It is not a
+measured property of the host. The `RUN_BUDGET / 2` rule *is* measured — it comes
+from the 1.79x, 1.83x and 2.06x above — and it **did not move**. Only the chosen
+half changed.
+
+The alternatives were considered and are recorded because they look cheaper than
+they are. Dropping a depth from the matrix would have paid a real data point for
+a saving that still left no margin. Shortening `measurement_time` further would
+have widened every published interval in this document — degrading all fifty
+results to protect a number nobody measured — and it would have damaged the
+comparison compio was added to make in the first place, since the depth-scaling
+question is exactly where tighter intervals matter most. Trading a *chosen*
+constraint against a *measured* one is the wrong way round.
+
+The cost is that a full run goes from about four minutes to about five.
 
 `measurement_time` is a floor, not a cap, and this is worth knowing before
 reading an interval. A benchmark whose hundred samples fit inside the window is
@@ -560,8 +587,13 @@ then fit the budget.
 
 Roughly **190 to 255 seconds** on the host above, with the working files already
 present and warm; the first run on a fresh checkout also creates a 256 MiB file.
-Five timed runs of the thirty-six-benchmark matrix came in at 190, 210, 213, 225
-and 254 seconds; three of the forty-benchmark matrix at 247, 219 and 215. The
+**That band is a forty-benchmark measurement and has not yet been re-taken at
+fifty.** It is left here as what was actually measured rather than scaled on
+paper; the projection in the time-budget section above — about four minutes
+becoming about five — is what to expect until a fifty-benchmark run replaces
+this band with a measured one. Five timed runs of the thirty-six-benchmark
+matrix came in at 190, 210, 213, 225 and 254 seconds; three of the
+forty-benchmark matrix at 247, 219 and 215. The
 spread is the machine, not the suite: the same binary measuring the
 same work varies by a minute depending on what else the host is doing, which is
 the same fact the noise-floor finding above reports in a different unit. Budget

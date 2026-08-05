@@ -524,9 +524,9 @@ impl Account {
         writeln!(out, "## Teardown and provenance").unwrap();
         writeln!(out).unwrap();
         // Against the ring combinations, not against all of them: the two
-        // thread-pool backends build no driver, so 40 measured combinations
-        // build 20 drivers and reading SC-014 against 40 would fail a correct
-        // run.
+        // thread-pool backends and compio build no driver, so 50 measured
+        // combinations build 20 drivers and reading SC-014 against 50 would
+        // fail a correct run.
         //
         // The narrative clause is conditional on the two numbers, because the
         // reassuring version of this line is the one a reader would most want to

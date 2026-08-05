@@ -138,7 +138,7 @@ account and `docs/performance.md` both quote it. The middle clause is false:
 and the backend runs registered buffers against an owned handle.
 
 Harmless to the measurement — every backend in the comparison passes an owned
-handle, so the four are alike in exactly the way a comparison needs — but the
+handle, so the five are alike in exactly the way a comparison needs — but the
 printed configuration overstates what was measured, which is the one thing a
 fairness account exists not to do. Either call `register_file` during
 preparation, and accept that the registered backend then differs from its peers
@@ -388,7 +388,7 @@ closed-form prediction for the declared shape and routes a mismatch through
   `--list` sets `bench=true, test=false`, so `test_mode()` correctly reports a
   benchmark run and `Config::default()` is selected; Criterion's list mode then
   never invokes a routine. The result is that merely asking which benchmarks
-  exist creates the 256 MiB read file, walks all forty combinations through
+  exist creates the 256 MiB read file, walks all fifty combinations through
   preparation, warm-up, verification and teardown, and reports every one of them
   as verified but not timed — minutes of I/O for a list of names. Detecting
   `--list` alongside `--test` and using `Config::small()`, or returning before
