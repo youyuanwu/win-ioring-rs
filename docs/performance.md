@@ -177,7 +177,9 @@ Taken on an AMD Ryzen 7 PRO 6850U (8 cores, 16 logical processors, 16 MiB L3),
 
 Operations per iteration: **256** for sequential read (256 I/Os), **512** for
 random read (512 I/Os), **128** for write-then-read (**256** I/Os — it writes
-each block and reads it back). `relative` is against
+each block and reads it back). Every figure in the `µs per I/O` column is
+**microseconds per single I/O** — an iteration's measured time divided by the
+I/O count above, not the time for the iteration. `relative` is against
 `tokio::fs (blocking pool 1)` within the same scenario and depth. Bold marks
 where this crate is ahead.
 
@@ -305,7 +307,8 @@ submission. They differ in sustained depth: the rolling window holds a mean of
 56.1 operations outstanding, the batched one 32.5, because it drains to zero at
 every batch boundary.
 
-From one run, µs per I/O:
+From one run, in **microseconds per single I/O** — each iteration's measured time
+divided by its 256 reads, not the time for the iteration:
 
 | shape | backend | [lower, estimate, upper] | relative |
 | --- | --- | --- | --- |
