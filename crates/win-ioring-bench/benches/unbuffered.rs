@@ -70,11 +70,11 @@ fn test_mode() -> bool {
 fn check_alignment(dir: &std::path::Path) -> Alignment {
     std::fs::create_dir_all(dir).expect("could not create the working directory");
 
-    // The query needs a file on the target volume, not the target file itself.
-    let probe = dir.join("alignment-probe");
-    std::fs::write(&probe, b"probe").expect("could not write the alignment probe");
-    let alignment = Alignment::query(&probe).expect("could not query the volume alignment");
-    let _ = std::fs::remove_file(&probe);
+    // The query takes the directory itself. It opens it with
+    // `FILE_FLAG_BACKUP_SEMANTICS` for metadata only and reads no data, so it
+    // cannot poison anything — which an earlier version, that wrote and deleted
+    // a probe file in this very directory, could not have said.
+    let alignment = Alignment::query(dir).expect("could not query the volume alignment");
 
     eprintln!("volume alignment: {}", alignment.describe());
 

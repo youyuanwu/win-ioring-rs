@@ -79,10 +79,12 @@ impl Alignment {
     ///
     /// `path` need only identify the volume; it is opened for metadata alone,
     /// never for data, so this is safe to call before the benchmark's data file
-    /// exists. In particular it does **not** poison an unbuffered working file:
-    /// no data is read through the handle. `path` may be a directory — passing
-    /// the working directory is the usual case, since the alignment must be
-    /// known before a correctly sized file can be created.
+    /// exists. `path` may be a directory — and passing the working *directory*
+    /// is what every caller here does, because the alignment must be known
+    /// before a correctly sized file can be created. That also sidesteps the
+    /// question of whether a metadata-only open of a data file would poison it
+    /// for unbuffered I/O: the arm never asks, because it never opens the data
+    /// file this way.
     pub fn query(path: &Path) -> io::Result<Self> {
         // `FILE_FLAG_BACKUP_SEMANTICS` is what makes a directory openable at
         // all; without it `std::fs::File::open` on a directory fails with

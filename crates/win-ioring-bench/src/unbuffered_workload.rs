@@ -74,10 +74,12 @@ pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 /// # The guarantee
 ///
 /// This type implements neither `AsRef<Path>` nor `Deref<Target = Path>`, so it
-/// cannot be passed to [`crate::workload::warm`] or
-/// [`crate::workload::ensure_file`]. Warming a file destroys its usefulness for
-/// unbuffered measurement — see the module documentation — and the destruction
-/// is silent, so it is prevented by the type system rather than by discipline.
+/// cannot be passed to [`crate::workload::warm`], to
+/// [`crate::workload::ensure_file`], or to any of the many standard-library
+/// entry points that are generic over `AsRef<Path>`. Buffered access destroys a
+/// file's usefulness for unbuffered measurement — see the module documentation —
+/// and the destruction is silent, so it is prevented by the type system rather
+/// than by discipline.
 ///
 /// Passing one to `warm` does not compile:
 ///
@@ -92,24 +94,57 @@ pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 /// win_ioring_bench::workload::warm(file.path()).unwrap();
 /// ```
 ///
-/// The same snippet against an ordinary path *does* compile, so the failure
-/// above can only be the missing conversion and not some unrelated mistake:
+/// The twin below is the **same snippet**, differing only in the one offending
+/// expression, and it compiles. That is what makes the failure above
+/// attributable: without a twin sharing the setup, a typo in `create` or
+/// `query` would also produce a `compile_fail` "pass" and the guard would
+/// silently become a no-op that keeps showing green.
 ///
 /// ```no_run
-/// let path = std::env::temp_dir().join("example.dat");
-/// win_ioring_bench::workload::warm(&path).unwrap();
+/// use win_ioring_bench::unbuffered_workload::UnbufferedFile;
+/// use win_ioring_bench::align::Alignment;
+///
+/// let dir = std::env::temp_dir();
+/// let alignment = Alignment::query(&dir).unwrap();
+/// let file = UnbufferedFile::create(&dir, 1 << 20, &alignment).unwrap();
+/// // The only change: the escape hatch, named explicitly.
+/// win_ioring_bench::workload::warm(file.path().as_raw_path()).unwrap();
 /// ```
 ///
-/// # What would defeat this, and what would not
+/// # What would defeat this
 ///
-/// Verified by deliberately adding each impl and re-running the doc-test.
-/// Adding `Deref<Target = Path>` **defeats the guard** — deref coercion is
-/// implicit, so `warm(file.path())` would start compiling silently — and the
-/// doc-test above duly fails when it is present. Adding `AsRef<Path>` does
-/// *not* defeat it, because reaching `warm` would still require writing
-/// `.as_ref()` by hand, which is as deliberate an act as calling
-/// [`UnbufferedPath::as_raw_path`]. So the rule this type must keep is
-/// specifically: **never implement `Deref<Target = Path>`**.
+/// Established by adding each impl and re-running the doc-test, **not** by
+/// reasoning about it — an earlier revision of this comment reasoned about it
+/// and got the answer wrong.
+///
+/// - `Deref<Target = Path>` defeats it. Deref coercion is implicit, so
+///   `warm(file.path())` would start compiling with nothing written at the call
+///   site.
+/// - `AsRef<Path>` defeats it too, and this is the one that was misjudged. It
+///   is true that `warm` itself would still need an explicit `.as_ref()`,
+///   because `warm` takes a concrete `&Path`. But `warm` is not the only
+///   poisoning route and not even the most likely one:
+///   [`std::fs::File::open`], [`std::fs::read`], [`std::fs::write`] and
+///   [`std::fs::OpenOptions::open`] are all generic over `P: AsRef<Path>`, so
+///   `File::open(p)` would compile for `p: &UnbufferedPath` with no conversion
+///   written anywhere. Every one of those is a buffered open.
+///
+/// So the rule is: **implement neither `Deref<Target = Path>` nor
+/// `AsRef<Path>`** — nor `Borrow<Path>`, for the same reason.
+///
+/// That rule is asserted, not just stated. A buffered `File::open` on one does
+/// not compile either:
+///
+/// ```compile_fail
+/// use win_ioring_bench::unbuffered_workload::UnbufferedFile;
+/// use win_ioring_bench::align::Alignment;
+///
+/// let dir = std::env::temp_dir();
+/// let alignment = Alignment::query(&dir).unwrap();
+/// let file = UnbufferedFile::create(&dir, 1 << 20, &alignment).unwrap();
+/// // `File::open` is generic over `AsRef<Path>`; `UnbufferedPath` is not.
+/// let _f = std::fs::File::open(file.path()).unwrap();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnbufferedPath(PathBuf);
 
@@ -154,17 +189,31 @@ pub struct UnbufferedFile {
 }
 
 impl UnbufferedFile {
-    /// Creates the working file if it is missing or the wrong size.
+    /// Creates the working file, unconditionally rewriting it.
     ///
     /// `bytes` is rounded up to the volume's alignment granularity, because an
     /// unbuffered write of a partial sector is rejected outright. The rounded
     /// size is what [`UnbufferedFile::bytes`] reports, so callers computing
     /// offsets from it stay in range.
     ///
-    /// Recreates rather than trusting what is there, matching
-    /// [`crate::workload::ensure_file`]: a file left from a different
-    /// configuration would silently change what is measured.
+    /// Always recreates rather than trusting what is there: a file left from a
+    /// different configuration would silently change what is measured, and a
+    /// file whose bytes arrived through a buffered write is poisoned in a way no
+    /// later inspection can detect. See [`ensure_unbuffered_file`].
+    ///
+    /// # Errors
+    ///
+    /// If `bytes` is zero. A zero-length working file would make every read in
+    /// the arm return zero bytes immediately, which measures nothing but would
+    /// still produce timings.
     pub fn create(dir: &Path, bytes: u64, alignment: &Alignment) -> io::Result<Self> {
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a zero-length working file measures nothing, but would still \
+                 produce timings",
+            ));
+        }
         let bytes = alignment.round_up(usize::try_from(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -203,14 +252,23 @@ impl UnbufferedFile {
 /// correct and fast for the warm-cache arm and fatal here: buffered writes
 /// during creation poison the file exactly as buffered reads do. See the module
 /// documentation.
+///
+/// # Why this always rewrites
+///
+/// [`crate::workload::ensure_file`] skips the work when a file of the right
+/// size is already present, and an earlier revision of this function copied
+/// that. It was wrong twice over. A size match says nothing about *how* the
+/// bytes got there, so a file written buffered by anything at all would be
+/// accepted and measured; and because the skip fires on every run after the
+/// first, the unbuffered self-check below — the only mechanical guard on the
+/// creation path — would never execute again. A check that quietly stops
+/// running is indistinguishable from one that was deleted.
+///
+/// Rewriting costs a few seconds of sequential unbuffered writing per run, once,
+/// entirely outside the measured region. That is the cheapest part of this arm.
 pub fn ensure_unbuffered_file(path: &Path, bytes: u64, alignment: &Alignment) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-    }
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() == bytes
-    {
-        return Ok(());
     }
 
     let g = alignment.granularity();
@@ -256,7 +314,7 @@ pub fn ensure_unbuffered_file(path: &Path, bytes: u64, alignment: &Alignment) ->
     let mut written = 0_u64;
     while written < bytes {
         use std::io::Write;
-        let take = ((bytes - written) as usize).min(chunk);
+        let take = (bytes - written).min(chunk as u64) as usize;
         // `take` is a multiple of `g` because both `bytes` and `chunk` are, so
         // this never presents a partial sector to an unbuffered handle.
         file.write_all(&buf.spare()[..take])?;
@@ -307,9 +365,18 @@ pub fn file_mode(file: &std::fs::File) -> io::Result<u32> {
             FileModeInformation,
         )
     };
-    if status.is_err() {
+    // Anything other than STATUS_SUCCESS is treated as failure, deliberately
+    // rather than using `status.is_err()`. `is_err()` is `status.0 < 0`, so it
+    // is *false* for STATUS_PENDING (0x103) — and on a pending completion the
+    // kernel writes into `iosb` and `mode` after this function returns, which
+    // would be a use-after-scope, while the caller would meanwhile read
+    // `mode == 0` as "neither unbuffered nor synchronous". That is a wrong
+    // answer of exactly the shape this module exists to prevent. Phase 3 and 4
+    // call this on overlapped handles by design, so the case is reachable even
+    // though `FileModeInformation` does not pend in practice.
+    if status.0 != 0 {
         return Err(io::Error::other(format!(
-            "NtQueryInformationFile(FileModeInformation) failed: {status:?}"
+            "NtQueryInformationFile(FileModeInformation) returned {status:?}"
         )));
     }
     Ok(mode)
@@ -335,15 +402,30 @@ pub fn is_synchronous(file: &std::fs::File) -> io::Result<bool> {
 mod tests {
     use super::*;
 
-    fn dir() -> PathBuf {
-        let d = std::env::temp_dir().join("win-ioring-bench-unbuffered-unit");
+    /// A directory unique to the calling test.
+    ///
+    /// Tests run concurrently in one process and [`UnbufferedFile::create`]
+    /// always uses the same file name, so a shared directory means they race on
+    /// one file: one test truncating to `2 * g` while another reads `16 * g`
+    /// produced an intermittent failure at roughly 1 in 100 runs. A flaky gate
+    /// in CI is worse than no gate, because it teaches people to re-run
+    /// failures instead of reading them.
+    ///
+    /// It also matters here for a second reason. These tests deliberately open
+    /// files buffered — that is the confound under test — and a buffered open
+    /// poisons whatever file it touches for every other test in the process.
+    /// Isolation keeps that contained.
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir()
+            .join("win-ioring-bench-unbuffered-unit")
+            .join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     #[test]
     fn a_created_file_is_readable_unbuffered_and_reports_the_flag() {
-        let d = dir();
+        let d = dir("readable");
         let alignment = Alignment::query(&d).unwrap();
         let g = alignment.granularity();
         let file = UnbufferedFile::create(&d, (16 * g) as u64, &alignment).unwrap();
@@ -374,7 +456,7 @@ mod tests {
 
     #[test]
     fn the_size_is_rounded_up_to_a_whole_number_of_sectors() {
-        let d = dir();
+        let d = dir("rounding");
         let alignment = Alignment::query(&d).unwrap();
         let g = alignment.granularity() as u64;
 
@@ -390,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_size_that_is_not_a_whole_number_of_sectors_is_refused() {
-        let d = dir();
+        let d = dir("partial");
         let alignment = Alignment::query(&d).unwrap();
         let g = alignment.granularity() as u64;
 
@@ -402,24 +484,96 @@ mod tests {
 
     #[test]
     fn the_three_open_modes_are_distinguishable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
         // The evidence behind the mode table in Phase 3, asserted rather than
         // recorded as prose: if these bits ever stop meaning what the arm
         // assumes, this fails instead of the measurements quietly changing
         // meaning.
-        let d = dir();
+        //
+        // This test opens a file *buffered* on purpose, which poisons it for
+        // unbuffered I/O for the life of the process. It therefore uses its own
+        // throwaway file, never the one any other test measures against.
+        let d = dir("modes");
         let alignment = Alignment::query(&d).unwrap();
         let g = alignment.granularity() as u64;
-        let file = UnbufferedFile::create(&d, 16 * g, &alignment).unwrap();
-        let path = file.path().as_raw_path();
+        let path = d.join("throwaway-poisoned.dat");
+        ensure_unbuffered_file(&path, 16 * g, &alignment).unwrap();
 
-        let plain = std::fs::File::open(path).unwrap();
-        assert!(
-            is_synchronous(&plain).unwrap(),
+        // Synchronous: caps outstanding operations at one regardless of what
+        // the caller submits. This is the defect Phase 3 documents.
+        let plain = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            file_mode(&plain).unwrap() & FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_SYNCHRONOUS_IO_NONALERT,
             "a plain File::open handle is expected to be synchronous"
         );
         assert!(!is_unbuffered(&plain).unwrap());
 
-        let unbuffered = file.path().open_unbuffered().unwrap();
+        // Overlapped, still buffered. Phase 4's "the ring's handle is really
+        // overlapped" assertion rests on this row, so it is pinned here rather
+        // than assumed.
+        let overlapped = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED.0)
+            .open(&path)
+            .unwrap();
+        assert!(!is_synchronous(&overlapped).unwrap());
+        assert!(!is_unbuffered(&overlapped).unwrap());
+
+        // Unbuffered and overlapped: what the arm actually measures on.
+        let unbuffered = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0)
+            .open(&path)
+            .unwrap();
         assert!(is_unbuffered(&unbuffered).unwrap());
+        assert!(!is_synchronous(&unbuffered).unwrap());
+
+        // The three modes must be mutually distinguishable, not merely each
+        // individually plausible: if any two collapsed to the same bits, the
+        // read-back could not tell the arm what it needs to know.
+        let modes = [
+            file_mode(&plain).unwrap(),
+            file_mode(&overlapped).unwrap(),
+            file_mode(&unbuffered).unwrap(),
+        ];
+        assert_ne!(modes[0], modes[1]);
+        assert_ne!(modes[1], modes[2]);
+        assert_ne!(modes[0], modes[2]);
+    }
+
+    #[test]
+    fn a_zero_length_working_file_is_refused() {
+        let d = dir("zero");
+        let alignment = Alignment::query(&d).unwrap();
+        let err = UnbufferedFile::create(&d, 0, &alignment)
+            .expect_err("a zero-length working file measures nothing");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_existing_file_of_the_right_size_is_still_rewritten() {
+        // The guard this protects: a size match says nothing about how the
+        // bytes got there. If creation were skipped for an existing file, a
+        // buffered-written file would be accepted and measured, and the
+        // unbuffered self-check would never run again after the first run.
+        let d = dir("rewrite");
+        let alignment = Alignment::query(&d).unwrap();
+        let g = alignment.granularity() as u64;
+        let path = d.join("preexisting.dat");
+
+        std::fs::write(&path, vec![0xEE_u8; (4 * g) as usize]).unwrap();
+        ensure_unbuffered_file(&path, 4 * g, &alignment).unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert_ne!(
+            content[0], 0xEE,
+            "the pre-existing buffered-written content survived, so creation \
+             was skipped and the unbuffered self-check did not run"
+        );
+        assert_eq!(content[0], 0);
+        assert_eq!(content[1], 1);
     }
 }
