@@ -15,28 +15,43 @@
 //!
 //! This arm opens **outside** the timed region, uniformly across all six
 //! configurations. That is a deliberate departure from the buffered arms'
-//! convention, and it exists because keeping the convention would have
-//! manufactured a win for this crate.
+//! convention. It exists because keeping the convention would bias the
+//! comparison in this crate's favour.
 //!
-//! Measured on this host (research probe 7): an unbuffered overlapped open
-//! costs **27.50 µs** against **8.60 µs** for a plain buffered one, and
-//! sixty-four of them cost **1779.90 µs**. A planned iteration is 256
-//! operations — about **2271 µs** of I/O at the multi-handle configuration's
-//! observed median. Charging opens per iteration would therefore add ~78% to
-//! [`Config::TokioPool512Hn`], the one configuration built to hold many handles,
-//! and ~1.2% to every single-handle configuration. The ring would have appeared
-//! to win by about 1.35x on nothing but the position of the timer.
+//! Measured on this host (research probe 7, median of five repeats): an
+//! unbuffered overlapped open costs about **9.5 µs** against about **8.9 µs**
+//! for a plain buffered one, and sixty-four of them held open cost about
+//! **571 µs**. A planned iteration is 256 operations. Charging opens to every
+//! iteration would therefore add roughly **25%** to [`Config::TokioPool512Hn`],
+//! the one configuration built to hold many handles, and about **0.3%** to
+//! every single-handle configuration.
 //!
-//! A real program opens its handle set once and then reads through it for the
-//! process's life; charging that set-up to every 256 reads is an artifact of
-//! the iteration boundary rather than a property of the design. So the opens
-//! move out — for everyone, which is what keeps it fair, since the ring gives
-//! up its 27.50 µs too.
+//! On the probe's provisional figures that would move the multi-handle
+//! configuration from 8.87 to about 11.10 µs/IO while the ring moved from 11.73
+//! to about 11.77 — compressing the competitor's lead from about 1.32x to about
+//! 1.06x. It would **not** have produced a ring victory, and an earlier version
+//! of this comment claimed it would have ("a fake 1.35x"). That claim came from
+//! a single cold run of probe 7 which reported 27.50 µs and 1779.90 µs for the
+//! two open costs — roughly triple the medians above. Repeating the probe five
+//! times did not reproduce it. The error was in the direction that made this
+//! crate's methodology look more scrupulous than it was, which is the direction
+//! this work has erred in before, so it is stated here rather than quietly
+//! amended.
+//!
+//! The decision is unchanged, because the direction of the bias is unchanged
+//! and only its size was overstated: charging set-up to every 256 reads
+//! penalises the configuration that holds the most handles, which is the honest
+//! competitor. A real program opens its handle set once and reads through it
+//! for the process's life, so the per-iteration charge is an artifact of the
+//! iteration boundary rather than a property of the design. The opens move out
+//! for everyone, which is what keeps it fair — the ring gives up its 9.5 µs too.
 //!
 //! The cost is reported rather than discarded: [`open_cost`] is measured and
-//! published beside the throughput, because sixty-four handles genuinely do
-//! cost ~1.78 ms to establish and a reader weighing the approach should see
-//! that.
+//! published beside the throughput, because sixty-four handles are not free and
+//! a reader weighing the approach should see what it costs to establish.
+//!
+//! All figures in this section are probe measurements, not results. The
+//! published numbers are whatever the harness produces.
 //!
 //! # What CI covers here, and what it deliberately does not
 //!
@@ -689,7 +704,7 @@ impl Backend for UnbufferedCompio {
     fn configuration(&self) -> String {
         format!(
             "{:?} driver; single-threaded completion processing; \
-             sector-aligned owned buffers; unbuffered handle",
+             sector-aligned owned buffers; unbuffered overlapped handle",
             self.runtime.driver_type()
         )
     }
@@ -878,7 +893,7 @@ impl Backend for UnbufferedTokioFs {
     fn configuration(&self) -> String {
         format!(
             "spawn_blocking + seek_read; max_blocking_threads = {}; \
-             {} unbuffered overlapped handle(s), round-robin; \
+             {} unbuffered synchronous handle(s), round-robin; \
              sector-aligned owned buffers",
             self.blocking_threads, self.handles
         )
@@ -1405,10 +1420,13 @@ mod tests {
     /// avoid manufacturing, and additionally poisoned the working file for
     /// every later cell.
     ///
-    /// Expectations differ by configuration and the test asserts the whole
-    /// mode word against `Config::read_flags`, not a mask: the completion-based
-    /// backends must be unbuffered *and* asynchronous, the thread-pool backends
-    /// unbuffered *and* synchronous (R3.3).
+    /// Expectations differ by configuration: the completion-based backends must
+    /// be unbuffered *and* asynchronous, the thread-pool backends unbuffered
+    /// *and* synchronous (R3.3). Both properties are read back from the live
+    /// handle via `NtQueryInformationFile`, and the synchronous one is compared
+    /// for equality against `Config::read_flags` rather than merely asserted
+    /// true, so a backend that gets the mode backwards is caught in either
+    /// direction.
     #[test]
     fn every_backend_opens_handles_with_exactly_its_configured_flags() {
         let fx = fixture("flag-readback");
@@ -1563,11 +1581,241 @@ mod tests {
         })
     }
 
-    /// Writes are refused rather than half-implemented, and the refusal is
-    /// reachable — an `Unsupported` error the caller can act on, not a panic.
+    /// Every backend's *own* `open_read` and `open_write` are exercised here.
+    ///
+    /// `write_refusals` drives each configuration's real `open_write`, rather
+    /// than asserting on the shared `unsupported_write()` helper. An earlier
+    /// version did the latter — it constructed no backend and named no
+    /// `Config`, which is exactly the defect B2 fixed for `open_read`, left
+    /// standing for `open_write` in the same file. Replacing
+    /// `UnbufferedCompio::open_write` with a real, working open left the whole
+    /// suite green.
     #[test]
     fn writes_are_refused_by_every_configuration() {
-        let e = unsupported_write();
-        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        let fx = fixture("write-refusal");
+        let path = fx.file.path();
+
+        let mut checked = 0usize;
+        for config in Config::all() {
+            let e = backend_write_refusal(config, path)
+                .expect_err("this arm reads only; a backend that opens for writing is a defect");
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::Unsupported,
+                "{}: `open_write` must refuse with `Unsupported`, not {:?}",
+                config.slug(),
+                e.kind()
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            Config::all().len(),
+            "every configuration must be exercised, or this test proves less \
+             than its name claims"
+        );
+    }
+
+    /// Drives one configuration's real `open_write` and returns its result.
+    fn backend_write_refusal(
+        config: Config,
+        path: &crate::unbuffered_workload::UnbufferedPath,
+    ) -> io::Result<()> {
+        let raw = path.as_raw_path();
+        match config {
+            Config::IoRingPlain => {
+                let mut backend = UnbufferedIoRing::new(4, 1, 4096, 4096)?;
+                let driver = backend.take_driver().expect("a driver");
+                let handle = backend.handle();
+                let r = drive_while(&driver, async { backend.open_write(raw).await.map(|_| ()) });
+                handle.shutdown();
+                futures::executor::block_on(driver.drive());
+                r
+            }
+            Config::IoRingRegistered => {
+                let mut backend = UnbufferedIoRingRegistered::new(4)?;
+                let driver = backend.take_driver().expect("a driver");
+                let handle = backend.handle();
+                let r = drive_while(&driver, async { backend.open_write(raw).await.map(|_| ()) });
+                handle.shutdown();
+                futures::executor::block_on(driver.drive());
+                r
+            }
+            Config::Compio => {
+                let backend = UnbufferedCompio::new(1, 4096, 4096)?;
+                backend.block_on(async { backend.open_write(raw).await.map(|_| ()) })
+            }
+            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
+                let backend = UnbufferedTokioFs::new(
+                    config.pool_width().expect("a pool width"),
+                    config.handles(4),
+                    1,
+                    4096,
+                    4096,
+                )?;
+                backend.block_on(async { backend.open_write(raw).await.map(|_| ()) })
+            }
+        }
+    }
+
+    /// The buffer pools fail loudly on exhaustion rather than quietly
+    /// allocating a replacement inside the timed region.
+    ///
+    /// This guards a correction that runs *against* this crate: the thread-pool
+    /// backend used to `alloc_zeroed` a fresh buffer when its pool ran dry,
+    /// charging the honest competitor a hidden per-operation cost the ring
+    /// never pays. Without a test, restoring that behaviour left the suite
+    /// green.
+    #[test]
+    fn an_exhausted_buffer_pool_is_an_error_not_a_silent_allocation() {
+        /// `expect_err` needs `Debug` on the success type; the buffers do not
+        /// have it, and adding it to satisfy a test would be the tail wagging
+        /// the dog.
+        fn err_or_panic<T>(r: io::Result<T>, what: &str) -> io::Error {
+            match r {
+                Ok(_) => panic!("{what}"),
+                Err(e) => e,
+            }
+        }
+
+        let pool = UnbufferedTokioFs::new(1, 1, 1, 4096, 4096).expect("a backend");
+        let first = pool.take_buffer(4096).expect("the pool's only buffer");
+        let e = err_or_panic(
+            pool.take_buffer(4096),
+            "an exhausted thread-pool buffer pool must refuse, not allocate a \
+             replacement inside the timed region",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        drop(first);
+
+        let compio = UnbufferedCompio::new(1, 4096, 4096).expect("a backend");
+        let held = compio.take_buffer(4096).expect("the pool's only buffer");
+        let e = err_or_panic(
+            compio.take_buffer(4096),
+            "an exhausted compio buffer pool must refuse, not allocate",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        drop(held);
+    }
+
+    /// A read larger than the buffer it was given is refused, not truncated.
+    ///
+    /// A truncated read is *faster* than a complete one, so a benchmark that
+    /// silently truncates reports a better number for doing less work. The
+    /// registered-buffer backend used to ignore the requested capacity
+    /// entirely.
+    #[test]
+    fn a_read_larger_than_its_buffer_is_refused_rather_than_truncated() {
+        fn err_or_panic<T>(r: io::Result<T>, what: &str) -> io::Error {
+            match r {
+                Ok(_) => panic!("{what}"),
+                Err(e) => e,
+            }
+        }
+
+        let mut backend = UnbufferedIoRingRegistered::new(4).expect("a backend");
+        let driver = backend.take_driver().expect("a driver");
+        let handle = backend.handle();
+        let e = drive_while(&driver, async {
+            backend.register(2, 4096, 4096).await.expect("registration");
+            err_or_panic(
+                backend.take_buffer(8192),
+                "a read twice the registered buffer size must be refused, not \
+                 silently truncated to the registered size",
+            )
+        });
+        handle.shutdown();
+        futures::executor::block_on(driver.drive());
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        let owned = UnbufferedIoRing::new(4, 1, 4096, 4096).expect("a backend");
+        let e = err_or_panic(
+            owned.take_buffer(8192),
+            "an over-large read must be refused",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Each backend's published self-description must match the handles it
+    /// actually opens.
+    ///
+    /// `configuration()` is printed into the report, so a wrong word here is a
+    /// wrong statement in the published record rather than a private comment.
+    /// The thread-pool backend described itself as opening "overlapped" handles
+    /// for the whole of the phase in which it did — and kept doing so after the
+    /// flags were split, because the split touched the opener and not the
+    /// sentence about it.
+    #[test]
+    fn each_backend_describes_the_handle_mode_it_actually_opens() {
+        for config in Config::all() {
+            let text = backend_configuration(config).expect("a backend");
+            let expect_sync = config.read_flags() & FILE_FLAG_OVERLAPPED.0 == 0;
+            let (wanted, forbidden) = if expect_sync {
+                ("synchronous", "overlapped")
+            } else {
+                ("overlapped", "synchronous")
+            };
+            assert!(
+                text.contains(wanted),
+                "{}: the published configuration string must say \"{wanted}\": {text:?}",
+                config.slug()
+            );
+            assert!(
+                !text.contains(forbidden),
+                "{}: the published configuration string says \"{forbidden}\", \
+                 which is the opposite of the handles this configuration opens: {text:?}",
+                config.slug()
+            );
+            assert!(
+                text.contains("unbuffered"),
+                "{}: the published configuration string must say \"unbuffered\": {text:?}",
+                config.slug()
+            );
+        }
+    }
+
+    /// One configuration's published self-description.
+    fn backend_configuration(config: Config) -> io::Result<String> {
+        Ok(match config {
+            Config::IoRingPlain => UnbufferedIoRing::new(4, 1, 4096, 4096)?.configuration(),
+            Config::IoRingRegistered => UnbufferedIoRingRegistered::new(4)?.configuration(),
+            Config::Compio => UnbufferedCompio::new(1, 4096, 4096)?.configuration(),
+            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
+                UnbufferedTokioFs::new(
+                    config.pool_width().expect("a pool width"),
+                    config.handles(4),
+                    1,
+                    4096,
+                    4096,
+                )?
+                .configuration()
+            }
+        })
+    }
+
+    /// `Config::opener` and each backend's hard-coded open must agree.
+    ///
+    /// `opener` is a third copy of the flag decision — after `read_flags` and
+    /// the backends themselves — and it is the copy `open_cost` uses. Collapsing
+    /// it to a single opener for all six configurations left the suite green,
+    /// which would let `open_cost` report the setup cost of handles no backend
+    /// actually opens.
+    #[test]
+    fn the_open_cost_opener_agrees_with_the_configured_flags() {
+        use crate::unbuffered_workload::is_synchronous;
+
+        let fx = fixture("opener-agreement");
+        let path = fx.file.path().as_raw_path();
+        for config in Config::all() {
+            let file = (config.opener())(path).expect("an open");
+            let expect_sync = config.read_flags() & FILE_FLAG_OVERLAPPED.0 == 0;
+            assert_eq!(
+                is_synchronous(&file).expect("a mode read-back"),
+                expect_sync,
+                "{}: `opener` disagrees with `read_flags`, so `open_cost` is \
+                 measuring a handle this configuration never opens",
+                config.slug()
+            );
+        }
     }
 }
