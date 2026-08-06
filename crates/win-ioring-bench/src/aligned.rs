@@ -189,6 +189,49 @@ impl Buffer for AlignedBuf {
     }
 }
 
+// SAFETY: the allocation is made once in `new` and never moved, reallocated or
+// resized, so `ptr` and `cap` are fixed for the value's whole life — which is
+// what the stability half of the contract asks for. It is non-null (checked
+// after `alloc_zeroed`), aligned to a power of two at least 1, and valid for
+// `cap` bytes in a single allocated object; `cap` came from a `Layout`, so it
+// cannot exceed `isize::MAX`. Every byte is initialised at allocation, so the
+// first `len` bytes are initialised for any `len <= cap`, and `set_len`
+// enforces that bound. `AlignedBuf` has no interior mutability and owns its
+// allocation exclusively — it is neither `Copy` nor `Clone` — so no other alias
+// can reach the bytes while an operation holds it.
+unsafe impl win_ioring::buf::IoBuf for AlignedBuf {
+    fn buf_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn buf_len(&self) -> usize {
+        self.len
+    }
+}
+
+// SAFETY: as for the `IoBuf` impl above. `buf_mut_ptr` returns the same address
+// as `buf_ptr`, satisfying the consistency requirement, and `buf_capacity`
+// reports `cap`, which is always at least `len` because `set_buf_init` clamps.
+unsafe impl win_ioring::buf::IoBufMut for AlignedBuf {
+    fn buf_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.cap
+    }
+
+    unsafe fn set_buf_init(&mut self, len: usize) {
+        // Clamped rather than asserted. The trait documents the authoritative
+        // transfer count as the one the operation's result carries, so a
+        // buffer that clamps here still reports the truth through
+        // `Backend::read_at`'s return value — whereas panicking inside a
+        // completion path would abort a run over a discrepancy the caller can
+        // already see.
+        self.len = len.min(self.cap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
