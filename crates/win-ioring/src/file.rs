@@ -115,11 +115,58 @@ impl File {
     }
 
     /// Opens a file for reading.
+    ///
+    /// # This produces a *synchronous* handle
+    ///
+    /// The handle comes from [`std::fs::File::open`], which does not pass
+    /// `FILE_FLAG_OVERLAPPED`. Windows therefore creates it with
+    /// `FILE_SYNCHRONOUS_IO_NONALERT`, and **the file object serialises I/O**:
+    /// at most one operation is in flight against it at a time, no matter how
+    /// many this crate submits to the ring.
+    ///
+    /// That is a real limitation of this constructor, not a detail. Submitting
+    /// at depth 64 against such a handle yields a depth of one. Measured on an
+    /// NVMe SSD with buffering disabled, random 4 KiB reads at a submitted depth
+    /// of 64 ran at **117 µs/IO** through a handle from this function and
+    /// **11.9 µs/IO** through one opened with `FILE_FLAG_OVERLAPPED` — a
+    /// tenfold difference produced entirely by the missing flag.
+    ///
+    /// It goes unnoticed under a warm page cache, because a cached read returns
+    /// synchronously after a memory copy and there is nothing to overlap. It
+    /// becomes decisive as soon as reads reach the device.
+    ///
+    /// # Getting an overlapped handle
+    ///
+    /// Open the file yourself and adopt it with [`File::from_std`]:
+    ///
+    /// ```no_run
+    /// use std::os::windows::fs::OpenOptionsExt;
+    ///
+    /// // FILE_FLAG_OVERLAPPED
+    /// const OVERLAPPED: u32 = 0x4000_0000;
+    ///
+    /// let std_file = std::fs::OpenOptions::new()
+    ///     .read(true)
+    ///     .custom_flags(OVERLAPPED)
+    ///     .open("data.bin")?;
+    /// let file = win_ioring::file::File::from_std(std_file);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// Whether this function should set the flag itself is an open question,
+    /// recorded in `docs/pending-work.md`. It is not changed here because every
+    /// figure in `docs/performance.md` was measured through handles from this
+    /// function, and changing it would invalidate them all.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::open(path)?))
     }
 
     /// Creates or truncates a file for writing.
+    ///
+    /// Produces a **synchronous** handle, with the same consequences described
+    /// on [`File::open`]: the file object serialises I/O regardless of the
+    /// depth submitted. Use [`File::from_std`] with `FILE_FLAG_OVERLAPPED` to
+    /// obtain one that does not.
     pub fn create(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::create(path)?))
     }
