@@ -32,13 +32,14 @@
 //! not a trade this crate makes.
 
 use std::io;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    FILE_ALIGNMENT_INFO, FILE_STORAGE_INFO, FileAlignmentInfo, FileStorageInfo, GetDiskFreeSpaceW,
-    GetFileInformationByHandleEx,
+    FILE_ALIGNMENT_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_STORAGE_INFO, FileAlignmentInfo,
+    FileStorageInfo, GetDiskFreeSpaceW, GetFileInformationByHandleEx,
 };
 use windows::core::HSTRING;
 
@@ -76,11 +77,22 @@ pub struct Alignment {
 impl Alignment {
     /// Asks the volume holding `path` what it requires.
     ///
-    /// `path` need only identify the volume; the file it names is opened for
-    /// metadata alone, so this is safe to call before the benchmark's data file
-    /// exists as long as *something* on the volume does.
+    /// `path` need only identify the volume; it is opened for metadata alone,
+    /// never for data, so this is safe to call before the benchmark's data file
+    /// exists. In particular it does **not** poison an unbuffered working file:
+    /// no data is read through the handle. `path` may be a directory — passing
+    /// the working directory is the usual case, since the alignment must be
+    /// known before a correctly sized file can be created.
     pub fn query(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
+        // `FILE_FLAG_BACKUP_SEMANTICS` is what makes a directory openable at
+        // all; without it `std::fs::File::open` on a directory fails with
+        // ERROR_ACCESS_DENIED. Since the alignment granularity is needed to
+        // decide how large the working file may be, the query must work before
+        // that file exists, which means it must accept a directory.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)?;
         // Borrowed for the duration of these calls only. `file` is alive across
         // all of them and closes the handle on drop, so no raw handle outlives
         // its owner.

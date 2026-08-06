@@ -57,6 +57,11 @@ pub mod fairness;
 pub mod harness;
 pub mod scenario;
 pub mod session;
+// Deliberately carries no `///` comment here. The module's own `//!` header
+// documents it at length, and an outer doc comment on the declaration makes
+// that header's intra-doc links resolve in *this* module's scope, where the
+// types it names are absent — which fails `cargo doc -D warnings` in CI.
+pub mod unbuffered_workload;
 pub mod verify;
 pub mod weaken;
 pub mod workload;
