@@ -1251,7 +1251,8 @@ cargo bench -p win-ioring-bench --bench unbuffered
 
 Opt-in: `bench = false` in the manifest keeps it out of a bare `cargo bench`, so
 it cannot inflate the main run's budget or share its stored baselines. It has its
-own wall-clock budget of 600 s; a full 36-cell run takes about 192 s here.
+own wall-clock budget of 600 s; a full 36-cell run takes 192 s to 204 s here,
+median 202 s.
 Criterion group names are prefixed `unbuffered-` so the two arms cannot share a
 `target/criterion` group directory.
 

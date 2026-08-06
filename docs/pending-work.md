@@ -454,9 +454,16 @@ done at the time.
 - **Should the published warm-cache ring figures carry a note that they were
   measured on synchronous handles?** Probably yes, for a reader's sake rather
   than for accuracy. Under a warm page cache nothing ever waits — a `ReadFile`
-  returns after a memory copy — so serialising at the file object costs nothing
-  there, and the unbuffered work found no measurable difference between the two
-  handle modes under a warm cache. The figures are not wrong.
+  returns after a memory copy — so serialising at the file object should cost
+  nothing there, and the figures are very unlikely to be wrong.
+
+  That is a **mechanism argument, not a measurement**: no warm-cache A/B on the
+  flag has been run, and the unbuffered arm cannot supply one, since it is
+  defined by `FILE_FLAG_NO_BUFFERING` and so has no warm-cache half. Its handle
+  modes are also confounded with backend identity — the ring and compio
+  configurations open with `FILE_FLAG_OVERLAPPED` and the thread-pool ones
+  without — so it is not a clean A/B on the flag even unbuffered. Running one
+  would cost a small dedicated probe; it has not been done.
 
   But the unbuffered section states plainly that it opens its handles
   differently, and a reader comparing the two sections will notice the

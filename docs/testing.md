@@ -435,6 +435,8 @@ Scrutinise a finding because it is surprising *or* because it is expected, not
 only because it is convenient.
 
 
+### Proving a wakeup cannot be lost
+
 The wakeup guarantee is the easiest thing in this crate to get subtly wrong and
 the hardest to catch, because a lost wakeup is a race that a passing test cannot
 distinguish from a won one. Two techniques carry most of the weight:

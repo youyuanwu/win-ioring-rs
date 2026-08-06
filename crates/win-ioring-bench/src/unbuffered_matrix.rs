@@ -155,7 +155,7 @@ impl UnbufferedConfig {
             random_block: 4 * 1024,
             sequential_block: 64 * 1024,
             operations: 8,
-            depths: &[1, 4],
+            depths: &[1, 8],
         }
     }
 
@@ -627,5 +627,147 @@ mod tests {
              with warm-cache ones, so the prefix guard may now be passing \
              vacuously"
         );
+    }
+
+    /// Every depth a configuration names must be a depth the grid emits.
+    ///
+    /// `grid()` only produces [`DEPTHS`], and the runner filters cells by
+    /// `depths.contains(..)`. A depth listed here but absent from `DEPTHS`
+    /// therefore matches nothing and is silently dropped -- which is exactly
+    /// what happened: `small()` named depth 4, the grid has no depth 4, and the
+    /// CI smoke-run covered depth 1 only. Every concurrency path in the bench
+    /// runner went unexercised by the target whose whole purpose is to keep
+    /// them from rotting, and `benchmarks()` over-reported by 2x because it
+    /// counted depths that never ran.
+    #[test]
+    fn every_configured_depth_is_a_depth_the_grid_emits() {
+        for config in [UnbufferedConfig::full(), UnbufferedConfig::small()] {
+            for depth in config.depths {
+                assert!(
+                    DEPTHS.contains(depth),
+                    "configured depth {depth} is not in DEPTHS {DEPTHS:?}, so it \
+                     matches no cell and is silently dropped"
+                );
+            }
+        }
+    }
+
+    /// `benchmarks()` must equal what the runner actually registers.
+    ///
+    /// The twin for the test above: it counts cells the way the bench runner
+    /// filters them, so a depth that matches nothing shows up as a mismatch
+    /// rather than as a quietly smaller run.
+    #[test]
+    fn the_benchmark_count_matches_the_cells_that_survive_filtering() {
+        for config in [UnbufferedConfig::full(), UnbufferedConfig::small()] {
+            let surviving = grid()
+                .iter()
+                .filter(|cell| config.depths.contains(&cell.depth))
+                .count();
+            assert_eq!(
+                surviving,
+                config.benchmarks(),
+                "benchmarks() disagrees with the number of cells the runner \
+                 would actually register"
+            );
+        }
+    }
+
+    /// A backend that performs no I/O and records what it was asked to read.
+    ///
+    /// Exists to bind [`issue_reads`] to the offset sequence it is given.
+    /// Without it the two halves are tested only in isolation: `offsets()` is
+    /// checked for alignment, bounds and reproducibility, and `issue_reads` is
+    /// checked for the byte count it returns -- but nothing asserted that the
+    /// measured region reads *those* offsets. Replacing `offsets[next]` with
+    /// `offsets[0]` left the whole suite green.
+    ///
+    /// That mutation is not a harmless one. Random read is this arm's primary
+    /// probe precisely because scattered access defeats the drive's own cache;
+    /// collapsing all 256 reads onto a single block would turn every one of
+    /// them into a cache hit and report a plausible, badly wrong number rather
+    /// than failing. It is the "believable number, not an obvious failure"
+    /// species this feature documented in `docs/testing.md`.
+    struct Recorder {
+        seen: std::cell::RefCell<Vec<u64>>,
+        block: usize,
+    }
+
+    impl crate::backend::Backend for Recorder {
+        type Buf = Vec<u8>;
+        type File = ();
+
+        fn name(&self) -> String {
+            "recorder".into()
+        }
+        fn configuration(&self) -> String {
+            "records offsets, performs no I/O".into()
+        }
+        async fn open_read(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn open_write(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn take_buffer(&self, capacity: usize) -> std::io::Result<Vec<u8>> {
+            Ok(vec![0u8; capacity])
+        }
+        fn put_buffer(&self, _buffer: Vec<u8>) {}
+        async fn read_at(
+            &self,
+            _file: &(),
+            buffer: Vec<u8>,
+            len: u32,
+            offset: u64,
+        ) -> (std::io::Result<u32>, Vec<u8>) {
+            self.seen.borrow_mut().push(offset);
+            let _ = len;
+            (Ok(self.block as u32), buffer)
+        }
+        async fn write_at(
+            &self,
+            _file: &(),
+            buffer: Vec<u8>,
+            _len: u32,
+            _offset: u64,
+        ) -> (std::io::Result<u32>, Vec<u8>) {
+            (
+                Err(std::io::Error::other("the recorder does not write")),
+                buffer,
+            )
+        }
+        async fn sync(&self, _file: &()) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The measured region must read the offsets it was handed, in full.
+    #[test]
+    fn the_measured_region_reads_every_offset_it_was_given() {
+        let block = 4096usize;
+        for scenario in SCENARIOS {
+            let ops = offsets(scenario, 64, block, block, (block as u64) * 512);
+            let backend = Recorder {
+                seen: std::cell::RefCell::new(Vec::new()),
+                block,
+            };
+            let delivered = futures::executor::block_on(issue_reads(&backend, &(), &ops, block))
+                .expect("reads");
+
+            assert_eq!(delivered, ops.len() * block);
+
+            // Order is not asserted: the measured region completes reads out of
+            // order on purpose, which is the whole point of running them
+            // concurrently. The multiset is what must match.
+            let mut seen = backend.seen.borrow().clone();
+            let mut expected = ops.clone();
+            seen.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                seen, expected,
+                "{scenario:?}: the measured region did not read the offsets it \
+                 was given"
+            );
+        }
     }
 }
