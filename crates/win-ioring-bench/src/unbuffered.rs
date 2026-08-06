@@ -29,14 +29,16 @@
 //! On the probe's provisional figures that would move the multi-handle
 //! configuration from 8.87 to about 11.10 µs/IO while the ring moved from 11.73
 //! to about 11.77 — compressing the competitor's lead from about 1.32x to about
-//! 1.06x. It would **not** have produced a ring victory, and an earlier version
-//! of this comment claimed it would have ("a fake 1.35x"). That claim came from
-//! a single cold run of probe 7 which reported 27.50 µs and 1779.90 µs for the
-//! two open costs — roughly triple the medians above. Repeating the probe five
-//! times did not reproduce it. The error was in the direction that made this
-//! crate's methodology look more scrupulous than it was, which is the direction
-//! this work has erred in before, so it is stated here rather than quietly
-//! amended.
+//! 1.06x. It would **not** have produced a ring victory, and earlier versions
+//! of this comment claimed it would have — first as "a fake 1.35x", then as
+//! "an apparent 1.33x", the figure changing between corrections without being
+//! re-measured. Both are retracted. They came from a single cold run of probe 7
+//! which reported 27.50 µs and 1779.90 µs for the two open costs — roughly
+//! triple the medians above. Repeating the probe five times did not reproduce
+//! it, and an independent re-run of seven agreed with the repeats. The error
+//! was in the direction that made this crate's methodology look more scrupulous
+//! than it was, which is the direction this work has erred in repeatedly, so it
+//! is stated here rather than quietly amended.
 //!
 //! The decision is unchanged, because the direction of the bias is unchanged
 //! and only its size was overstated: charging set-up to every 256 reads
@@ -59,8 +61,11 @@
 //! unbuffered open, one real read per configuration end to end, the flags each
 //! backend's `open_read` actually establishes, each backend's real `open_write`
 //! refusal, buffer-pool exhaustion and over-capacity refusal in all four pools,
-//! the published configuration strings, the handle-count arithmetic, and the
-//! open-cost measurement.
+//! the published configuration strings, the handle-count arithmetic, and both
+//! halves of the open-cost measurement — that it counts handles, and that the
+//! handles it opens are unbuffered. The flag half was uncovered for two
+//! revisions while this list claimed the measurement as covered; it is named
+//! in two parts now because "the open-cost measurement" concealed that.
 //!
 //! One disclosed deviation from R10.2, which otherwise forbids asserting on
 //! durations: `open_cost_scales_with_the_handle_count` compares two
@@ -68,14 +73,28 @@
 //! Nothing else in this module asserts a duration, an ordering, or a ratio
 //! against a wall clock, and nothing asserts throughput or a published figure.
 //! The exemption is narrow on purpose: the comparison is within one process,
-//! best-of-five, and the real margin is ~32x, so it is not a plausible flake —
-//! and without it the round-3 fix to `open_cost` has no guard at all. A flaky
-//! device-bound gate is worse than no gate, because it teaches people to ignore
-//! failures; a 32x within-process margin is not that.
+//! best-of-five, and the measured margin is about **10x** on this host (seven
+//! runs, 9.6x to 10.4x; an independent run on the same host saw 4.7x to 10.2x,
+//! its low end coming from a noisy single-open sample). Even the smallest
+//! observed margin leaves the assertion far from its boundary.
 //!
-//! Not covered, and stated rather than implied: `write_at`, which is
-//! unreachable because every `open_write` refuses first. Reachable only from
-//! the opt-in bench target.
+//! An earlier revision of this comment claimed the margin was "~32x". That
+//! figure was never measured — it was inferred from the handle count, 32. The
+//! per-handle cost falls sharply with count (one open ~39 µs, thirty-two ~400
+//! µs, so ~12 µs each after the first), which is why the ratio is nowhere near
+//! the handle ratio. The claim was wrong in the direction that made this gate
+//! look more robust than it is.
+//!
+//! The guard is kept rather than dropped because without it the fix that made
+//! `open_cost` count handles has no cover at all. A flaky device-bound gate
+//! would be worse than no gate, since it teaches people to ignore failures; a
+//! within-process comparison with a 4.7x worst observed margin is not that.
+//!
+//! Not covered, and stated rather than implied: `write_at`. It is unreachable
+//! in practice — every configuration's `open_write` refuses first, so nothing
+//! can obtain the file handle `write_at` would need — which is why no test
+//! drives it. It is not reachable from the opt-in bench target either; this
+//! arm reads only.
 //!
 //! That split is deliberate rather than an omission. **A flaky device-bound
 //! gate is worse than no gate, because it trains people to ignore failures** —
@@ -203,15 +222,37 @@ pub fn open_unbuffered_synchronous(path: &Path) -> io::Result<std::fs::File> {
 ///
 /// If any handle cannot be opened.
 pub fn open_cost(config: Config, path: &Path, depth: usize) -> io::Result<std::time::Duration> {
+    let (elapsed, handles) = open_handle_set(config, path, depth)?;
+    drop(handles);
+    Ok(elapsed)
+}
+
+/// Opens the handle set and returns it alongside the elapsed time.
+///
+/// [`open_cost`] is a thin wrapper that drops the handles. The split exists so
+/// a test can inspect the handles `open_cost` actually opens, rather than
+/// reconstructing an equivalent open and checking that instead.
+///
+/// That distinction is not pedantic. An earlier revision replaced the third
+/// copy of the flag decision with a derivation from [`Config::read_flags`] —
+/// the right fix — but rewrote the guarding test to reconstruct the open
+/// inline. The test then verified a property of Windows rather than a property
+/// of this crate, and pointing this function at a plainly buffered open left
+/// every test green. A buffered open here poisons the arm's working file for
+/// the life of the process, so the failure would have been a plausible,
+/// publishable, wrong number with nothing visible in the output.
+///
+/// # Errors
+///
+/// If any handle cannot be opened.
+fn open_handle_set(
+    config: Config,
+    path: &Path,
+    depth: usize,
+) -> io::Result<(std::time::Duration, Vec<std::fs::File>)> {
     let n = config.handles(depth);
-    // Opened from `read_flags()` rather than from a second table of openers.
-    // There used to be a third copy of this fact, and the test that guarded it
-    // checked only the `FILE_FLAG_OVERLAPPED` bit — leaving the copy free to
-    // drift on `FILE_FLAG_NO_BUFFERING`, the one bit this entire arm exists to
-    // measure. A buffered open here would have poisoned the arm's working file
-    // for the life of the process (see the module header), producing a
-    // plausible, publishable, wrong number. Deriving it removes the copy
-    // instead of testing it.
+    // Opened from `read_flags()` rather than from a second table of openers, so
+    // the two cannot drift.
     let flags = config.read_flags();
     let open = |p: &Path| {
         std::fs::OpenOptions::new()
@@ -222,8 +263,7 @@ pub fn open_cost(config: Config, path: &Path, depth: usize) -> io::Result<std::t
     let start = std::time::Instant::now();
     let handles = (0..n).map(|_| open(path)).collect::<io::Result<Vec<_>>>()?;
     let elapsed = start.elapsed();
-    drop(handles);
-    Ok(elapsed)
+    Ok((elapsed, handles))
 }
 
 /// One cell's backend choice in the unbuffered arm.
@@ -757,11 +797,13 @@ impl Backend for UnbufferedCompio {
             io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
         })?;
         if buffer.0.capacity() < capacity {
+            // Returned before erroring; see `take_aligned` for why.
+            let shortfall = buffer.0.capacity();
+            self.buffers.borrow_mut().push(buffer);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "a {capacity}-byte read needs a buffer of at least that capacity, not {}",
-                    buffer.0.capacity()
+                    "a {capacity}-byte read needs a buffer of at least that capacity, not {shortfall}"
                 ),
             ));
         }
@@ -959,11 +1001,13 @@ impl Backend for UnbufferedTokioFs {
             io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
         })?;
         if buffer.capacity() < capacity {
+            // Returned before erroring; see `take_aligned` for why.
+            let shortfall = buffer.capacity();
+            pool.push(buffer);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "a {capacity}-byte read needs a buffer of at least that capacity, not {}",
-                    buffer.capacity()
+                    "a {capacity}-byte read needs a buffer of at least that capacity, not {shortfall}"
                 ),
             ));
         }
@@ -1059,11 +1103,16 @@ fn take_aligned(
         io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
     })?;
     if buffer.capacity() < capacity {
+        // Return it before erroring. Dropping it here would shrink the pool by
+        // one permanently, so a configuration that hit this path would run the
+        // rest of the measurement with less concurrency than it was configured
+        // for -- a quiet change to what is being measured, on an error path.
+        let shortfall = buffer.capacity();
+        pool.borrow_mut().push(buffer);
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "a {capacity}-byte read needs a buffer of at least that capacity, not {}",
-                buffer.capacity()
+                "a {capacity}-byte read needs a buffer of at least that capacity, not {shortfall}"
             ),
         ));
     }
@@ -1549,9 +1598,11 @@ mod tests {
         const DEPTH: usize = 32;
 
         // Take the best of a few repeats on each side. This is a ratio between
-        // two measurements on the same host in the same process, and the claim
-        // is 32x apart, so it does not need the arm's noise band -- but a
-        // single sample of a syscall can be preempted arbitrarily.
+        // two measurements on the same host in the same process, so it does not
+        // need the arm's noise band -- but a single sample of a syscall can be
+        // preempted arbitrarily. Measured margin is about 10x, not the 32x an
+        // earlier comment here claimed from the handle count: the per-handle
+        // cost falls after the first open.
         let best = |config: Config| {
             (0..5)
                 .map(|_| open_cost(config, path, DEPTH).expect("an open"))
@@ -1888,6 +1939,23 @@ mod tests {
              truncation here would make the honest competitor do less work",
         );
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        // A refusal must not consume the buffer. Dropping it would shrink the
+        // pool permanently, so the rest of the measurement would run at less
+        // concurrency than configured — a quiet change to what is being
+        // measured, reachable only from an error path.
+        let again = pool
+            .take_buffer(4096)
+            .expect("a refusal must return the buffer to the pool, not consume it");
+        drop(again);
+        let compio_again = compio
+            .take_buffer(4096)
+            .expect("a refusal must return the buffer to the pool, not consume it");
+        drop(compio_again);
+        let owned_again = owned
+            .take_buffer(4096)
+            .expect("a refusal must return the buffer to the pool, not consume it");
+        drop(owned_again);
     }
 
     /// Each backend's published self-description must match the handle mode its
@@ -1960,43 +2028,46 @@ mod tests {
         })
     }
 
-    /// The handles `open_cost` actually opens carry both configured bits.
+    /// The handles `open_cost` actually opens are unbuffered, in every
+    /// configuration.
     ///
-    /// `open_cost` used to consult a third copy of the flag decision — after
-    /// `read_flags` and the backends themselves — and this test checked only
-    /// the `FILE_FLAG_OVERLAPPED` bit of it. Pointing that copy at a plainly
-    /// buffered `File::open` left all eighteen tests green, so the copy was
-    /// free to drift on `FILE_FLAG_NO_BUFFERING` — the one bit the arm exists
-    /// to measure, and the one whose loss silently poisons the working file.
+    /// This drives [`open_handle_set`] — the function `open_cost` is a wrapper
+    /// around — and reads the mode back off the handles it returns. Two earlier
+    /// revisions failed to do that. The first consulted a third copy of the
+    /// flag decision and checked only the `FILE_FLAG_OVERLAPPED` bit of it. The
+    /// second removed the copy but reconstructed the open inline, so it stopped
+    /// touching `open_cost`'s code path entirely: pointing that path at a
+    /// plainly buffered open left all nineteen tests green, while the
+    /// docstring claimed the derivation was verified end to end. The hole went
+    /// from one bit to every bit, in the commit that closed the one bit.
     ///
-    /// The copy is gone; `open_cost` derives from `read_flags`. This now
-    /// verifies the derivation end to end, on a real handle, in **both**
-    /// dimensions, so neither bit can be lost without a failure.
+    /// The assertion is deliberately absolute rather than a comparison against
+    /// `read_flags()`. Opening with `flags` and then asserting the handle
+    /// reflects `flags` is a property of Windows, not of this crate, and no
+    /// mutation of this crate can falsify it. `is_unbuffered` can be falsified,
+    /// and it is the bit that matters: a buffered open here silently poisons
+    /// the arm's working file for the life of the process.
     #[test]
-    fn the_handles_open_cost_opens_carry_both_configured_flags() {
-        use crate::unbuffered_workload::{is_synchronous, is_unbuffered};
+    fn the_handles_open_cost_opens_are_unbuffered_in_every_configuration() {
+        use crate::unbuffered_workload::is_unbuffered;
 
         let fx = fixture("opener-agreement");
         let path = fx.file.path().as_raw_path();
         for config in Config::all() {
-            let flags = config.read_flags();
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(flags)
-                .open(path)
-                .expect("an open");
+            let (_, handles) = open_handle_set(config, path, 2).expect("an open");
             assert!(
-                is_unbuffered(&file).expect("a mode read-back"),
-                "{}: `open_cost` would open a buffered handle, which poisons the \
-                 arm's working file for the life of the process",
+                !handles.is_empty(),
+                "{}: no handle was opened, so nothing was measured",
                 config.slug()
             );
-            assert_eq!(
-                is_synchronous(&file).expect("a mode read-back"),
-                flags & FILE_FLAG_OVERLAPPED.0 == 0,
-                "{}: `open_cost` opens a handle mode this configuration never uses",
-                config.slug()
-            );
+            for file in &handles {
+                assert!(
+                    is_unbuffered(file).expect("a mode read-back"),
+                    "{}: `open_cost` opens a buffered handle, which poisons the \
+                     arm's working file for the life of the process",
+                    config.slug()
+                );
+            }
         }
     }
 }
