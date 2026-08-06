@@ -17,8 +17,9 @@
 //! The second is that **fixing it here would invalidate the published
 //! results**. The twenty `win-ioring` cells of the matrix in
 //! `docs/performance.md` were all measured through handles from
-//! `win_ioring::file::File::open` and `File::create`, and every ratio in that
-//! matrix is computed against them, so setting the flag would force a full
+//! `win_ioring::file::File::open` and `File::create`, and that matrix is a
+//! single-run artefact that is never patched from a second run
+//! (`docs/performance.md:236-242`), so setting the flag would force a full
 //! re-run and republication of the whole table. That is deliberately out of
 //! scope; the question is recorded in `docs/pending-work.md` with its cost.
 //!
@@ -37,8 +38,8 @@
 //!
 //! They assert handle mode, never timing. The size of the effect the flag has
 //! on throughput is the unbuffered arm's business, measured through the real
-//! harness and published in `docs/performance.md`. Nothing here depends on
-//! those figures.
+//! harness and reported in `docs/performance.md` once that arm has run.
+//! Nothing here depends on those figures.
 
 use std::os::windows::fs::OpenOptionsExt;
 
@@ -50,7 +51,7 @@ use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 /// The exact mode a synchronous, buffered handle reports.
 ///
 /// Asserted as a whole value rather than only as a masked bit. Masking against
-/// [`FILE_SYNCHRONOUS_IO_NONALERT`] and comparing to that same constant is
+/// `FILE_SYNCHRONOUS_IO_NONALERT` and comparing to that same constant is
 /// satisfied by *any* value of the constant, including zero — `mode & 0 == 0`
 /// holds for every handle in existence. That is the fourth instance in this
 /// work of a check that cannot distinguish "the guard held" from "the guard
@@ -100,9 +101,10 @@ fn file_open_produces_a_synchronous_handle() {
          the flag's absence is a real limitation, documented on File::open and \
          recorded in docs/pending-work.md. But the twenty win-ioring cells of \
          the published matrix in docs/performance.md were all measured through \
-         handles from this function, and every ratio in that matrix is computed \
-         against them, so the whole table must be re-run and republished rather \
-         than merely re-read. Update this test as part of doing so."
+         handles from this function, and that matrix is a single-run artefact \
+         that is never patched from a second run, so the whole table must be \
+         re-run and republished rather than merely re-read. Update this test \
+         as part of doing so."
     );
 }
 
