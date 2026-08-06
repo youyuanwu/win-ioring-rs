@@ -37,6 +37,13 @@ sixteen include **every one of the fourteen at depth 8 and depth 64** — which 
 to say the two are indistinguishable everywhere the loss happens. See
 ["A third backend"](#a-third-backend-completion-based-but-not-a-ring).
 
+**Everything in this headline is warm page cache.** A separate, opt-in arm
+measures unbuffered reads that reach the device, and there the ranking changes:
+the crate beats `tokio::fs` at pool width 1 by 7.84x, and loses to `tokio::fs`
+at pool 512 across 64 file handles by 1.22x. Neither figure is quotable without
+the other, and neither is comparable to the numbers above. See
+[Unbuffered](#unbuffered-reads-that-reach-the-device).
+
 Three warnings attach to those paragraphs, and they are not decoration.
 
 **One of this crate's depth-1 cells reversed its direction against the previous
@@ -1047,10 +1054,15 @@ backend — and because it was caught by review rather than by any automated che
 
 - Anything about **cold-cache or device-bound** workloads, where the ranking
   could differ entirely and where the device, not the software, decides.
+  A separate, opt-in arm now measures this; see
+  [Unbuffered: reads that reach the device](#unbuffered-reads-that-reach-the-device).
+  Its figures are **not comparable** to the table above and must not be read
+  against it.
 - Anything about workloads with **real per-operation latency**, where a
   thread-pool backend's threads block and a completion-based one's do not. Warm
   cache means nothing ever really waits, which is the case least favourable to
-  this crate.
+  this crate. Also addressed by the unbuffered arm — and the answer there is not
+  the simple one this bullet implies.
 - Anything about **scaling past one application thread**. This crate is `!Send`
   by construction and uses one; the comparison holds that constant rather than
   rewarding the alternative for using more.
@@ -1076,3 +1088,201 @@ work.
 They live in `crates/win-ioring-bench/src/config.rs` and
 `crates/win-ioring-bench/benches/comparison.rs`, and every one of them is printed
 with every run, because a figure without its parameters is not a result.
+
+## Unbuffered: reads that reach the device
+
+Everything above this section is **warm page cache by design**. This section is
+not. It is a separate, opt-in benchmark target measuring reads issued with
+`FILE_FLAG_NO_BUFFERING`, which bypass the operating system page cache and pay
+real device latency.
+
+**Do not read these numbers against the table above.** They answer a different
+question, they have their own noise band, and they are far more host-dependent
+than anything else in this document. Nothing here supersedes or amends the
+50-cell warm-cache matrix; that matrix was not re-run and its code path was not
+touched. Per-operation microsecond figures from the two sections are not
+comparable in either direction.
+
+### Why it was measured
+
+The crate loses to `tokio::fs` at blocking-pool width 1 as queue depth rises,
+and two previous investigations removed the obvious explanations: submission
+batching was already operating at the full configured depth, and `compio` — a
+completion-based backend that is not a ring — loses in the same places
+indistinguishably. The cause is still recorded as unknown.
+
+The hypothesis this arm tests: under a warm cache a `ReadFile` never blocks, so
+there is no waiting to overlap, and completion-based I/O pays per-operation
+machinery for a benefit that cannot exist. Disable the cache and a single
+blocking thread is structurally capped at **one outstanding device request**,
+while a ring holds the full configured depth. That is the condition under which
+the design should pay.
+
+### The prediction, registered before measuring
+
+Recorded in the feature's specification before any number existed, so that a
+null or contrary result could not be quietly reframed afterwards:
+
+> At depth 64 unbuffered, `win-ioring` is expected to beat `tokio::fs` at pool
+> width 1 by a wide margin, because pool-1 is capped at one outstanding device
+> request and the ring is not.
+
+**It was confirmed, and it was also beside the point.** Both halves of that
+sentence are the result, and neither is quotable without the other.
+
+### The headline
+
+Random read, 4 KiB, depth 64, µs per I/O:
+
+| configuration | handles | blocking threads | µs/IO |
+|---|---:|---:|---:|
+| `tokio::fs` pool 512, **64 handles** | 64 | 512 | **11.33** |
+| `win-ioring` registered | 1 | — | 13.70 |
+| `win-ioring` owned | 1 | — | 13.86 |
+| `compio` (IOCP) | 1 | — | 14.41 |
+| `tokio::fs` pool 1 | 1 | 1 | 108.62 |
+| `tokio::fs` pool 512, 1 handle | 1 | 512 | 116.41 |
+
+- The ring beats `tokio::fs` at pool width 1 by **7.84x**. The prediction holds,
+  and the margin is large.
+- The ring **loses to `tokio::fs` at pool 512 with 64 handles by 1.22x**. That
+  configuration is the honest competitor: with real device latency, 512 blocking
+  threads across 64 file handles also achieve deep outstanding I/O.
+
+A victory declared over pool-1 alone, while the multi-handle thread pool is
+ahead, would be a misleading result. It is not presented as a win. The ring's
+advantage here is **resource cost, not speed**: it reaches within 1.22x of the
+thread pool's throughput with one handle, one thread and no thread per
+outstanding operation. That is a real engineering property and it is a different
+claim from being faster.
+
+### Handle count was the variable, not pool width
+
+This is the most useful thing the arm found, and it corrects a framing this
+document has used since the thread-pool backends were first split by width.
+
+Holding everything else fixed, per run, at random read depth 64:
+
+| what changes | ratio, across 5 runs | resolved? |
+|---|---|---|
+| pool width 1 → 512, **one handle both** | 0.93, 1.02, 0.95, 0.95, 0.95 | no — straddles 1.0 |
+| handles 1 → 64, **pool 512 both** | 10.27, 8.75, 9.48, 8.98, 10.16 | yes — 8.75x to 10.27x |
+
+Adding 511 threads to a one-handle configuration does nothing measurable.
+Adding 63 file handles at a fixed pool width moves the result by roughly nine to
+ten times. The thread pool was never limited by its width; it was limited by
+serialisation at the file object, and one handle is one queue however many
+threads are pushing on it.
+
+This also explains why pool 512 beats pool 1 here but *loses* to it in the
+warm-cache table: those are different mechanisms. Warm-cache pool 512 loses to
+pool 1 on scheduling contention with nothing to overlap, and that result stands
+unchanged. Neither section overturns the other.
+
+### Sequential read, 64 KiB
+
+The weaker probe, and included because its absence would have been a choice
+worth questioning: a drive's own readahead can serve sequential unbuffered reads
+from its internal cache regardless of the OS page cache. Depth 64, µs/IO:
+
+| configuration | µs/IO |
+|---|---:|
+| `tokio::fs` pool 512, 64 handles | 29.67 |
+| `win-ioring` registered | 32.15 |
+| `win-ioring` owned | 32.45 |
+| `compio` | 32.56 |
+| `tokio::fs` pool 1 | 193.82 |
+| `tokio::fs` pool 512, 1 handle | 198.96 |
+
+Same shape, smaller margins: ring over pool-1 is 5.97x, multi-handle pool over
+ring is 1.09x.
+
+### The noise band for this arm
+
+**−5.9% to +14.0%**, measured for this arm specifically.
+
+Five whole runs, each in a fresh process, on an otherwise idle machine — not
+five samples within one run, which would not capture between-process or drive
+state drift. Each cell's spread is taken against its own median across those
+five runs; the figures above are from the first run.
+
+This band is **not** the roughly −18% to +24% band recorded earlier for the
+warm-cache arm, is not derived from it, and neither substitutes for the other.
+It is also not the "±17%" figure this document previously retracted. Device I/O
+has higher and differently shaped variance — SLC cache exhaustion, thermal
+behaviour, background garbage collection, drive state drift — and the asymmetry
+above is the visible sign of it: a run can be slowed by drive state, but nothing
+makes the device faster than it is.
+
+Both headline claims were tested by pairing runs rather than comparing ranges,
+which is stricter. Across all five runs the ring beat pool-1 by 7.57x to 8.00x,
+and the multi-handle thread pool beat the ring by 1.12x to 1.27x — the same
+direction every time, with the ring never once ahead. Both are resolved. The
+1.22x is the smaller claim and it is the one the band was measured for.
+
+### What this arm does not tell you
+
+- **Disabling the OS page cache does not disable the drive's cache**, nor its
+  readahead. `FILE_FLAG_NO_BUFFERING` is an operating-system flag and has no
+  authority over the device. The read file is 256 MiB, which a modern SSD may
+  substantially hold in its own cache, so some fraction of these reads may not
+  have reached NAND at all. Random access over the full extent is the better
+  probe for this reason and is why it is the primary one; the residual
+  uncertainty is not eliminated, only reduced, and it cannot be measured from
+  the host.
+- **These figures are one drive.** More so than anything else in this document.
+  The host is a Micron `MTFDKBA1T0TFK` NVMe SSD on an NTFS volume. Alignment
+  requirements are volume-dependent; this volume reported
+  `AlignmentRequirement` 4 B, `LogicalBytesPerSector` 512 B,
+  `PhysicalBytesPerSectorForAtomicity` 4096 B,
+  `PhysicalBytesPerSectorForPerformance` 4096 B, and `GetDiskFreeSpace`
+  `BytesPerSector` 512 B. The harness takes the **strictest** of these, 4096 B,
+  as its granularity. Those four APIs disagreeing by a factor of a thousand is
+  itself worth knowing: do not hardcode 4096, and do not trust any single one of
+  them.
+- **Nothing about µs/IO compared to the warm-cache table.** Stated twice
+  deliberately.
+
+### How to reproduce
+
+```text
+cargo bench -p win-ioring-bench --bench unbuffered
+```
+
+Opt-in: `bench = false` in the manifest keeps it out of a bare `cargo bench`, so
+it cannot inflate the main run's budget or share its stored baselines. It has its
+own wall-clock budget of 600 s; a full 36-cell run takes about 192 s here.
+Criterion group names are prefixed `unbuffered-` so the two arms cannot share a
+`target/criterion` group directory.
+
+The arm keeps its own working file, and that is load-bearing rather than tidy: a
+single *buffered* read of a file collapses subsequent unbuffered reads of that
+file by roughly an order of magnitude for the life of the process. Sharing the
+warm-cache arm's data file — which is read buffered before every run — would
+have produced a plausible null result rather than an obvious failure. See
+[testing.md](testing.md) for that hazard and the type-level guard against it.
+
+### One methodological difference from the main matrix
+
+The opens sit **outside** the timed region in this arm. In the warm-cache arm
+they sit inside it, which is the right choice there.
+
+The reason is that the configurations here deliberately hold different numbers
+of file handles — that is the variable under test — and an unbuffered open costs
+about as much as a whole read. Charging opens per iteration would tax whichever
+configuration holds the most handles, which is the multi-handle thread pool: the
+one configuration whose result is inconvenient.
+
+Measured rather than assumed. Opening 64 handles unbuffered costs about 555 µs
+(median of seven), one handle about 9.3 µs; spread over the 256 operations in an
+iteration that is 2.17 µs/IO for the multi-handle configuration and 0.036 µs/IO
+for a single-handle one. Charged, the multi-handle figure moves 11.33 → 13.50
+(+19%) and the ring's moves 13.86 → 13.90 (+0.3%), which compresses the
+competitor's lead from **1.22x to 1.03x**. So the choice does not change who
+wins — the thread pool is still ahead either way — but it would have shrunk a
+genuine margin almost to nothing, in the crate's favour, on the strength of a
+bookkeeping decision. The direction of that bias is the reason for the choice.
+
+An earlier estimate of this effect, quoted from a single cold-start
+measurement, was about three times too large and is withdrawn; the figures here
+are medians of repeated runs.

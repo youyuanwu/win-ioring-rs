@@ -154,7 +154,8 @@ impl File {
     /// ```
     ///
     /// Whether this function should set the flag itself is an open question,
-    /// which `docs/pending-work.md` will record with its cost. It is not
+    /// which `docs/pending-work.md` records with its cost, under "Handle mode".
+    /// It is not
     /// changed here because the twenty `win-ioring` cells of the fifty in the
     /// published matrix (see "Full result" in `docs/performance.md`) were all
     /// measured through handles from this function and from [`File::create`],

@@ -21,8 +21,8 @@
 //! single-run artefact that is never patched from a second run (see "Full
 //! result" in `docs/performance.md`), so setting the flag would force a full
 //! re-run and republication of the whole table. That is deliberately out of
-//! scope; the question is scheduled to be recorded in `docs/pending-work.md`
-//! with its cost, by this feature's documentation phase.
+//! scope; the question is recorded in `docs/pending-work.md` under "Handle
+//! mode", with its cost.
 //!
 //! So the behaviour is *pinned* rather than changed. If someone later adds the
 //! flag — which is a reasonable thing to want, and the pending-work note is
@@ -101,8 +101,8 @@ fn file_open_produces_a_synchronous_handle() {
          \n\
          If FILE_FLAG_OVERLAPPED was just added: that is a defensible change — \
          the flag's absence is a real limitation, documented on File::open and \
-         due to be recorded in docs/pending-work.md by this feature's \
-         documentation phase. But the twenty win-ioring cells of the fifty in \
+         recorded in docs/pending-work.md under \"Handle mode\", with its \
+         cost. But the twenty win-ioring cells of the fifty in \
          the published matrix in docs/performance.md were all measured through \
          handles from File::open and File::create, and that matrix is a \
          single-run artefact that is never patched from a second run, so the \
