@@ -9,11 +9,24 @@ publish = false
 futures.workspace = true
 win-ioring.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
-# Only for the available-physical-memory query the report needs. Declared here
-# rather than widened into the workspace `windows` entry so the feature never
-# enters `win-ioring`'s declared surface and a downstream consumer never
-# compiles it — the same reasoning as the `Win32_System_Pipes` dev-dependency.
-windows = { workspace = true, features = ["Win32_System_SystemInformation"] }
+# `Win32_System_SystemInformation` for the available-physical-memory query the
+# report needs. `Win32_Storage_FileSystem` for the volume alignment query the
+# unbuffered arm cannot proceed without. The `Wdk_*` pair and `Win32_System_IO`
+# reach `NtQueryInformationFile`/`FileModeInformation`, which is the only way to
+# read back whether a handle really is unbuffered and really is overlapped —
+# `GetFileInformationByHandleEx` cannot report either.
+#
+# All declared here rather than widened into the workspace `windows` entry so
+# the features never enter `win-ioring`'s declared surface and a downstream
+# consumer never compiles them — the same reasoning as the `Win32_System_Pipes`
+# dev-dependency.
+windows = { workspace = true, features = [
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 # The fifth comparison backend, and the third point on the axis that matters:
 # completion-based, but not a ring. Declared here rather than in
 # `[workspace.dependencies]` for the same reason as `windows` above: this is a
@@ -36,11 +49,39 @@ criterion = { workspace = true, features = ["async"] }
 [lib]
 bench = false
 
-# The one entry point. `harness = false` because Criterion writes `main`
-# itself; there is no `[[bin]]` and no second way to run this.
+# The one entry point for the published warm-cache matrix. `harness = false`
+# because Criterion writes `main` itself; there is no `[[bin]]` and no second
+# way to run this.
 [[bench]]
 name = "comparison"
 harness = false
+
+# The unbuffered arm, opt-in.
+#
+# `bench = false` keeps it out of a bare `cargo bench`, which is the point: its
+# iterations are device-bound, its figures are not comparable to the warm-cache
+# matrix above, and it needs its own noise band. Running it is a deliberate act:
+# `cargo bench -p win-ioring-bench --bench unbuffered`.
+#
+# `test = true` is LOAD-BEARING — do not delete it as redundant.
+#
+# `--benches` and `--all-targets` select bench targets by the `bench` flag, and
+# `test` defaults to false for a bench target. So `bench = false` alone removes
+# this target from CI *entirely*: `cargo check/clippy --all-targets` would not
+# compile it and `cargo test --all-targets` would not run it. Verified by
+# experiment — a deliberate type error in a `bench = false` target went
+# undetected by `cargo check --all-targets`. The build would stay green
+# precisely because nothing was built.
+#
+# `comparison` above is reached by `cargo test` only because it is `bench = true`
+# by default, so its precedent does not transfer here. With `test = true` this
+# target is compiled, linted and smoke-run in test mode by CI, at the small
+# configuration, on every push. See `docs/testing.md`.
+[[bench]]
+name = "unbuffered"
+harness = false
+bench = false
+test = true
 
 [lints]
 workspace = true

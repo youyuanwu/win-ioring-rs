@@ -47,6 +47,8 @@
 //! See `docs/performance.md` for what the measurements do and do not tell you.
 
 pub mod account;
+pub mod align;
+pub mod aligned;
 pub mod backend;
 pub mod backends;
 pub mod concurrency;
