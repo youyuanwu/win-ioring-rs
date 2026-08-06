@@ -173,11 +173,11 @@ fn an_adopted_overlapped_handle_is_not_synchronous() {
     // fail, in the file whose own header names the species: setting
     // FILE_NO_INTERMEDIATE_BUFFERING to 0xFFFF_FFFF left all three tests
     // passing. It is kept only behind the positive read-back below, which
-    // establishes that the constant names a bit a genuinely unbuffered handle
-    // actually reports. That guard still has a residue: it is itself masked, so
-    // K = 0 satisfies both assertions. The whole-value assertion in
-    // `unbuffered_workload`'s `the_three_open_modes_are_distinguishable` is
-    // what closes that case, and the crate suite fails if it is broken.
+    // asserts the *whole* mode of a genuinely unbuffered handle rather than
+    // masking it. The masked form was instance seven: `mode & K == K` is
+    // satisfied by K = 0, so zeroing the constant left this file green again.
+    // Whole-value equality has no such hole, because the modes involved are
+    // themselves non-zero.
     let unbuffered = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0)
@@ -185,9 +185,10 @@ fn an_adopted_overlapped_handle_is_not_synchronous() {
         .unwrap();
     let unbuffered = win_ioring::file::File::from_std(unbuffered);
     assert_eq!(
-        mode_of(&unbuffered) & FILE_NO_INTERMEDIATE_BUFFERING,
+        mode_of(&unbuffered),
         FILE_NO_INTERMEDIATE_BUFFERING,
-        "the no-buffering bit does not read back, so asserting its absence \
+        "an unbuffered overlapped handle no longer reports exactly \
+         FILE_NO_INTERMEDIATE_BUFFERING, so asserting that bit's absence \
          elsewhere in this file proves nothing"
     );
     assert_eq!(mode_of(&file) & FILE_NO_INTERMEDIATE_BUFFERING, 0);
