@@ -690,7 +690,15 @@ mod tests {
     /// species this feature documented in `docs/testing.md`.
     struct Recorder {
         seen: std::cell::RefCell<Vec<u64>>,
-        block: usize,
+        /// What `read_at` reports, so a short read can be simulated.
+        ///
+        /// `issue_reads` rejects a transfer that is not exactly `block` bytes,
+        /// and that check needs binding for a reason specific to this arm: a
+        /// short read does *less work*, so tolerating one does not slow the
+        /// benchmark down — it makes the offending configuration post the best
+        /// number in the published table. A regression there is a wrong result,
+        /// not a failure.
+        reports: usize,
     }
 
     impl crate::backend::Backend for Recorder {
@@ -722,7 +730,7 @@ mod tests {
         ) -> (std::io::Result<u32>, Vec<u8>) {
             self.seen.borrow_mut().push(offset);
             let _ = len;
-            (Ok(self.block as u32), buffer)
+            (Ok(self.reports as u32), buffer)
         }
         async fn write_at(
             &self,
@@ -749,7 +757,7 @@ mod tests {
             let ops = offsets(scenario, 64, block, block, (block as u64) * 512);
             let backend = Recorder {
                 seen: std::cell::RefCell::new(Vec::new()),
-                block,
+                reports: block,
             };
             let delivered = futures::executor::block_on(issue_reads(&backend, &(), &ops, block))
                 .expect("reads");
@@ -769,5 +777,60 @@ mod tests {
                  was given"
             );
         }
+    }
+
+    /// A transfer that is not exactly `block` bytes must be rejected.
+    ///
+    /// The twin the docstring above promised and did not have. Weakening the
+    /// check from `!=` to `>` -- a plausible "tolerate short reads" regression
+    /// -- previously left the entire workspace suite green.
+    ///
+    /// This matters more than an ordinary correctness gate because of the
+    /// direction of the error. A short read moves fewer bytes and therefore
+    /// finishes sooner, so a configuration that quietly did less work would not
+    /// look broken; it would look fast, and it would take the top row of a
+    /// published table.
+    #[test]
+    fn a_short_read_is_refused_rather_than_counted() {
+        let block = 4096usize;
+        let ops = offsets(Scenario::RandomRead, 8, block, block, (block as u64) * 64);
+
+        for reports in [block - 1, block / 2, 0, block + 1] {
+            let backend = Recorder {
+                seen: std::cell::RefCell::new(Vec::new()),
+                reports,
+            };
+            let outcome = futures::executor::block_on(issue_reads(&backend, &(), &ops, block));
+            let err = match outcome {
+                Ok(n) => panic!(
+                    "a read reporting {reports} of {block} bytes was accepted \
+                     and counted as {n} bytes delivered"
+                ),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "a {reports}-byte transfer was rejected, but not as a short read"
+            );
+        }
+    }
+
+    /// The positive control for the test above.
+    ///
+    /// Proves the `Recorder` can satisfy the check at all, so
+    /// `a_short_read_is_refused_rather_than_counted` is known to be rejecting
+    /// the short transfer specifically rather than failing for every input.
+    #[test]
+    fn an_exact_read_is_accepted() {
+        let block = 4096usize;
+        let ops = offsets(Scenario::RandomRead, 8, block, block, (block as u64) * 64);
+        let backend = Recorder {
+            seen: std::cell::RefCell::new(Vec::new()),
+            reports: block,
+        };
+        let delivered =
+            futures::executor::block_on(issue_reads(&backend, &(), &ops, block)).expect("reads");
+        assert_eq!(delivered, ops.len() * block);
     }
 }
