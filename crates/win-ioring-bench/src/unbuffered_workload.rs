@@ -503,11 +503,17 @@ mod tests {
 
         // Synchronous: caps outstanding operations at one regardless of what
         // the caller submits. This is the defect Phase 3 documents.
+        // Asserted as whole values, not as masked bits. `mode & K == K` is
+        // satisfied by any K including zero, so a masked assertion cannot
+        // distinguish "the bit means what we think" from "the constant is
+        // wrong" — which is the same failure species as the gate that cannot
+        // fail, and it went unnoticed here once already.
         let plain = std::fs::File::open(&path).unwrap();
         assert_eq!(
-            file_mode(&plain).unwrap() & FILE_SYNCHRONOUS_IO_NONALERT,
+            file_mode(&plain).unwrap(),
             FILE_SYNCHRONOUS_IO_NONALERT,
-            "a plain File::open handle is expected to be synchronous"
+            "a plain File::open handle is expected to be synchronous and \
+             buffered, reporting exactly FILE_SYNCHRONOUS_IO_NONALERT"
         );
         assert!(!is_unbuffered(&plain).unwrap());
 
@@ -519,6 +525,11 @@ mod tests {
             .custom_flags(FILE_FLAG_OVERLAPPED.0)
             .open(&path)
             .unwrap();
+        assert_eq!(
+            file_mode(&overlapped).unwrap(),
+            0,
+            "an overlapped buffered handle is expected to report no mode bits"
+        );
         assert!(!is_synchronous(&overlapped).unwrap());
         assert!(!is_unbuffered(&overlapped).unwrap());
 
@@ -528,6 +539,12 @@ mod tests {
             .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0)
             .open(&path)
             .unwrap();
+        assert_eq!(
+            file_mode(&unbuffered).unwrap(),
+            FILE_NO_INTERMEDIATE_BUFFERING,
+            "an unbuffered overlapped handle is expected to report exactly \
+             FILE_NO_INTERMEDIATE_BUFFERING"
+        );
         assert!(is_unbuffered(&unbuffered).unwrap());
         assert!(!is_synchronous(&unbuffered).unwrap());
 

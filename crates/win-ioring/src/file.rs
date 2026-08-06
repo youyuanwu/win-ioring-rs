@@ -125,15 +125,13 @@ impl File {
     /// many this crate submits to the ring.
     ///
     /// That is a real limitation of this constructor, not a detail. Submitting
-    /// at depth 64 against such a handle yields a depth of one. Measured on an
-    /// NVMe SSD with buffering disabled, random 4 KiB reads at a submitted depth
-    /// of 64 ran at **117 µs/IO** through a handle from this function and
-    /// **11.9 µs/IO** through one opened with `FILE_FLAG_OVERLAPPED` — a
-    /// tenfold difference produced entirely by the missing flag.
+    /// at depth 64 against such a handle yields a depth of one.
     ///
-    /// It goes unnoticed under a warm page cache, because a cached read returns
-    /// synchronously after a memory copy and there is nothing to overlap. It
-    /// becomes decisive as soon as reads reach the device.
+    /// The effect is invisible under a warm page cache, where a cached read
+    /// returns synchronously after a memory copy and there is nothing to
+    /// overlap. It becomes decisive as soon as reads reach the device. (The
+    /// warm-cache half of that is a mechanism argument, not a measurement: no
+    /// A/B on the flag under a warm cache has been run.)
     ///
     /// # Getting an overlapped handle
     ///
@@ -154,9 +152,11 @@ impl File {
     /// ```
     ///
     /// Whether this function should set the flag itself is an open question,
-    /// recorded in `docs/pending-work.md`. It is not changed here because every
-    /// figure in `docs/performance.md` was measured through handles from this
-    /// function, and changing it would invalidate them all.
+    /// recorded in `docs/pending-work.md`. It is not changed here because the
+    /// twenty `win-ioring` cells of the published matrix in
+    /// `docs/performance.md` were all measured through handles from this
+    /// function, and every ratio in that matrix is computed against them — so
+    /// changing it would invalidate the whole table, not a fifth of it.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::open(path)?))
     }
@@ -165,8 +165,10 @@ impl File {
     ///
     /// Produces a **synchronous** handle, with the same consequences described
     /// on [`File::open`]: the file object serialises I/O regardless of the
-    /// depth submitted. Use [`File::from_std`] with `FILE_FLAG_OVERLAPPED` to
-    /// obtain one that does not.
+    /// depth submitted. To obtain one that does not, open the file yourself
+    /// with `FILE_FLAG_OVERLAPPED` alongside the write access this function
+    /// implies — `.write(true).create(true).truncate(true)` — and adopt it with
+    /// [`File::from_std`].
     pub fn create(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::create(path)?))
     }

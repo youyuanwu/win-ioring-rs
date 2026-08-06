@@ -12,36 +12,54 @@
 //!
 //! The first is that this is a genuine defect in the crate's own API. An async
 //! I/O crate whose file handles serialise at the file object is not delivering
-//! what its interface promises. Measured with buffering disabled on an NVMe
-//! SSD, random 4 KiB reads at a submitted depth of 64 ran at 117 µs/IO through
-//! a `File::open` handle and 11.9 µs/IO through an overlapped one — a tenfold
-//! difference produced entirely by the missing flag.
+//! what its interface promises.
 //!
 //! The second is that **fixing it here would invalidate the published
-//! results**. Every figure in `docs/performance.md` was measured through
-//! handles from this function. Setting the flag would change the timed path of
-//! all fifty warm-cache cells and force a full re-run and republication. That
-//! is deliberately out of scope; the question is recorded in
-//! `docs/pending-work.md` with its cost.
+//! results**. The twenty `win-ioring` cells of the matrix in
+//! `docs/performance.md` were all measured through handles from
+//! `win_ioring::file::File::open` and `File::create`, and every ratio in that
+//! matrix is computed against them, so setting the flag would force a full
+//! re-run and republication of the whole table. That is deliberately out of
+//! scope; the question is recorded in `docs/pending-work.md` with its cost.
 //!
 //! So the behaviour is *pinned* rather than changed. If someone later adds the
 //! flag — which is a reasonable thing to want, and the pending-work note invites
 //! it — this test fails and says why, instead of the change silently
 //! invalidating a published matrix that nothing else would notice.
 //!
-//! Under a warm page cache the flag makes no measurable difference, because a
-//! cached read returns synchronously after a memory copy and there is nothing
-//! to overlap. That is why fifty cells were measured on synchronous handles
-//! without the defect showing up.
+//! Under a warm page cache the flag is expected to make no measurable
+//! difference, because a cached read returns synchronously after a memory copy
+//! and there is nothing to overlap. That is a mechanism argument and not a
+//! measurement: no warm-cache A/B on the flag has been run, and none is
+//! required for the pin, which asserts only what the handle *is*.
+//!
+//! # Scope of these tests
+//!
+//! They assert handle mode, never timing. The size of the effect the flag has
+//! on throughput is the unbuffered arm's business, measured through the real
+//! harness and published in `docs/performance.md`. Nothing here depends on
+//! those figures.
 
 use std::os::windows::fs::OpenOptionsExt;
 
-use win_ioring_bench::unbuffered_workload::{
-    FILE_NO_INTERMEDIATE_BUFFERING, FILE_SYNCHRONOUS_IO_NONALERT, file_mode,
-};
+use win_ioring_bench::unbuffered_workload::{FILE_NO_INTERMEDIATE_BUFFERING, file_mode};
 
-/// `FILE_FLAG_OVERLAPPED`.
-const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+/// `FILE_FLAG_OVERLAPPED`, from the same source the rest of the crate uses.
+use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+/// The exact mode a synchronous, buffered handle reports.
+///
+/// Asserted as a whole value rather than only as a masked bit. Masking against
+/// [`FILE_SYNCHRONOUS_IO_NONALERT`] and comparing to that same constant is
+/// satisfied by *any* value of the constant, including zero — `mode & 0 == 0`
+/// holds for every handle in existence. That is the fourth instance in this
+/// work of a check that cannot distinguish "the guard held" from "the guard
+/// never ran", so these tests pin the literal values the host actually reports
+/// and the constant is left to document rather than to decide.
+const MODE_SYNCHRONOUS: u32 = 0x0000_0020;
+
+/// The exact mode an overlapped, buffered handle reports.
+const MODE_OVERLAPPED: u32 = 0x0000_0000;
 
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("win-ioring-bench-openmode");
@@ -61,10 +79,10 @@ fn mode_of(file: &win_ioring::file::File) -> u32 {
 
     let raw = file.as_raw_handle();
     // SAFETY: `raw` is a live handle owned by `file`, which outlives this
-    // borrow. `ManuallyDrop` prevents the temporary `std::fs::File` from
-    // closing it, so ownership is unaffected.
-    let borrowed = unsafe { std::fs::File::from_raw_handle(raw.0) };
-    let borrowed = std::mem::ManuallyDrop::new(borrowed);
+    // borrow. `ManuallyDrop` wraps the temporary in the same expression that
+    // creates it, so there is no point at which an unwrapped `std::fs::File`
+    // could be dropped and close a handle it does not own.
+    let borrowed = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw.0) });
     file_mode(&borrowed).unwrap()
 }
 
@@ -74,17 +92,17 @@ fn file_open_produces_a_synchronous_handle() {
     let file = win_ioring::file::File::open(&path).unwrap();
 
     assert_eq!(
-        mode_of(&file) & FILE_SYNCHRONOUS_IO_NONALERT,
-        FILE_SYNCHRONOUS_IO_NONALERT,
+        mode_of(&file),
+        MODE_SYNCHRONOUS,
         "win_ioring::file::File::open no longer produces a synchronous handle.\n\
          \n\
          If FILE_FLAG_OVERLAPPED was just added: that is a defensible change — \
          the flag's absence is a real limitation, documented on File::open and \
-         recorded in docs/pending-work.md. But it changes the timed path of \
-         every cell in the published 50-cell warm-cache matrix in \
-         docs/performance.md, all of which were measured through handles from \
-         this function. That matrix must be re-run and republished, not merely \
-         re-read. Update this test as part of doing so."
+         recorded in docs/pending-work.md. But the twenty win-ioring cells of \
+         the published matrix in docs/performance.md were all measured through \
+         handles from this function, and every ratio in that matrix is computed \
+         against them, so the whole table must be re-run and republished rather \
+         than merely re-read. Update this test as part of doing so."
     );
 }
 
@@ -94,8 +112,8 @@ fn file_create_produces_a_synchronous_handle() {
     let file = win_ioring::file::File::create(&path).unwrap();
 
     assert_eq!(
-        mode_of(&file) & FILE_SYNCHRONOUS_IO_NONALERT,
-        FILE_SYNCHRONOUS_IO_NONALERT,
+        mode_of(&file),
+        MODE_SYNCHRONOUS,
         "win_ioring::file::File::create no longer produces a synchronous \
          handle; see the note on the File::open pin test — the published write \
          cells were measured through handles from this function."
@@ -118,17 +136,29 @@ fn an_adopted_overlapped_handle_is_not_synchronous() {
     let path = scratch("overlapped.dat");
     let std_file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .custom_flags(FILE_FLAG_OVERLAPPED.0)
         .open(&path)
         .unwrap();
     let file = win_ioring::file::File::from_std(std_file);
 
     assert_eq!(
-        mode_of(&file) & FILE_SYNCHRONOUS_IO_NONALERT,
-        0,
-        "an overlapped handle adopted through from_std reports as synchronous, \
-         so the read-back cannot distinguish the two modes and the pin tests \
-         above prove nothing"
+        mode_of(&file),
+        MODE_OVERLAPPED,
+        "an overlapped handle adopted through from_std does not report the \
+         expected mode, so the read-back cannot distinguish the two modes and \
+         the pin tests above prove nothing"
+    );
+
+    // The two modes must differ. This is the assertion that survives any error
+    // in the named constants above, including all of them being zero: it
+    // compares two live measurements against each other rather than against a
+    // literal, so it fails if the read-back has collapsed to a constant.
+    let synchronous = win_ioring::file::File::open(scratch("compare.dat")).unwrap();
+    assert_ne!(
+        mode_of(&synchronous),
+        mode_of(&file),
+        "File::open and an overlapped from_std handle report the same mode, so \
+         the read-back is not measuring what these tests assume"
     );
 
     // Neither handle is unbuffered: this file was opened without
