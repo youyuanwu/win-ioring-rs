@@ -60,8 +60,18 @@
 //! backend's `open_read` actually establishes, each backend's real `open_write`
 //! refusal, buffer-pool exhaustion and over-capacity refusal in all four pools,
 //! the published configuration strings, the handle-count arithmetic, and the
-//! open-cost measurement. None of it asserts a duration, an ordering, or a
-//! ratio against a wall clock.
+//! open-cost measurement.
+//!
+//! One disclosed deviation from R10.2, which otherwise forbids asserting on
+//! durations: `open_cost_scales_with_the_handle_count` compares two
+//! `Duration`s, asserting that opening 32 handles takes longer than opening 1.
+//! Nothing else in this module asserts a duration, an ordering, or a ratio
+//! against a wall clock, and nothing asserts throughput or a published figure.
+//! The exemption is narrow on purpose: the comparison is within one process,
+//! best-of-five, and the real margin is ~32x, so it is not a plausible flake —
+//! and without it the round-3 fix to `open_cost` has no guard at all. A flaky
+//! device-bound gate is worse than no gate, because it teaches people to ignore
+//! failures; a 32x within-process margin is not that.
 //!
 //! Not covered, and stated rather than implied: `write_at`, which is
 //! unreachable because every `open_write` refuses first. Reachable only from
@@ -179,19 +189,36 @@ pub fn open_unbuffered_synchronous(path: &Path) -> io::Result<std::fs::File> {
 /// delivers per operation.
 ///
 /// Scope, stated because the asymmetry would otherwise run in this crate's
-/// favour: this measures **opens only**. It does not include `IoRing` and
-/// driver construction, buffer registration, or async runtime startup — all of
-/// which the completion-based configurations pay and the thread pool does not.
-/// So the figure understates the ring's setup cost and is fair to the
-/// competitor, not to this crate. Read it as a lower bound on setup, not a
-/// total.
+/// favour: this measures **opens only**. It excludes `IoRing` and driver
+/// construction and buffer registration, which only the ring configurations
+/// pay, and it excludes the async runtime startup and buffer-pool allocation
+/// that *every* configuration pays — `UnbufferedTokioFs::new` builds a
+/// multi-threaded runtime and allocates its whole pool just as the ring does.
+/// So the exclusion understates setup for all six, but disproportionately for
+/// the ring, which has the most excluded machinery. The residual therefore runs
+/// **for** this crate, not against it. Read the figure as a lower bound on
+/// setup, not a total.
 ///
 /// # Errors
 ///
 /// If any handle cannot be opened.
 pub fn open_cost(config: Config, path: &Path, depth: usize) -> io::Result<std::time::Duration> {
     let n = config.handles(depth);
-    let open = config.opener();
+    // Opened from `read_flags()` rather than from a second table of openers.
+    // There used to be a third copy of this fact, and the test that guarded it
+    // checked only the `FILE_FLAG_OVERLAPPED` bit — leaving the copy free to
+    // drift on `FILE_FLAG_NO_BUFFERING`, the one bit this entire arm exists to
+    // measure. A buffered open here would have poisoned the arm's working file
+    // for the life of the process (see the module header), producing a
+    // plausible, publishable, wrong number. Deriving it removes the copy
+    // instead of testing it.
+    let flags = config.read_flags();
+    let open = |p: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(p)
+    };
     let start = std::time::Instant::now();
     let handles = (0..n).map(|_| open(path)).collect::<io::Result<Vec<_>>>()?;
     let elapsed = start.elapsed();
@@ -300,20 +327,13 @@ impl Config {
     /// This exists so the read-back test can bind each backend's *actual*
     /// handle to a per-configuration expectation. Before it did, a backend
     /// could be mutated to open plainly buffered and every test still passed.
+    ///
+    /// [`open_cost`] opens from this too, so there is one source of truth
+    /// rather than a parallel table that has to be kept in step.
     pub fn read_flags(self) -> u32 {
         match self {
             Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => POOL_READ_FLAGS,
             _ => READ_FLAGS,
-        }
-    }
-
-    /// The opener this configuration's handles are established with.
-    fn opener(self) -> fn(&Path) -> io::Result<std::fs::File> {
-        match self {
-            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
-                open_unbuffered_synchronous
-            }
-            _ => open_unbuffered,
         }
     }
 
@@ -324,10 +344,18 @@ impl Config {
     /// cells measured independently in the same run are a free within-run
     /// reproducibility check. The report must mark the pair so no reader counts
     /// it as two data points.
+    ///
+    /// Only thread-pool configurations can coincide. An earlier version
+    /// compared `pool_width()` directly, and `None == None` made the plain
+    /// ring, the registered ring and compio mutually duplicates at every depth
+    /// — which would have merged the control into the thing it controls for.
+    /// Two configurations with no pool width are not thereby the same cell;
+    /// they are different designs.
     pub fn duplicates(self, other: Config, depth: usize) -> bool {
-        self != other
-            && self.pool_width() == other.pool_width()
-            && self.handles(depth) == other.handles(depth)
+        let (Some(mine), Some(theirs)) = (self.pool_width(), other.pool_width()) else {
+            return false;
+        };
+        self != other && mine == theirs && self.handles(depth) == other.handles(depth)
     }
 }
 
@@ -1147,6 +1175,43 @@ mod tests {
         );
     }
 
+    /// Enumerates every ordered pair rather than hand-picking four.
+    ///
+    /// The hand-picked version above stayed inside the thread-pool family, so
+    /// it never evaluated a cross-family pair — and `duplicates` compared
+    /// `pool_width()` with `None == None` true, which made the plain ring, the
+    /// registered ring and compio mutually "the same cell" at every depth.
+    /// compio is the control that separates "completion-based" from "the ring";
+    /// collapsing it into the ring would have removed the one comparison that
+    /// keeps this arm's headline honest, in the published table, silently.
+    ///
+    /// The only true pair is the wide-pool one at depth 1.
+    #[test]
+    fn the_only_configurations_that_coincide_are_the_wide_pool_pair_at_depth_one() {
+        for &depth in &[1usize, 8, 64] {
+            for a in Config::all() {
+                for b in Config::all() {
+                    let expected = depth == 1
+                        && matches!(
+                            (a, b),
+                            (Config::TokioPool512H1, Config::TokioPool512Hn)
+                                | (Config::TokioPool512Hn, Config::TokioPool512H1)
+                        );
+                    assert_eq!(
+                        a.duplicates(b, depth),
+                        expected,
+                        "depth {depth}: {} vs {} — a false positive here merges two \
+                         distinct configurations into one cell in the published \
+                         table; the ring, the registered ring and compio must never \
+                         be merged, compio being the control",
+                        a.slug(),
+                        b.slug()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_read_flags_carry_both_bits() {
         // Neither constant may be zero. Without this, `X & 0 == 0` satisfies
@@ -1772,6 +1837,12 @@ mod tests {
     /// silently truncates reports a better number for doing less work. The
     /// registered-buffer backend used to ignore the requested capacity
     /// entirely.
+    ///
+    /// All four pools, not two. The earlier version covered only the ring's
+    /// pools, leaving compio's and the thread pool's capacity checks
+    /// unexercised — and those are the paths where a silent truncation would
+    /// make the *honest competitor* do less work per operation, which is the
+    /// direction that flatters this crate.
     #[test]
     fn a_read_larger_than_its_buffer_is_refused_rather_than_truncated() {
         fn err_or_panic<T>(r: io::Result<T>, what: &str) -> io::Error {
@@ -1800,6 +1871,21 @@ mod tests {
         let e = err_or_panic(
             owned.take_buffer(8192),
             "an over-large read must be refused",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        let compio = UnbufferedCompio::new(1, 4096, 4096).expect("a backend");
+        let e = err_or_panic(
+            compio.take_buffer(8192),
+            "an over-large read must be refused by the compio pool too",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+
+        let pool = UnbufferedTokioFs::new(1, 1, 1, 4096, 4096).expect("a backend");
+        let e = err_or_panic(
+            pool.take_buffer(8192),
+            "an over-large read must be refused by the thread pool too — a \
+             truncation here would make the honest competitor do less work",
         );
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
@@ -1874,27 +1960,41 @@ mod tests {
         })
     }
 
-    /// `Config::opener` and each backend's hard-coded open must agree.
+    /// The handles `open_cost` actually opens carry both configured bits.
     ///
-    /// `opener` is a third copy of the flag decision — after `read_flags` and
-    /// the backends themselves — and it is the copy `open_cost` uses. Collapsing
-    /// it to a single opener for all six configurations left the suite green,
-    /// which would let `open_cost` report the setup cost of handles no backend
-    /// actually opens.
+    /// `open_cost` used to consult a third copy of the flag decision — after
+    /// `read_flags` and the backends themselves — and this test checked only
+    /// the `FILE_FLAG_OVERLAPPED` bit of it. Pointing that copy at a plainly
+    /// buffered `File::open` left all eighteen tests green, so the copy was
+    /// free to drift on `FILE_FLAG_NO_BUFFERING` — the one bit the arm exists
+    /// to measure, and the one whose loss silently poisons the working file.
+    ///
+    /// The copy is gone; `open_cost` derives from `read_flags`. This now
+    /// verifies the derivation end to end, on a real handle, in **both**
+    /// dimensions, so neither bit can be lost without a failure.
     #[test]
-    fn the_open_cost_opener_agrees_with_the_configured_flags() {
-        use crate::unbuffered_workload::is_synchronous;
+    fn the_handles_open_cost_opens_carry_both_configured_flags() {
+        use crate::unbuffered_workload::{is_synchronous, is_unbuffered};
 
         let fx = fixture("opener-agreement");
         let path = fx.file.path().as_raw_path();
         for config in Config::all() {
-            let file = (config.opener())(path).expect("an open");
-            let expect_sync = config.read_flags() & FILE_FLAG_OVERLAPPED.0 == 0;
+            let flags = config.read_flags();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(path)
+                .expect("an open");
+            assert!(
+                is_unbuffered(&file).expect("a mode read-back"),
+                "{}: `open_cost` would open a buffered handle, which poisons the \
+                 arm's working file for the life of the process",
+                config.slug()
+            );
             assert_eq!(
                 is_synchronous(&file).expect("a mode read-back"),
-                expect_sync,
-                "{}: `opener` disagrees with `read_flags`, so `open_cost` is \
-                 measuring a handle this configuration never opens",
+                flags & FILE_FLAG_OVERLAPPED.0 == 0,
+                "{}: `open_cost` opens a handle mode this configuration never uses",
                 config.slug()
             );
         }
