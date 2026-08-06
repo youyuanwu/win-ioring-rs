@@ -34,10 +34,22 @@
 
 use std::time::Instant;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 
+use win_ioring_bench::account::{Budget, UNBUFFERED_RUN_BUDGET};
 use win_ioring_bench::align::Alignment;
 use win_ioring_bench::aligned::AlignedBuf;
+use win_ioring_bench::backend::Backend;
+use win_ioring_bench::unbuffered::{
+    Config, UnbufferedCompio, UnbufferedIoRing, UnbufferedIoRingRegistered, UnbufferedTokioFs,
+};
+use win_ioring_bench::unbuffered_matrix::{
+    Cell, SCENARIOS, UnbufferedConfig, grid, group_name, issue_reads, offsets,
+};
+use win_ioring_bench::unbuffered_workload::UnbufferedFile;
 use win_ioring_bench::workload;
 
 /// Whether this process is a test run rather than a benchmark run.
@@ -92,6 +104,138 @@ fn check_alignment(dir: &std::path::Path) -> Alignment {
     alignment
 }
 
+/// Drives a ring driver alongside the work.
+///
+/// A local copy, for the reason the unbuffered module's tests give: the
+/// buffered arms' `session::drive_while` is private and belongs to that
+/// machinery.
+fn drive_while<T>(
+    driver: &win_ioring::runtime::Driver,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    use futures::future::Either;
+    use std::pin::pin;
+    futures::executor::block_on(async {
+        let driving = pin!(driver.drive());
+        let work = pin!(work);
+        match futures::future::select(driving, work).await {
+            Either::Left(_) => panic!("the driver shut down while the work was still running"),
+            Either::Right((outcome, _)) => outcome,
+        }
+    })
+}
+
+/// Measures one cell.
+///
+/// The opens happen **before** `bench_function` and are deliberately outside
+/// the timed region — unlike the buffered arm, where [`Backend::open_read`]'s
+/// documentation notes they sit inside it. An unbuffered open costs about the
+/// same as a whole read, and the configurations here hold deliberately
+/// different numbers of handles (that is the variable under test), so charging
+/// opens per iteration would tax whichever configuration holds the most
+/// handles. That is the multi-handle thread pool: the honest competitor. The
+/// unbuffered module header records the measurements behind this, including the
+/// retraction of an earlier, overstated estimate of its size.
+fn run_cell(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    cell: Cell,
+    file: &UnbufferedFile,
+    alignment: &Alignment,
+    config: UnbufferedConfig,
+) {
+    let block = config.block(cell.scenario);
+    let align = alignment.granularity();
+    let ops = offsets(cell.scenario, config.operations, block, align, file.bytes());
+    let path = file.path().as_raw_path();
+    let depth = cell.depth;
+    let id = BenchmarkId::new(cell.config.slug(), depth);
+
+    group.throughput(Throughput::Elements(ops.len() as u64));
+
+    match cell.config {
+        Config::IoRingPlain => {
+            let mut b = UnbufferedIoRing::new(depth, depth, block, align).expect("a ring backend");
+            let driver = b.take_driver().expect("a driver");
+            let handle = b.handle();
+            let file = drive_while(&driver, b.open_read(path)).expect("an unbuffered open");
+            group.bench_function(id, |bencher| {
+                bencher.iter_custom(|iters| {
+                    drive_while(&driver, async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            issue_reads(&b, &file, &ops, block).await.expect("a read");
+                        }
+                        start.elapsed()
+                    })
+                });
+            });
+            drop(file);
+            handle.shutdown();
+            futures::executor::block_on(driver.drive());
+        }
+        Config::IoRingRegistered => {
+            let mut b = UnbufferedIoRingRegistered::new(depth).expect("a ring backend");
+            let driver = b.take_driver().expect("a driver");
+            let handle = b.handle();
+            let file = drive_while(&driver, async {
+                b.register(depth, block, align).await.expect("registration");
+                b.open_read(path).await.expect("an unbuffered open")
+            });
+            group.bench_function(id, |bencher| {
+                bencher.iter_custom(|iters| {
+                    drive_while(&driver, async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            issue_reads(&b, &file, &ops, block).await.expect("a read");
+                        }
+                        start.elapsed()
+                    })
+                });
+            });
+            drop(file);
+            handle.shutdown();
+            futures::executor::block_on(driver.drive());
+        }
+        Config::Compio => {
+            let b = UnbufferedCompio::new(depth, block, align).expect("a compio backend");
+            let file = b.block_on(b.open_read(path)).expect("an unbuffered open");
+            group.bench_function(id, |bencher| {
+                bencher.iter_custom(|iters| {
+                    b.block_on(async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            issue_reads(&b, &file, &ops, block).await.expect("a read");
+                        }
+                        start.elapsed()
+                    })
+                });
+            });
+        }
+        Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
+            let b = UnbufferedTokioFs::new(
+                cell.config.pool_width().expect("a pool width"),
+                cell.config.handles(depth),
+                depth,
+                block,
+                align,
+            )
+            .expect("a thread-pool backend");
+            let file = b.block_on(b.open_read(path)).expect("an unbuffered open");
+            group.bench_function(id, |bencher| {
+                bencher.iter_custom(|iters| {
+                    b.block_on(async {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            issue_reads(&b, &file, &ops, block).await.expect("a read");
+                        }
+                        start.elapsed()
+                    })
+                });
+            });
+        }
+    }
+}
+
 fn unbuffered(c: &mut Criterion) {
     let test_mode = test_mode();
 
@@ -115,10 +259,44 @@ fn unbuffered(c: &mut Criterion) {
         eprintln!("running the small configuration (a test run, not a benchmark run)");
     }
 
-    // The measured combinations arrive in a later phase. Until then this target
-    // exists to hold the alignment apparatus under CI, which is the part that
-    // silently breaks.
-    let _ = (c, alignment);
+    // The measured grid.
+    let config = if test_mode {
+        UnbufferedConfig::small()
+    } else {
+        UnbufferedConfig::full()
+    };
+
+    assert!(
+        config.affordable(),
+        "the unbuffered grid's floor of {:?} exceeds its budget of {UNBUFFERED_RUN_BUDGET:?}",
+        config.floor()
+    );
+
+    let file = UnbufferedFile::create(&dir, config.read_file_bytes, &alignment)
+        .expect("could not create the unbuffered working file");
+
+    eprintln!(
+        "unbuffered working file: {} ({} MiB)",
+        file.path().as_raw_path().display(),
+        file.bytes() / (1024 * 1024)
+    );
+
+    for scenario in SCENARIOS {
+        let mut group = c.benchmark_group(group_name(scenario));
+        group
+            .warm_up_time(Budget::CHOSEN.warm_up)
+            .measurement_time(Budget::CHOSEN.measurement)
+            .sample_size(Budget::CHOSEN.sample_size);
+
+        for cell in grid() {
+            if cell.scenario != scenario || !config.depths.contains(&cell.depth) {
+                continue;
+            }
+            run_cell(&mut group, cell, &file, &alignment, config);
+        }
+
+        group.finish();
+    }
 
     eprintln!("unbuffered arm finished in {:?}", started.elapsed());
 }
