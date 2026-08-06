@@ -132,8 +132,10 @@ Getting that split wrong in either direction breaks the benchmark: comparing
 completion order makes it flaky, and not comparing delivered bytes lets a backend
 report transfers whose data never reached anywhere readable.
 
-Two tests in `crates/win-ioring-bench/tests/fairness.rs` deliberately weaken a
-backend and require the run to be **rejected** rather than reported. Each takes a
+Four tests in `crates/win-ioring-bench/tests/fairness.rs` deliberately weaken a
+backend and require the run to be **rejected** rather than reported. Two of them
+weaken a thread-pool backend and two weaken `compio-iocp`; none weakens a ring
+backend, which is recorded in [pending-work.md](pending-work.md). Each takes a
 *real* backend, wraps it so that it either skips one read in four or reports full
 transfers whose bytes never reach anywhere readable, and drives it through
 `harness::measure_combination`, which is the function a measured benchmark calls.
@@ -146,18 +148,23 @@ on the issue-trace comparison alone. A control case runs the matrix unweakened
 and asserts it agrees and that it delivered a non-zero number of bytes, because
 "everything agreed" is satisfied by everything doing nothing.
 
-**Which backend is weakened, precisely.** The weakening tests take fixed
+**Which backend is weakened, precisely.** Five of the weakening tests take fixed
 positions from the available list, and the two `tokio::fs` backends are always
-first, so on every host — with an I/O ring or without one — the backend weakened
-is `tokio-pool-1` or `tokio-pool-512` and never a ring one. This paragraph used
-to say each test took "every one the host can build, so a machine without an I/O
-ring still runs them against two", which reads as though a ring host runs them
-against four. It does not, and never did. What the tests establish is that
+first, so on every host — with an I/O ring or without one — the backend those
+five weaken is `tokio-pool-1` or `tokio-pool-512` and never a ring one. This
+paragraph used to say each test took "every one the host can build, so a machine
+without an I/O ring still runs them against two", which reads as though a ring
+host runs them against every backend it has — five, today. It does not, and never
+did. Two further tests,
+added with the compio backend, select their backend *by identity* rather than by
+position and so do weaken `compio-iocp` directly — that is what establishes the
+machinery reaches a completion-based backend and not only the thread-pool ones.
+Neither ring backend is weakened by any test. What the tests establish is that
 `measure_combination` *rejects* a run that delivered less, and that function is
 backend-agnostic — the weakening is injected above it, in a wrapper that knows
 nothing about which backend it wraps. That the ring backends deliver what they
-report is established by the control case, which does run all four. Extending the
-weakening across the whole list is recorded in
+report is established by the control case, which does run every available
+backend. Extending the weakening across the whole list is recorded in
 [pending-work.md](pending-work.md).
 
 **Two further tests fix *which run* is verified.** `measure_combination` runs an
@@ -195,7 +202,7 @@ with the warm-up's (`evidence.last.unwrap_or(warm)` → `warm`), and deleting th
 first-versus-last trace comparison. Each is now caught by exactly one test and by
 nothing else in the workspace.
 
-**What this establishes is that the four backends did the same work — not that
+**What this establishes is that the five backends did the same work — not that
 the published timings are of that work.** The two are bound together by
 `Timer::time`, whose production implementation is `CriterionTimer` in
 `benches/comparison.rs`: it decides what Criterion measures, while the trace that
@@ -212,14 +219,14 @@ Criterion timed *that* closure; that rests on reading those ten lines.
 `cargo test --benches` runs the Criterion target in **test mode** — one iteration
 per benchmark, against `Config::small()` and a working directory of its own — so
 `cargo test --workspace --all-targets` exercises preparation, warm-up,
-verification and teardown end to end for **twenty-eight** combinations.
+verification and teardown end to end for **thirty-five** combinations.
 `Config::small()` has depths `[1, 4]` where the benchmark configuration has
-`[1, 8, 64]`, so the three rolling scenarios contribute 3 × 2 × 4 = 24, and bulk
-read — which runs at the deepest configured depth alone — contributes 1 × 1 × 4 =
-4. That is 28 against the 40 a benchmark run walks. (This paragraph said
+`[1, 8, 64]`, so the three rolling scenarios contribute 3 × 2 × 5 = 30, and bulk
+read — which runs at the deepest configured depth alone — contributes 1 × 1 × 5 =
+5. That is 35 against the 50 a benchmark run walks. (This paragraph said
 thirty-six until it was checked against `config.rs`, then twenty-four until bulk
-read was added; the path is the same one, but a dozen fewer combinations travel
-it.) The bench target detects test mode by
+read was added, then twenty-eight; the path is the same one, but fifteen fewer
+combinations travel it.) The bench target detects test mode by
 Criterion's own rule rather than by testing for `--test` alone: a target that read
 it wrongly would build a 256 MiB working file inside the test suite.
 
@@ -317,8 +324,9 @@ the pattern recurs, not because the specific tests matter.
   in a way that preserves its old modification time — `Move-Item` of a `.bak`
   copy will do it — leaves Cargo with no reason to rebuild, so the mutated
   artifact stays in `target/` and every later run measures it. This has produced
-  two false findings in this repository: a matrix size read as 52 when it is 28,
-  and an entries-per-submission figure read as 1.00 when it is the configured
+  two false findings in this repository: a matrix size read as 52 when it was 28
+  at the time — it is 35 now — and an entries-per-submission figure read as 1.00
+  when it is the configured
   depth. The second survived a code review and most of a day's investigation,
   because it was stable on every run and flipped whenever anything forced a
   rebuild — adding a package to `-p`, toggling an unrelated feature, inserting a

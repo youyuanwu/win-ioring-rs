@@ -53,16 +53,24 @@ pub enum Which {
     RingPlain,
     /// This crate, with registered buffers and handles.
     RingRegistered,
+    /// Completion-based, but not a ring.
+    ///
+    /// The other four vary two things at once — synchronous work on threads
+    /// versus completion delivery through a ring — so a difference between
+    /// them cannot say which of the two it is about. This one holds the
+    /// completion model and drops the ring.
+    Compio,
 }
 
 impl Which {
     /// Every backend, in a fixed order.
-    pub fn all() -> [Which; 4] {
+    pub fn all() -> [Which; 5] {
         [
             Which::TokioOne,
             Which::TokioMany,
             Which::RingPlain,
             Which::RingRegistered,
+            Which::Compio,
         ]
     }
 
@@ -80,13 +88,15 @@ impl Which {
             Which::TokioMany => "tokio-pool-512",
             Which::RingPlain => "ioring-owned",
             Which::RingRegistered => "ioring-registered",
+            Which::Compio => "compio-iocp",
         }
     }
 
     /// Whether this backend builds a driver.
     ///
-    /// The thread-pool backends do not, which is why the driver count of SC-014
-    /// is read against the ring combinations rather than against all of them.
+    /// The thread-pool and compio backends do not, which is why the driver count
+    /// of SC-014 is read against the ring combinations rather than against all of
+    /// them.
     pub fn builds_a_driver(self) -> bool {
         matches!(self, Which::RingPlain | Which::RingRegistered)
     }
@@ -97,7 +107,7 @@ impl Which {
 /// Rotated so no backend is systematically advantaged by always running first on
 /// a freshly settled machine. Deterministic, so two runs visit the same order
 /// and can be compared.
-pub fn rotated_order(index: usize) -> [Which; 4] {
+pub fn rotated_order(index: usize) -> [Which; 5] {
     let mut order = Which::all();
     let count = order.len();
     order.rotate_left(index % count);
@@ -399,8 +409,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn four_consecutive_rotations_are_four_distinct_orders() {
-        let orders: Vec<[Which; 4]> = (0..4).map(rotated_order).collect();
+    fn five_consecutive_rotations_are_five_distinct_orders() {
+        let orders: Vec<[Which; 5]> = (0..5).map(rotated_order).collect();
         for (i, a) in orders.iter().enumerate() {
             for b in &orders[i + 1..] {
                 assert_ne!(a, b, "two rotations produced the same order");
@@ -410,7 +420,12 @@ mod tests {
 
     #[test]
     fn every_rotation_contains_every_backend_once() {
-        for index in 0..8 {
+        // Ten, not eight. The bound is a multiple of the backend count so every
+        // rotation offset is covered the same number of times. Eight did cover
+        // all five offsets, but unevenly — and an arity-blind bound stops
+        // covering all of them the moment the backend count exceeds it, which is
+        // why this moved with the arity rather than being left alone.
+        for index in 0..10 {
             let order = rotated_order(index);
             for which in Which::all() {
                 assert_eq!(
@@ -419,6 +434,70 @@ mod tests {
                     "rotation {index} did not contain {which:?} exactly once"
                 );
             }
+        }
+    }
+
+    /// Over the whole matrix, every backend occupies every position equally
+    /// often — and the rotation turns the way it is supposed to.
+    ///
+    /// The balance clause and the direction clause are separate assertions
+    /// because balance alone does not pin direction: `rotate_right` produces an
+    /// exactly-as-balanced schedule as `rotate_left`, so a flipped rotation
+    /// would satisfy every counting property here while visiting the
+    /// combinations in a different order. Direction has to be asserted in its
+    /// own right or the flip goes unnoticed.
+    #[test]
+    fn the_matrix_gives_every_backend_every_position_equally() {
+        let config = crate::config::Config::default();
+        let combinations: usize = crate::scenario::Scenario::all()
+            .iter()
+            .map(|scenario| config.depths_for(*scenario).len())
+            .sum();
+        let backends = Which::all().len();
+        assert!(
+            combinations > 0,
+            "with no combinations both loops below iterate an empty range and \
+             this test passes without checking anything"
+        );
+        assert_eq!(
+            combinations % backends,
+            0,
+            "the schedule only balances when the combination count is a whole \
+             number of cycles; at {combinations} combinations and {backends} \
+             backends it is not. This is a real loss of the fairness property, \
+             not a mis-specified test: at four backends the schedule genuinely \
+             was unbalanced. If this fires, the matrix or the backend count has \
+             to change — relaxing the check would silently give up position \
+             balance rather than report that it was given up"
+        );
+        let expected = combinations / backends;
+
+        // Balance: each backend runs in each position exactly `expected` times.
+        for position in 0..backends {
+            for which in Which::all() {
+                let count = (0..combinations)
+                    .filter(|index| rotated_order(*index)[position] == which)
+                    .count();
+                assert_eq!(
+                    count, expected,
+                    "{which:?} occupied position {position} {count} times over \
+                     {combinations} combinations, not {expected}"
+                );
+            }
+        }
+
+        // Direction: rotation `n` starts with the backend `n` places along
+        // `all()`, which is what `rotate_left` means. Under `rotate_right` this
+        // fails while every count above still passes.
+        let all = Which::all();
+        for index in 0..combinations {
+            assert_eq!(
+                rotated_order(index)[0],
+                all[index % backends],
+                "rotation {index} did not begin with the {}th backend: the \
+                 rotation is turning the wrong way",
+                index % backends
+            );
         }
     }
 }

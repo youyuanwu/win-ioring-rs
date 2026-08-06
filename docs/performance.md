@@ -14,12 +14,40 @@ run it.
 ## The headline
 
 **`tokio::fs` is still faster than this crate on most of what is measured here,
-but not at one operation in flight.** At depth 1 this crate is ahead in all three
-scenarios — random reads at 0.55x, write-then-read at 0.86x, sequential reads at
-0.81x. At eight and sixty-four operations in flight it loses everywhere, by 1.10x
-to 1.75x with owned buffers and by 1.10x to 1.76x with registered ones.
+but not at one operation in flight.** At depth 1 this crate is ahead on random
+reads — 0.58x owned and 0.61x registered, and both resolve. Its other depth-1
+leads do not: sequential reads at 0.83x and 0.85x, and write-then-read with owned
+buffers at 0.91x, are all inside the null band, and no direction is claimed from
+them. At eight and sixty-four operations in flight every point estimate is a
+loss, ranging 1.06x to 1.40x with owned buffers and 1.11x to 1.47x with
+registered ones — but only **six of those fourteen comparisons resolve**: random
+reads at both depths (1.36x and 1.40x owned, 1.47x and 1.32x registered), and,
+with registered buffers only, sequential read and write-then-read at depth 64
+(1.25x and 1.31x). The direction is consistent across all fourteen; the evidence
+for it is much thinner than fourteen cells.
 
-Two warnings attach to that paragraph, and they are not decoration.
+**And a fifth backend now says the loss is not about the ring.** `compio`, which
+is completion-based on Windows but uses I/O completion ports rather than an I/O
+ring, loses in the same places: at depth 64 it is 1.27x on sequential read and
+1.33x on random read, against the ring's 1.24x and 1.40x. (Bulk read puts it at
+1.21x against the ring's 1.21x, but that comparison against `tokio::fs` is
+unresolved and no direction is claimed from it.) Of the twenty
+compio-against-ring comparisons in the matrix, sixteen are unresolved, and those
+sixteen include **every one of the fourteen at depth 8 and depth 64** — which is
+to say the two are indistinguishable everywhere the loss happens. See
+["A third backend"](#a-third-backend-completion-based-but-not-a-ring).
+
+Three warnings attach to those paragraphs, and they are not decoration.
+
+**One of this crate's depth-1 cells reversed its direction against the previous
+publication.** Write-then-read with registered buffers was 0.85x and is now
+1.64x, on a wide interval ([252.87, 355.12] µs per I/O against `tokio::fs`'s
+[177.57, 191.73]).
+It is disjoint, so it is a real loss *in this run*; it is also the single widest
+cell in the matrix and the previous run put it on the other side of 1.00x. Read
+it as an unstable cell, not as a regression — and read it beside the standing
+finding below that four of nine `tokio-pool-1`-against-`tokio-pool-512` cells
+reversed between two runs of one binary.
 
 **The sequential-read result at depth 1 is a change of *ranking* against what
 this document used to publish, and it is not claimed as an improvement in this
@@ -62,16 +90,18 @@ unmodified against each backend. Each run records:
 
 A run whose trace disagrees with the others is **rejected, not reported**.
 
-Two tests in `crates/win-ioring-bench/tests/fairness.rs` hold that to account.
+Four tests in `crates/win-ioring-bench/tests/fairness.rs` hold that to account.
 Each takes a **real** backend, wraps it so that it either skips one read in four
 or reports full transfers whose bytes never reach anywhere readable, and drives
 it through `harness::measure_combination` — the same function a measured
 benchmark calls, applying the weakening at the same call site the timed closure
-uses. Both require the run to be **rejected**, and both assert *which* mismatch
-was reported, so a run falling over for an unrelated reason does not count as a
-pass. A third test proves the weakenings change what was delivered rather than
-what was issued, so the two above cannot be passing on the issue-trace comparison
-alone.
+uses. All four require the run to be **rejected**, and all four assert *which*
+mismatch was reported, so a run falling over for an unrelated reason does not
+count as a pass. Two of them weaken a thread-pool backend and two weaken
+`compio-iocp`; no test weakens a ring backend, which is recorded in
+`docs/pending-work.md`. A further test proves the weakenings change what was
+delivered rather than what was issued, so the four above cannot be passing on
+the issue-trace comparison alone.
 
 **That paragraph used to say something stronger than was true.** Until this
 document was rewritten it read "Two tests deliberately weaken a backend … and
@@ -97,8 +127,9 @@ could not be built honestly until that was fixed.
 | `tokio::fs (blocking pool 512)` | the same, at the default pool width |
 | `win-ioring (owned buffers)` | this crate, caller-owned buffers, unregistered handles |
 | `win-ioring (registered)` | this crate, **registered buffers**, operations naming a buffer by index |
+| `compio (IOCP)` | the `compio` runtime, completion-based on Windows via I/O completion ports — **not** an I/O ring |
 
-Three notes on fairness:
+Four notes on fairness:
 
 **The thread-pool backend uses `spawn_blocking`, not `tokio::fs::File`.** That
 type is cursor-based and cannot express several *positional* operations
@@ -113,8 +144,44 @@ under two labels.
 **The registered backend registers buffers only.** The account prints its
 configuration as "registered buffers and file handle", which overstates: the code
 never registers a file, so every backend in the comparison passes an owned
-handle. Harmless to the measurement, since that makes all four alike, but the
+handle. Harmless to the measurement, since that makes all five alike, but the
 printed string is wrong; it is tracked in [pending-work.md](pending-work.md).
+
+**compio opens its files asynchronously, and that costs it about 32 µs per
+open.** Every scenario opens inside the timed iteration, so this is a real
+fairness item rather than a curiosity, and it is measured in-tree rather than
+estimated. The run above recorded **std 14.0 µs (p90 14.9 µs) against compio
+45.9 µs (p90 82.3 µs)**, medians over 200 opens each — compio costs **3.3x, or
+31.9 µs more per open**. It is produced by `cargo bench -p win-ioring-bench` and
+printed in the teardown section of `target/bench-data/fairness.md`. The probe can
+be exercised without a full run by `cargo bench -p win-ioring-bench -- --list`,
+which builds the whole working set and runs the preparation path
+(see [pending-work.md](pending-work.md)) — note that it **overwrites the
+account**, so do not run it against a run whose account you still need. The p90s
+are worth reading beside the medians: the syscall's sits about 1 µs above its
+median, the async open's at nearly twice its own — the cost is not merely larger,
+it is *variable* in a way the syscall is not.
+
+The quantity that matters is the **delta**, 31.9 µs, not compio's absolute
+45.9 µs: the other four backends also open a file, and only the difference is a
+fairness question. Multiplied by the opens per iteration — **one** for the three
+read scenarios, **two** for write-then-read, which opens for the write and again
+for the read — it is this share of a depth-64 iteration:
+
+| scenario | opens | extra | iteration | share |
+| --- | --- | --- | --- | --- |
+| sequential read | 1 | 31.9 µs | 19.56 ms | **0.16%** |
+| random read | 1 | 31.9 µs | 5.00 ms | **0.64%** |
+| write then read | 2 | 63.8 µs | 42.75 ms | **0.15%** |
+| bulk read | 1 | 31.9 µs | 18.89 ms | **0.17%** |
+
+**The direction is asymmetric, and that is the whole reason the figure matters.**
+The cost biases compio *slower*. So it is **conservative for any conclusion that
+compio also loses** — the loss is real and would only shrink if the open were
+free — and **anti-conservative for any conclusion that compio scales well**,
+because a fixed per-iteration cost is amortised over more I/Os as depth rises and
+can manufacture the appearance of improvement on its own. Both readings appear
+below, and each is qualified accordingly rather than with a generic caveat.
 
 ## Reading the numbers
 
@@ -161,76 +228,101 @@ check that bites.
 
 ## Full result
 
-All thirty-six cells of the rolling matrix — every rolling scenario, depth and
-backend — because a selection invites the question of how it was selected.
+All fifty cells of the matrix — every scenario, depth and backend — because a
+selection invites the question of how it was selected. That is 45 rolling cells
+(three scenarios by three depths by five backends) plus the five bulk-read cells,
+which run at depth 64 alone.
 
-The bulk-read scenario was added after this run and is not in this table.
-Republishing forty cells would have meant re-running everything, and a table
-stitched from two runs is worse than two tables. It has its own section,
-[below](#the-batched-window-and-what-it-settled), reported against the rolling
-depth-64 cells **from the same run as itself** so the shape comparison is
-internal to one run rather than across the ±24% floor.
+**Every figure here comes from one run.** Adding a fifth backend invalidated every
+stored number, so the whole matrix was re-measured rather than patched. The
+bulk-read rows are therefore no longer a table stitched on beside this one, and
+the shape comparison in
+["The batched window"](#the-batched-window-and-what-it-settled) is now internal to
+the same run as everything else. If this table has to be taken again it is taken
+whole; nothing in it is ever patched from a second run.
 
 Taken on an AMD Ryzen 7 PRO 6850U (8 cores, 16 logical processors, 16 MiB L3),
 28436 MiB of memory, working files on an NVMe volume. `warm_up_time` 1 s,
-`measurement_time` 2 s, 100 samples per estimate.
+`measurement_time` 2 s, 100 samples per estimate. The run took **275.0 seconds**
+of wall clock, of which 274.0 s was measurement and 0.1 s preparation.
 
 Operations per iteration: **256** for sequential read (256 I/Os), **512** for
 random read (512 I/Os), **128** for write-then-read (**256** I/Os — it writes
-each block and reads it back). Every figure in the `µs per I/O` column is
-**microseconds per single I/O** — an iteration's measured time divided by the
-I/O count above, not the time for the iteration. `relative` is against
-`tokio::fs (blocking pool 1)` within the same scenario and depth. Bold marks
-where this crate is ahead.
+each block and reads it back) and **256** for bulk read (256 I/Os). Every figure
+in the `µs per I/O` column is **microseconds per single I/O** — an iteration's
+measured time divided by the I/O count above, not the time for the iteration.
+`relative` is against `tokio::fs (blocking pool 1)` within the same scenario and
+depth. Bold marks where **this crate** is ahead; compio is a reference point
+rather than a competitor and is not bolded, and its own comparisons are made
+[below](#a-third-backend-completion-based-but-not-a-ring).
 
 | scenario | depth | backend | µs per I/O [lower, estimate, upper] | relative |
 | --- | --- | --- | --- | --- |
-| sequential read (64 KiB) | 1 | tokio::fs (pool 1) | [105.62, 107.58, 109.54] | 1.00x |
-| sequential read (64 KiB) | 1 | tokio::fs (pool 512) | [111.87, 114.57, 117.34] | 1.06x |
-| sequential read (64 KiB) | 1 | win-ioring (owned) | **[85.46, 87.47, 89.70]** | 0.81x |
-| sequential read (64 KiB) | 1 | win-ioring (registered) | **[82.95, 85.31, 87.94]** | 0.79x |
-| sequential read (64 KiB) | 8 | tokio::fs (pool 1) | [72.81, 74.70, 76.71] | 1.00x |
-| sequential read (64 KiB) | 8 | tokio::fs (pool 512) | [69.98, 71.28, 72.64] | 0.95x |
-| sequential read (64 KiB) | 8 | win-ioring (owned) | [81.09, 82.42, 83.86] | 1.10x |
-| sequential read (64 KiB) | 8 | win-ioring (registered) | [84.91, 86.72, 88.64] | 1.16x |
-| sequential read (64 KiB) | 64 | tokio::fs (pool 1) | [67.84, 69.09, 70.41] | 1.00x |
-| sequential read (64 KiB) | 64 | tokio::fs (pool 512) | [71.82, 73.10, 74.46] | 1.06x |
-| sequential read (64 KiB) | 64 | win-ioring (owned) | [82.69, 84.59, 86.68] | 1.22x |
-| sequential read (64 KiB) | 64 | win-ioring (registered) | [84.49, 86.10, 87.82] | 1.25x |
-| random read (4 KiB) | 1 | tokio::fs (pool 1) | [24.23, 24.88, 25.59] | 1.00x |
-| random read (4 KiB) | 1 | tokio::fs (pool 512) | [24.15, 24.73, 25.33] | 0.99x |
-| random read (4 KiB) | 1 | win-ioring (owned) | **[13.25, 13.59, 13.96]** | 0.55x |
-| random read (4 KiB) | 1 | win-ioring (registered) | **[14.03, 14.39, 14.78]** | 0.58x |
-| random read (4 KiB) | 8 | tokio::fs (pool 1) | [6.92, 7.15, 7.39] | 1.00x |
-| random read (4 KiB) | 8 | tokio::fs (pool 512) | [11.87, 12.28, 12.74] | 1.72x |
-| random read (4 KiB) | 8 | win-ioring (owned) | [10.18, 10.75, 11.42] | 1.50x |
-| random read (4 KiB) | 8 | win-ioring (registered) | [11.24, 11.69, 12.18] | 1.64x |
-| random read (4 KiB) | 64 | tokio::fs (pool 1) | [5.65, 5.78, 5.92] | 1.00x |
-| random read (4 KiB) | 64 | tokio::fs (pool 512) | [12.97, 13.38, 13.84] | 2.32x |
-| random read (4 KiB) | 64 | win-ioring (owned) | [9.77, 10.11, 10.47] | 1.75x |
-| random read (4 KiB) | 64 | win-ioring (registered) | [9.95, 10.17, 10.42] | 1.76x |
-| write then read (64 KiB) | 1 | tokio::fs (pool 1) | [186.62, 192.39, 200.67] | 1.00x |
-| write then read (64 KiB) | 1 | tokio::fs (pool 512) | [193.34, 196.84, 200.86] | 1.02x |
-| write then read (64 KiB) | 1 | win-ioring (owned) | **[163.04, 165.57, 168.37]** | 0.86x |
-| write then read (64 KiB) | 1 | win-ioring (registered) | **[158.40, 162.85, 167.66]** | 0.85x |
-| write then read (64 KiB) | 8 | tokio::fs (pool 1) | [149.90, 152.09, 154.43] | 1.00x |
-| write then read (64 KiB) | 8 | tokio::fs (pool 512) | [153.46, 155.70, 158.08] | 1.02x |
-| write then read (64 KiB) | 8 | win-ioring (owned) | [170.24, 175.98, 185.02] | 1.16x |
-| write then read (64 KiB) | 8 | win-ioring (registered) | [164.33, 166.88, 169.55] | 1.10x |
-| write then read (64 KiB) | 64 | tokio::fs (pool 1) | [149.21, 152.77, 157.54] | 1.00x |
-| write then read (64 KiB) | 64 | tokio::fs (pool 512) | [154.32, 159.17, 166.44] | 1.04x |
-| write then read (64 KiB) | 64 | win-ioring (owned) | [167.17, 170.98, 175.62] | 1.12x |
-| write then read (64 KiB) | 64 | win-ioring (registered) | [172.29, 175.71, 179.30] | 1.15x |
+| sequential read (64 KiB) | 1 | tokio::fs (pool 1) | [92.69, 93.94, 95.24] | 1.00x |
+| sequential read (64 KiB) | 1 | tokio::fs (pool 512) | [98.21, 99.48, 100.77] | 1.06x |
+| sequential read (64 KiB) | 1 | win-ioring (owned) | **[77.18, 77.96, 78.77]** | 0.83x |
+| sequential read (64 KiB) | 1 | win-ioring (registered) | **[78.97, 79.60, 80.26]** | 0.85x |
+| sequential read (64 KiB) | 1 | compio (IOCP) | [75.37, 76.56, 77.80] | 0.81x |
+| sequential read (64 KiB) | 8 | tokio::fs (pool 1) | [60.87, 61.17, 61.48] | 1.00x |
+| sequential read (64 KiB) | 8 | tokio::fs (pool 512) | [63.10, 63.41, 63.73] | 1.04x |
+| sequential read (64 KiB) | 8 | win-ioring (owned) | [73.03, 73.60, 74.21] | 1.20x |
+| sequential read (64 KiB) | 8 | win-ioring (registered) | [74.04, 74.60, 75.17] | 1.22x |
+| sequential read (64 KiB) | 8 | compio (IOCP) | [72.01, 72.55, 73.12] | 1.19x |
+| sequential read (64 KiB) | 64 | tokio::fs (pool 1) | [59.71, 60.09, 60.51] | 1.00x |
+| sequential read (64 KiB) | 64 | tokio::fs (pool 512) | [63.60, 63.96, 64.35] | 1.06x |
+| sequential read (64 KiB) | 64 | win-ioring (owned) | [73.61, 74.40, 75.22] | 1.24x |
+| sequential read (64 KiB) | 64 | win-ioring (registered) | [74.19, 75.16, 76.24] | 1.25x |
+| sequential read (64 KiB) | 64 | compio (IOCP) | [75.46, 76.40, 77.38] | 1.27x |
+| random read (4 KiB) | 1 | tokio::fs (pool 1) | [26.08, 26.51, 26.94] | 1.00x |
+| random read (4 KiB) | 1 | tokio::fs (pool 512) | [27.35, 27.74, 28.13] | 1.05x |
+| random read (4 KiB) | 1 | win-ioring (owned) | **[15.23, 15.42, 15.62]** | 0.58x |
+| random read (4 KiB) | 1 | win-ioring (registered) | **[15.91, 16.13, 16.34]** | 0.61x |
+| random read (4 KiB) | 1 | compio (IOCP) | [11.26, 11.49, 11.74] | 0.43x |
+| random read (4 KiB) | 8 | tokio::fs (pool 1) | [7.79, 7.91, 8.02] | 1.00x |
+| random read (4 KiB) | 8 | tokio::fs (pool 512) | [11.88, 12.04, 12.20] | 1.52x |
+| random read (4 KiB) | 8 | win-ioring (owned) | [10.56, 10.72, 10.88] | 1.36x |
+| random read (4 KiB) | 8 | win-ioring (registered) | [11.41, 11.62, 11.85] | 1.47x |
+| random read (4 KiB) | 8 | compio (IOCP) | [9.93, 10.13, 10.35] | 1.28x |
+| random read (4 KiB) | 64 | tokio::fs (pool 1) | [7.21, 7.37, 7.52] | 1.00x |
+| random read (4 KiB) | 64 | tokio::fs (pool 512) | [13.21, 13.40, 13.59] | 1.82x |
+| random read (4 KiB) | 64 | win-ioring (owned) | [10.01, 10.29, 10.58] | 1.40x |
+| random read (4 KiB) | 64 | win-ioring (registered) | [9.53, 9.74, 9.96] | 1.32x |
+| random read (4 KiB) | 64 | compio (IOCP) | [9.56, 9.77, 9.98] | 1.33x |
+| write then read (64 KiB) | 1 | tokio::fs (pool 1) | [177.57, 182.83, 191.73] | 1.00x |
+| write then read (64 KiB) | 1 | tokio::fs (pool 512) | [176.00, 177.95, 179.95] | 0.97x |
+| write then read (64 KiB) | 1 | win-ioring (owned) | **[160.75, 166.59, 176.64]** | 0.91x |
+| write then read (64 KiB) | 1 | win-ioring (registered) | [252.87, 299.77, 355.12] | 1.64x |
+| write then read (64 KiB) | 1 | compio (IOCP) | [190.50, 218.92, 250.73] | 1.20x |
+| write then read (64 KiB) | 8 | tokio::fs (pool 1) | [155.81, 165.93, 183.44] | 1.00x |
+| write then read (64 KiB) | 8 | tokio::fs (pool 512) | [154.92, 163.69, 178.21] | 0.99x |
+| write then read (64 KiB) | 8 | win-ioring (owned) | [165.98, 176.47, 194.75] | 1.06x |
+| write then read (64 KiB) | 8 | win-ioring (registered) | [180.60, 184.47, 188.47] | 1.11x |
+| write then read (64 KiB) | 8 | compio (IOCP) | [160.17, 168.14, 181.30] | 1.01x |
+| write then read (64 KiB) | 64 | tokio::fs (pool 1) | [136.66, 142.77, 153.59] | 1.00x |
+| write then read (64 KiB) | 64 | tokio::fs (pool 512) | [143.17, 144.72, 146.31] | 1.01x |
+| write then read (64 KiB) | 64 | win-ioring (owned) | [153.65, 155.76, 158.06] | 1.09x |
+| write then read (64 KiB) | 64 | win-ioring (registered) | [179.38, 187.17, 199.68] | 1.31x |
+| write then read (64 KiB) | 64 | compio (IOCP) | [158.24, 166.99, 182.30] | 1.17x |
+| bulk read (64 KiB) | 64 | tokio::fs (pool 1) | [60.67, 61.11, 61.57] | 1.00x |
+| bulk read (64 KiB) | 64 | tokio::fs (pool 512) | [65.49, 65.98, 66.48] | 1.08x |
+| bulk read (64 KiB) | 64 | win-ioring (owned) | [73.23, 74.11, 75.05] | 1.21x |
+| bulk read (64 KiB) | 64 | win-ioring (registered) | [73.94, 74.77, 75.66] | 1.22x |
+| bulk read (64 KiB) | 64 | compio (IOCP) | [73.05, 73.80, 74.58] | 1.21x |
 
 **Do not compare µs per I/O across scenarios.** A 64 KiB read moves sixteen times
 the bytes of a 4 KiB one, and write-then-read pays a file-system write path the
-read scenarios never touch. Compare down a group of four rows, not across them.
+read scenarios never touch. Compare down a group of five rows, not across them.
 
-**What a second full run reproduced, and what it did not.** The same binary was
-run again minutes later against this run as a stored baseline — the same binary
-in the checkable sense: `sequential-read/tokio-pool-1/1` came back at 27.521 ms
-against the 27.540 ms above, a reported change of −0.07%. Recomputing every
-relative from that run's own absolutes:
+**What a repeat run reproduced, and what it did not.** *This finding comes from an
+earlier pair of runs of the four-backend matrix, not from the run in the table
+above.* It is kept, and marked, because what it establishes — how much of a
+relative survives a repeat — is a property of the instrument rather than of any
+one table, and re-establishing it would cost a second whole run for no new
+information. The same binary was run twice minutes apart, the second against the
+first as a stored baseline, and it was the same binary in the checkable sense:
+`sequential-read/tokio-pool-1/1` came back at 27.521 ms against 27.540 ms, a
+reported change of −0.07%. Recomputing every relative from the second run's own
+absolutes:
 
 - **The direction of each ring backend against `tokio::fs (pool 1)` reproduced in
   all eighteen ring cells.** Ahead at depth 1 in all three scenarios, behind at
@@ -247,18 +339,24 @@ relative from that run's own absolutes:
   where the two are within a few percent of each other. Read those cells as "no
   difference measured", not as a ranking.
 - **The two ring backends' order against each other flipped in two cells** —
-  random read at depth 1 and write-then-read at depth 8 — which is the same fact
-  the "registration is behind in six of nine and ahead in three" reading below
-  rests on, and the reason that reading is given as "a few percent either way"
-  rather than as a winner.
+  random read at depth 1 and write-then-read at depth 8 — which is why the
+  registration reading below is reported as a count of cells rather than as a
+  winner. The fifty-benchmark run moved that count again, to nine cells behind
+  and one ahead.
 
 **This paragraph used to claim that every relative figure was reproduced**, with
 "the largest disagreement being random read at depth 64 with owned buffers (1.75x
 against 1.40x)", and advised treating one significant figure as solid. Four cells
 reverse direction between the two runs, and 1.75x against 1.40x is itself a
-disagreement in the first significant figure, so both halves were wrong. The
-1.75x that the headline and `README.md` quote as the top of the loss range is a
-figure from one run; the second put that cell at 1.40x.
+disagreement in the first significant figure, so both halves were wrong.
+
+**And the table above is a third data point for it.** That cell — random read at
+depth 64, owned buffers — reads 1.40x in the fifty-benchmark run, against the
+1.75x and 1.40x of the earlier pair. The 1.75x that the headline and `README.md`
+used to quote as the top of the loss range is gone from both, because it was a
+figure from one run out of three. Read a relative in this document for its
+direction and its rough size. Not to a decimal, and on this evidence not to one
+significant figure either.
 
 ## The batched window, and what it settled
 
@@ -287,10 +385,14 @@ entries they covered. Across the whole default matrix, entries per submission:
 The rolling window batches at **exactly the configured depth** — 256 entries over
 4 submissions at depth 64. Where a figure is not the depth it is arithmetic:
 write-then-read's 257 entries are four submissions of 64 and one of 1. Both ring
-backends agree to the digit in all **twenty** ring cells — the other twenty rows
-of the matrix are `tokio::fs`, which has no ring and reports the figure as not
-applicable rather than as zero — and **three full runs produced bit-identical
-figures**, so this is not an average over noise.
+backends agree to the digit in all **twenty** ring cells — the other thirty rows
+of the matrix are `tokio::fs` and compio, neither of which has a ring, and both
+report the figure as not applicable rather than as zero — and **three full runs
+produced bit-identical
+figures**, so this is not an average over noise. The fifty-benchmark run
+published above is a fourth, and it reproduced every figure in this table to the
+digit again, with a fifth backend in the matrix and nine of the ten combinations
+in a different backend order.
 
 The mechanism: the executor drains every ready completion in one pass before the
 driver submits again, so against a warm cache a rolling refill rebuilds the whole
@@ -312,14 +414,16 @@ divided by its 256 reads, not the time for the iteration:
 
 | shape | backend | [lower, estimate, upper] | relative |
 | --- | --- | --- | --- |
-| rolling | tokio::fs (pool 1) | [61.66, 61.98, 62.33] | 1.00x |
-| rolling | tokio::fs (pool 512) | [65.28, 66.02, 66.83] | 1.07x |
-| rolling | win-ioring (owned) | [77.64, 78.35, 79.10] | 1.26x |
-| rolling | win-ioring (registered) | [78.60, 79.35, 80.15] | 1.28x |
-| batched | tokio::fs (pool 1) | [66.53, 67.36, 68.24] | 1.00x |
-| batched | tokio::fs (pool 512) | [67.10, 67.66, 68.23] | 1.00x |
-| batched | win-ioring (owned) | [78.28, 79.33, 80.44] | 1.18x |
-| batched | win-ioring (registered) | [78.95, 79.81, 80.72] | 1.18x |
+| rolling | tokio::fs (pool 1) | [59.71, 60.09, 60.51] | 1.00x |
+| rolling | tokio::fs (pool 512) | [63.60, 63.96, 64.35] | 1.06x |
+| rolling | win-ioring (owned) | [73.61, 74.40, 75.22] | 1.24x |
+| rolling | win-ioring (registered) | [74.19, 75.16, 76.24] | 1.25x |
+| rolling | compio (IOCP) | [75.46, 76.40, 77.38] | 1.27x |
+| batched | tokio::fs (pool 1) | [60.67, 61.11, 61.57] | 1.00x |
+| batched | tokio::fs (pool 512) | [65.49, 65.98, 66.48] | 1.08x |
+| batched | win-ioring (owned) | [73.23, 74.11, 75.05] | 1.21x |
+| batched | win-ioring (registered) | [73.94, 74.77, 75.66] | 1.22x |
+| batched | compio (IOCP) | [73.05, 73.80, 74.58] | 1.21x |
 
 Read by interval overlap within the run. A comparison is treated as **resolved**
 only when the intervals settle it; where it depends on a ratio between two
@@ -329,22 +433,38 @@ can only under-claim, never over-claim. A comparison that does not clear both is
 recorded as **unresolved** rather than reported as a direction.
 
 - **Resolved: this crate is indistinguishable between the two shapes.** Owned
-  buffers [77.64, 79.10] against [78.28, 80.44]; registered [78.60, 80.15]
-  against [78.95, 80.72]. Both pairs overlap. Draining the ring to zero at every
-  batch tail cost it nothing measurable, and neither did filling it.
-- **Resolved: `tokio::fs` is slower in the batched shape.** [61.66, 62.33]
-  against [66.53, 68.24] — disjoint, and disjoint again in a second run
-  ([66.34, 67.78] against [70.90, 72.94]). Handed 64 tasks at once rather than a
-  steady trickle, the one-thread pool pays about 8% more per I/O.
+  buffers [73.61, 75.22] against [73.23, 75.05]; registered [74.19, 76.24]
+  against [73.94, 75.66]. Both pairs overlap. Draining the ring to zero at every
+  batch tail cost it nothing measurable, and neither did filling it. This is the
+  third run to find it.
+- **Resolved: `tokio::fs` is slower in the batched shape — but by much less than
+  it was.** [59.71, 60.51] against [60.67, 61.57] — disjoint, and disjoint in
+  both earlier runs too ([61.66, 62.33] against [66.53, 68.24], and
+  [66.34, 67.78] against [70.90, 72.94]). **The direction has now reproduced
+  three times; the magnitude has not.** The one-thread pool paid about 8% more
+  per I/O in the first two runs and about **1.7%** in this one. Take the
+  direction, not the size.
+- **Resolved: compio is *faster* in the batched shape.** [75.46, 77.38] against
+  [73.05, 74.58] — disjoint, about 3.4% per I/O, and the only backend that is
+  measurably faster batched; the two `tokio::fs` pools resolve in the opposite
+  direction and this crate does not resolve either way. Both ring backends' point
+  estimates also fell
+  (74.40 to 74.11, and 75.16 to 74.77), by too little to resolve. It is a single
+  run and the caveat in the paragraph below applies to it in full: the two shapes
+  differ in sustained depth as well as in shape, so this mixes the two. The
+  async-open cost does **not** confound it — both shapes issue 256 I/Os per
+  iteration behind one open, so the 31.9 µs is identical on both rows and cancels
+  in the comparison.
 - **Unresolved: whether the gap between this crate and `tokio::fs` narrows.**
-  Within this run the ratio is smaller in the batched shape, 1.26x against
-  1.18x. That difference is not resolvable: both ratios fall inside the null
-  band, and across three runs bulk read at depth 64 ran 1.15x to 1.28x while
-  rolling sequential read ran 0.92x to 1.61x in the same runs — overlapping
-  ranges. The narrowing is what one run shows; it is not a result. What the
-  interval evidence does support is only the two statements above, and neither of
-  them is a claim that this crate closes the gap. It does not: every ring cell in
-  the table is slower than every `tokio::fs` cell.
+  Within this run the ratio is again smaller in the batched shape, 1.24x against
+  1.21x — a smaller difference than the 1.26x against 1.18x of the earlier run,
+  and still not resolvable: both ratios fall inside the null band, and across
+  three runs bulk read at depth 64 ran 1.15x to 1.28x while rolling sequential
+  read ran 0.92x to 1.61x in the same runs — overlapping ranges. The narrowing is
+  what a run shows; it is not a result. What the interval evidence does support
+  is only the statements above, and none of them is a claim that this crate
+  closes the gap. It does not: every ring cell in the table is slower than every
+  `tokio::fs` cell, and so is every compio cell.
 
 **These two shapes are not directly comparable to each other.** Rolling and
 batched sustain different depths by construction — 56.1 against 32.5 — so a
@@ -364,6 +484,218 @@ and the honest position is to leave the gap open rather than fill it with the
 next plausible guess — single-threaded completion processing against a
 512-thread pool, per-completion dequeue cost, cache effects. Each is testable and
 none is tested.
+
+**One of those three has since been narrowed, and a fourth candidate has been
+ruled out.** That is what the next section is for.
+
+## A third backend: completion-based, but not a ring
+
+Everything above compares this crate against a thread pool. That comparison
+confounds two variables. This crate is **completion-based** — it hands an
+operation to the kernel and collects the result later — and it is **an I/O
+ring**, a specific Windows interface with a submission queue, a completion queue
+and a `SubmitIoRing` call. `tokio::fs` is neither. So every loss in the table
+above could be charged to either property, and nothing in a two-way comparison
+can say which.
+
+`compio` is the third point that separates them. On Windows it is completion-based
+via **I/O completion ports** — completion-based, no ring. If the loss travels with
+the completion model it should appear in compio too; if it belongs to the ring, or
+to this crate's implementation of it, compio should be clear of it.
+
+It is not clear of it.
+
+### What compio is here, as confirmed at run time
+
+- **The driver is IOCP, confirmed by the run and not by the documentation.** The
+  backend prints `compio_runtime::Runtime::driver_type()` rather than a written
+  assumption, so a host or a version that produced something else would say so;
+  this run printed `IOCP driver`. There is no mode to select — the driver type is
+  a property of the platform build.
+- **Completion processing is single-threaded.** The `iocp-global` feature is off,
+  so the runtime drives its own thread's completions, and compio's `Driver` is
+  neither `Send` nor `Sync`. This is deliberate: it matches this crate's
+  single-threaded driver, which is the point of the comparison.
+- **`open` is a blocking-pool operation plus a completion-port attach**, and this
+  is why the benchmark's `Backend::open_read` and `open_write` are `async fn`.
+  A file handle cannot be synthesised through `FromRawHandle` and used, because
+  that route skips the attach and produces a file whose operations never
+  complete — a defect that would present as a hang, not as an error. The cost of
+  the async open is measured and published in
+  ["The backends"](#the-backends) above.
+- **`sync` is a blocking-pool operation too, and unlike `open` its cost is not
+  measured.** compio declares `OpType::Blocking` for `Sync` and implements it as
+  `FlushFileBuffers` (`compio-driver-0.12.4/src/sys/op/fs/iocp.rs:21-32`), so
+  `file.sync_all().await` is a thread-pool hop rather than a completion. The
+  write-then-read scenario commits once per iteration inside the timed region
+  (`crates/win-ioring-bench/src/scenario.rs:295`) — deliberately, because a
+  backend that skipped the commit would be doing less work than the others.
+  **This is a second compio-slower bias in write-then-read, and it is disclosed
+  rather than quantified.** It matters where it lands: write-then-read holds the
+  widest intervals in the matrix and is the one scenario whose depth-scaling
+  result resolves, so the unmeasured part of compio's cost is concentrated in
+  exactly the cell doing the most argumentative work. Read the depth-scaling
+  section below with that in mind.
+- **There is no submission figure for compio, and that is not a gap.** The
+  entries-per-submission table exists because a ring batches entries into one
+  `SubmitIoRing` and the count is meaningful. IOCP has no such call, so there is
+  nothing batched to count. The account reports the figure as *not applicable*
+  rather than as zero, because zero would read as "compio does not batch", which
+  is a claim this measurement does not make.
+- **There is one compio row, not two, and the reason is a fact about Windows.**
+  A reader who knows compio has a `buffer_pool` will reasonably ask why there is
+  no registered-buffer compio row to set against this crate's registered
+  backend. `compio_runtime::Runtime::buffer_pool()` resolves on Windows to
+  `compio-driver-0.12.4/src/sys/buffer_pool/fallback.rs`, whose `BufControl` is a
+  `VecDeque<u16>` of slot indices (`:7-8`) with a `release` that takes its driver
+  argument and returns `Ok(())` (`:20-22`) — a **userspace free list**, not a
+  kernel registration. That selection is not a guess: the sibling `mod.rs` picks
+  its implementation with `cfg_select!`, and the fallback arm is the `_` default
+  taken when neither `fusion` nor `io_uring` is configured. The `iour.rs` sibling,
+  which does map to kernel buffer rings, imports `io_uring::types::BufRingEntry`
+  and `rustix::mm` and is not compiled on Windows at all. A second compio
+  configuration would have spent ten benchmarks of a hard-limited budget
+  comparing a `Vec<u8>` pool against a `VecDeque<u16>` pool. The absence is a
+  measured property of the platform, not an omission.
+
+The compio backend ran all ten combinations, produced ten timed rows, and agreed
+with the reference backend on issue trace and delivered-bytes digest in every one
+of them — a disagreement would have ended the run rather than been reported.
+
+**What it costs to have it.** compio arrives as **nine** crates, all of them
+dependencies of `win-ioring-bench` alone — a `publish = false` crate — and none
+of them reachable from the library: `cargo tree -p win-ioring -e normal` contains
+no compio crate at all. They are `compio 0.19.1`, `compio-buf 0.8.3`,
+`compio-driver 0.12.4`, `compio-executor 0.1.3`, `compio-fs 0.12.0`,
+`compio-io 0.10.1`, `compio-log 0.2.0`, `compio-runtime 0.12.4` and
+`compio-send-wrapper 0.7.2`. The dependency is declared with
+`default-features = false` and the `fs` feature only, which drops the Linux-only
+`io-uring` default and leaves `iocp-global` off. The list is given in full, and
+is checkable with `cargo tree -p win-ioring-bench -e normal`, because a partial
+list is the kind of thing that gets quoted as a total.
+
+### What it measured
+
+compio's per-I/O cost, and its ratio against `tokio::fs (pool 1)` and both ring
+backends. A ratio is **resolved** only if it clears the −18%/+24% null band *and*
+the two intervals are disjoint; otherwise it is **unresolved**, and no direction
+is claimed from it — here or in the prose below.
+
+| scenario | depth | compio µs per I/O | vs `tokio::fs` (pool 1) | vs win-ioring (owned) | vs win-ioring (registered) |
+| --- | --- | --- | --- | --- | --- |
+| sequential read | 1 | [75.37, 76.56, 77.80] | 0.81x **resolved** | 0.98x unresolved | 0.96x unresolved |
+| sequential read | 8 | [72.01, 72.55, 73.12] | 1.19x unresolved | 0.99x unresolved | 0.97x unresolved |
+| sequential read | 64 | [75.46, 76.40, 77.38] | 1.27x **resolved** | 1.03x unresolved | 1.02x unresolved |
+| random read | 1 | [11.26, 11.49, 11.74] | 0.43x **resolved** | 0.75x **resolved** | 0.71x **resolved** |
+| random read | 8 | [9.93, 10.13, 10.35] | 1.28x **resolved** | 0.94x unresolved | 0.87x unresolved |
+| random read | 64 | [9.56, 9.77, 9.98] | 1.33x **resolved** | 0.95x unresolved | 1.00x unresolved |
+| write then read | 1 | [190.50, 218.92, 250.73] | 1.20x unresolved | 1.31x **resolved** | 0.73x **resolved** |
+| write then read | 8 | [160.17, 168.14, 181.30] | 1.01x unresolved | 0.95x unresolved | 0.91x unresolved |
+| write then read | 64 | [158.24, 166.99, 182.30] | 1.17x unresolved | 1.07x unresolved | 0.89x unresolved |
+| bulk read | 64 | [73.05, 73.80, 74.58] | 1.21x unresolved | 1.00x unresolved | 0.99x unresolved |
+
+**Resolved: compio loses to the one-thread pool as depth rises, in the same
+places this crate does.** Sequential read at depth 64, 1.27x; random read at
+depth 8 and 64, 1.28x and 1.33x. The async-open cost biases compio slower, so
+this direction is **conservative** — removing the open entirely would move
+sequential read at depth 64 by 0.16% and random read at depth 64 by 0.64%, and
+neither shifts a 1.27x or a 1.33x anywhere near the band.
+
+**Resolved: compio beats the ring at depth 1 on random read** — 0.75x and 0.71x,
+the only depth-1 cell where compio separates from both ring backends in the same
+direction. (The three ring-and-compio backends do not all separate from each
+other there: registered against owned is 1.05x, inside the band.) Two more
+resolved ring comparisons sit in write-then-read at depth 1 (1.31x and 0.73x),
+and they are the least trustworthy numbers in the document: that cell holds the
+widest interval in the matrix and the one relative that reversed direction
+against the previous publication. They are reported because the rule is to report
+what resolves, and flagged because the rule is also not to launder an unstable
+cell as a finding.
+
+**Resolved, and stated because the data resolves it: compio beats `tokio::fs` at
+depth 1 on both read scenarios** — 0.81x on sequential and 0.43x on random read,
+the largest advantage any backend achieves over `tokio::fs` anywhere in the
+matrix. The sequential
+one only just resolves: at 0.815 it clears the band's −18% edge by half a
+percentage point, so treat it as the weaker of the two. It is the same
+shape as this crate's own depth-1 advantage, and it is reported here rather than
+left to the table because enumerating only the losses would be a one-sided
+reading of a result that cuts both ways.
+
+**Unresolved, and this is the result: compio and the ring are indistinguishable
+wherever the loss actually happens.** All fourteen compio-against-ring
+comparisons at depth 8 and depth 64 are unresolved — sequential read 0.99x,
+0.97x, 1.03x, 1.02x; random read 0.94x, 0.87x, 0.95x, 1.00x; write-then-read
+0.95x, 0.91x, 1.07x, 0.89x; bulk read 1.00x, 0.99x. No direction is claimed for
+any of them, and none is needed: two implementations that share no kernel
+interface, no submission mechanism and no buffer-handling strategy land inside
+each other's noise at every depth where this crate loses.
+
+### Does compio's per-I/O cost fall with depth?
+
+The benchmark measures achieved depth at its own seam, so it cannot see a backend
+serialising operations below its own interface — the standing caveat that applies
+to every backend in this document applies to compio too. The one thing that would
+give indirect evidence of real concurrency underneath is the per-I/O cost falling
+as depth rises. It does so on one scenario of three:
+
+| scenario | depth 1 | depth 8 | depth 64 | depth 64 vs depth 1 |
+| --- | --- | --- | --- | --- |
+| sequential read | 76.56 | 72.55 | 76.40 | −0.2%, **unresolved** |
+| random read | 11.49 | 10.13 | 9.77 | −15.0%, **unresolved** |
+| write then read | 218.92 | 168.14 | 166.99 | −23.7%, **resolved** |
+
+Only write-then-read clears the −18% band with disjoint intervals
+([190.50, 250.73] against [158.24, 182.30]). Random read falls visibly and does
+not clear it; sequential read is flat. And the one scenario that does resolve
+rests on the widest depth-1 interval in the matrix — the same cell flagged above.
+
+**So compio's in-kernel concurrency is unverified below its interface.** The
+evidence for it is one scenario out of three, resting on the least stable cell
+measured. This is also the reading where the async-open cost is
+**anti-conservative**: a fixed 31.9 µs per iteration is amortised over the same
+256 or 512 I/Os at every depth, so it does not manufacture a fall on its own —
+but it inflates all three depths equally, which compresses the *relative* fall it
+would otherwise show. It cannot rescue the two unresolved rows, and it is not
+offered as an excuse for them.
+
+### What this bears on, and what it leaves alone
+
+The three candidate causes left open above were single-threaded completion
+processing against a 512-thread pool, per-completion dequeue cost, and cache
+effects. This measurement touches them unevenly, and it is worth being exact
+about which.
+
+- **Per-completion dequeue cost — narrowed.** It is *not* the I/O ring's dequeue
+  specifically. `PopIoRingCompletion` and `GetQueuedCompletionStatusEx` are
+  different code paths in different subsystems, and they cost the same to within
+  the resolution of this instrument at every depth where the loss appears. The
+  candidate survives only in its model-level form: a per-completion cost that any
+  completion-based design on this platform pays. In its implementation-specific
+  form it is ruled out.
+- **Single-threaded completion processing — untouched.** Both losing backends
+  have it, so this matrix cannot discriminate it; there is no arm here with
+  multi-threaded completion processing. It is worth noting that the backend that
+  wins is `tokio::fs` at pool width **1** — a single blocking thread — so
+  "against a 512-thread pool" was already the weaker half of the phrasing, and
+  the pool-512 configuration loses to pool-1 in seven of the nine rolling cells.
+  The live form of this candidate is about *where* completions are processed,
+  not how many threads are available.
+- **Cache effects — untouched.** Nothing here varies the cache path. Every figure
+  in this document is warm-cache by design.
+
+And a fourth candidate, never written down as one because a two-backend
+comparison could not have tested it, is now ruled out: **the loss is not a defect
+in this crate's implementation of the I/O ring, and it is not a property of the
+I/O ring interface.** An independent runtime, sharing none of this crate's code,
+reaching the kernel through a different mechanism, loses by the same margin in
+the same cells. Whatever the cause is, it is above the interface or below both of
+them — not in between.
+
+That does not make this crate fast. It means the remaining explanation is one
+that a completion-based design on this platform pays for reaching a warm page
+cache, and that finding a cheaper ring will not recover it.
+
 
 ## What changed when the instrument changed
 
@@ -445,9 +777,9 @@ whatever was there before. The second names a baseline; the third compares
 against that name and prints, per benchmark, a change interval and a verdict.
 Baselines live under `target/criterion/<group>/<backend>/<depth>/<name>`, survive
 rebuilds, and are lost with the `target` directory. A filtered run times only the
-benchmarks matching the filter but still prepares, warms and verifies all forty
-combinations, so the fairness check never narrows because somebody typed a
-filter; the combinations it did not time are marked
+benchmarks matching the filter but still prepares, warms and verifies all fifty
+of them, so the fairness check never narrows because somebody typed a
+filter; the benchmarks it did not time are marked
 **verified but not timed** in the account.
 
 **Read the verdicts against this host's noise floor, not against zero.** Running
@@ -489,7 +821,8 @@ proceeds, and in full to `target/bench-data/fairness.md` at the end. It carries
   concurrency, and whether it was **timed** or **verified but not timed**;
 - the reference backend and the agreement verdict per (scenario, depth);
 - the number of drivers built against the number of **ring** combinations
-  measured — 20 of the 40, because the two thread-pool backends build none;
+  measured — 20 of the 50, because the two thread-pool backends and compio
+  build none;
 - the write file's size after the run, and whether the first and last measured
   iteration issued and delivered the same work;
 - preparation and measurement wall clock.
@@ -501,12 +834,12 @@ backend serialising below it.
 
 ## Run order
 
-Backends are measured in a **rotated** order: the four are rotated left by the
+Backends are measured in a **rotated** order: the five are rotated left by the
 combination index, so each takes a turn going first. That is a decision, retained
 deliberately, not an inherited habit.
 
 Criterion's per-benchmark warm-up absorbs settling *within* a benchmark. It does
-nothing about drift *across* a three-minute run, which is what rotation is for:
+nothing about drift *across* a five-minute run, which is what rotation is for:
 without it, whichever backend is measured first is systematically measured on a
 cooler machine, in every group and in every run — a bias that repeats rather than
 averages out. It costs one line, it is deterministic so two runs compared through
@@ -525,21 +858,57 @@ level, resampling count and noise threshold are all Criterion's.
 
 The two that moved had to. A benchmark costs at least its warm-up plus its
 measurement window no matter how small an iteration is, and at Criterion's
-defaults of 3 s and 5 s, forty benchmarks are 320 seconds of floor against a
-five-minute budget — over it before a single I/O is issued. Reducing what an
+defaults of 3 s and 5 s, fifty benchmarks are 400 seconds of floor against a
+six-minute budget — over it before a single I/O is issued. Reducing what an
 iteration does cannot get below that floor; only the budget can.
 
 **The budget is a number, not an aspiration.** It used to exist only in this
 paragraph, which is no use as a constraint when somebody proposes a new scenario.
-`RUN_BUDGET` is 300 seconds and `Budget::CHOSEN` holds the two timing values, and
+`RUN_BUDGET` is 360 seconds and `Budget::CHOSEN` holds the two timing values, and
 a test computes the matrix's floor from the real depth lists and checks it. The
 check is against **half** the budget, not all of it: three recorded runs cost
 1.79x, 1.83x and 2.06x their floor once preparation, untimed warm-ups, analysis
 and window overruns are counted, so a matrix whose floor merely fits the budget
-will overrun it in practice. At forty benchmarks the floor is 120 seconds against
-a 150-second limit, which is room for about two more combinations. Past that,
+will overrun it in practice. At fifty benchmarks the floor is 150 seconds against
+a 180-second limit, which is room for about two more combinations. Past that,
 something has to be traded away — which is how bulk read came to run at depth 64
 alone.
+
+**Why the budget moved from 300 seconds to 360.** Adding compio as a fifth
+backend grew the matrix by 25%, from forty benchmarks to fifty, and took the
+floor from 120 seconds to 150. Under the old budget the limit was also 150
+seconds, so the matrix would have been affordable by exactly nothing — passing
+the check with zero margin, which is indistinguishable on paper from a matrix
+that is about to overrun.
+
+The budget was raised rather than the matrix trimmed, and the distinction that
+decided it is worth stating because it recurs. **`RUN_BUDGET` is a chosen
+number: how long a run may take before people stop doing them.** It is not a
+measured property of the host. The `RUN_BUDGET / 2` rule *is* measured — it comes
+from the 1.79x, 1.83x and 2.06x above — and it **did not move**. Only the chosen
+half changed.
+
+The alternatives were considered and are recorded because they look cheaper than
+they are. Dropping a depth from the matrix would have paid a real data point for
+a saving that still left no margin. Shortening `measurement_time` further would
+have widened every published interval in this document — degrading all fifty
+results to protect a number nobody measured — and it would have damaged the
+comparison compio was added to make in the first place, since the depth-scaling
+question is exactly where tighter intervals matter most. Trading a *chosen*
+constraint against a *measured* one is the wrong way round.
+
+The cost is that a full run goes from about four minutes to about five.
+
+**Measured: 275.0 seconds.** The fifty-benchmark run published above came in at
+275.0 s of wall clock, measured at the shell; the account's own timers report
+0.1 s of preparation and 274.0 s of measurement, and the difference is process
+startup and teardown outside them. It is inside the 269–309 s that scaling the
+forty-benchmark
+runs by 25% projected, and 85 seconds under the 360-second budget. It is **not**
+comparable to the "190 to 255 seconds" this document used to quote, which was a
+*thirty-six*-benchmark matrix; reading fifty benchmarks against that band would
+overstate the growth this change caused. The projection held, so it is left
+standing rather than corrected.
 
 `measurement_time` is a floor, not a cap, and this is worth knowing before
 reading an interval. A benchmark whose hundred samples fit inside the window is
@@ -556,15 +925,20 @@ then fit the budget.
 
 ## What a full run costs
 
-Roughly **190 to 255 seconds** on the host above, with the working files already
-present and warm; the first run on a fresh checkout also creates a 256 MiB file.
-Five timed runs of the thirty-six-benchmark matrix came in at 190, 210, 213, 225
-and 254 seconds; three of the forty-benchmark matrix at 247, 219 and 215. The
-spread is the machine, not the suite: the same binary measuring the
-same work varies by a minute depending on what else the host is doing, which is
-the same fact the noise-floor finding above reports in a different unit. Budget
-for the slow end, not the fast one. The account prints preparation and
-measurement separately.
+**275.0 seconds** on the host above, with the working files already present and
+warm; the first run on a fresh checkout also creates a 256 MiB file. That is a
+single measurement of the fifty-benchmark matrix, and it replaces the "190 to 255
+seconds" band this section used to give, which was a *thirty-six*-benchmark
+measurement and was never re-published at forty or at fifty. The historical
+figures are kept for the spread
+they show: five timed runs of the thirty-six-benchmark matrix came in at 190, 210,
+213, 225 and 254 seconds; three of the forty-benchmark matrix at 247, 219 and
+215. **One run is not a band.** Budget for the slow end of that growth, not for
+275 seconds exactly. The spread is the machine, not the suite: the same binary
+measuring the same work varies by a minute depending on what else the host is
+doing, which is the same fact the noise-floor finding above reports in a
+different unit. The account prints preparation and measurement separately — 0.1 s
+and 274.0 s in this run.
 
 It writes about **12 GiB** to `target/bench-data/write.dat` — 8 MiB per
 iteration, across roughly 1570 write-bearing iterations. The file itself stays
@@ -574,28 +948,45 @@ scenario, and it is stated here so nobody discovers it from a wear indicator.
 
 ## What to take from it
 
-- **At depth 1 the crate is ahead in all three scenarios.** This is where the
-  wake-path work landed: with one operation in flight there is nothing to
-  amortise the cost of parking over, so the driver paid it in full on every
-  operation.
+- **At depth 1 the crate is ahead on random reads**, by 0.58x/0.61x, and that
+  result resolves. Its sequential-read leads (0.83x/0.85x) and its owned-buffer
+  write-then-read lead (0.91x) are inside the null band and resolve nothing, so
+  read them as "no worse", not as wins. Depth 1 is where the wake-path work
+  landed: with one
+  operation in flight there is nothing to amortise the cost of parking over, so
+  the driver paid it in full on every operation. The exception is
+  write-then-read with registered buffers, which read 1.64x here against 0.85x
+  in the previous publication — the single most unstable cell in the matrix, and
+  not a result in either direction.
 - **Concurrency still does not favour this crate on this workload, and the
   reason is not the one this document used to give.** The advantage
   completion-based I/O is supposed to earn — coalescing outstanding operations
   into one submission — is *not* missing: it was measured, and it runs at exactly
-  the configured depth in every cell above. The crate loses anyway. What accounts
-  for that is currently unknown; see [the batched
-  window](#the-batched-window-and-what-it-settled).
+  the configured depth in every cell above. The crate loses anyway. It is not the
+  ring's fault either: a completion-based runtime with no ring loses by the same
+  margin, which is [the third backend's
+  result](#a-third-backend-completion-based-but-not-a-ring).
 - **A narrow blocking pool beats a wide one for small reads.** `tokio::fs` at one
-  blocking thread is more than twice as fast as at 512 on random reads at depth
-  64. That is contention, not I/O.
+  blocking thread ran 1.82x faster than at 512 on random reads at depth 64. That
+  is contention, not I/O. (The previous run put the same cell at 2.32x. The
+  direction has held across every run; the size has not.)
 - **Registration still does not pay for itself here.** It is behind the
-  owned-buffer path in six of the nine (scenario, depth) cells and ahead in
-  three, by a few percent either way — where it used to be consistently behind.
-  Its own cost is excluded from these figures, so this is the per-operation
-  comparison alone.
-- **Sequential reads remain the worst case above depth 1**, at 1.10x to 1.25x.
-  64 KiB transfers are dominated by data movement rather than per-operation
-  overhead, so there was less for this work to remove.
+  owned-buffer path in nine of the ten (scenario, depth) cells in this run and
+  ahead in one — random read at depth 64, by 5% — having been behind in six of
+  nine and ahead in three in the previous one. Its own cost is excluded from
+  these figures, so this is the per-operation comparison alone.
+- **Random reads are where the crate loses hardest above depth 1**, at 1.32x to
+  1.47x, and random read is the only scenario whose losses resolve at *both*
+  depths and for *both* buffer modes. Sequential read runs 1.20x to 1.25x and
+  write-then-read 1.06x to 1.31x, but of those eight comparisons only two
+  resolve — sequential and write-then-read at depth 64, registered buffers only.
+  This bullet used to name sequential reads as the worst case at
+  "1.10x to 1.25x", which was never what the table said: those are the smallest
+  ratios above depth 1, not the largest. Sequential read is the most expensive
+  scenario in *absolute* microseconds per I/O, because 64 KiB transfers are
+  dominated by data movement rather than per-operation overhead — which is a
+  statement about where there was least for this work to remove, not about where
+  the crate falls furthest behind.
 
 ## Where the improvement came from
 

@@ -133,11 +133,11 @@ impl Backend for IoRingPlain {
         "single-threaded driver; caller-owned buffers; unregistered handles".to_owned()
     }
 
-    fn open_read(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         File::open(path)
     }
 
-    fn open_write(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         File::create(path)
     }
 
@@ -287,11 +287,11 @@ impl Backend for IoRingRegistered {
             .to_owned()
     }
 
-    fn open_read(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         File::open(path)
     }
 
-    fn open_write(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         File::create(path)
     }
 

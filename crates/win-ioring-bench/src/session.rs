@@ -29,6 +29,7 @@ use futures::future::Either;
 use win_ioring::runtime::{Driver, Handle, SubmissionCounts};
 
 use crate::backend::Backend;
+use crate::backends::compio::Compio;
 use crate::backends::ioring;
 use crate::backends::tokio_fs::TokioFs;
 use crate::config::Config;
@@ -73,6 +74,12 @@ pub enum Prepared {
         /// Used once, by [`Prepared::finish`].
         handle: Handle,
     },
+    /// The completion-based, non-ring backend.
+    ///
+    /// A single field, like `Pool`: it brings its own runtime and has no driver
+    /// to pump alongside the work, because the runtime pumps its own completion
+    /// port from inside `block_on`.
+    Compio(Compio),
 }
 
 /// Builds one backend, performing every one-off cost outside any timed region.
@@ -138,6 +145,12 @@ pub fn prepare(which: Which, config: &Config, job: &Job<'_>) -> Result<Prepared,
                 handle,
             })
         }
+        Which::Compio => Compio::new(pool, capacity)
+            .map(Prepared::Compio)
+            .map_err(|e| Unavailable {
+                name: "compio (IOCP)".to_owned(),
+                reason: e.to_string(),
+            }),
     }
 }
 
@@ -148,6 +161,7 @@ impl Prepared {
             Prepared::Pool(backend) => backend.name(),
             Prepared::Plain { backend, .. } => backend.name(),
             Prepared::Registered { backend, .. } => backend.name(),
+            Prepared::Compio(backend) => backend.name(),
         }
     }
 
@@ -157,6 +171,7 @@ impl Prepared {
             Prepared::Pool(backend) => backend.configuration(),
             Prepared::Plain { backend, .. } => backend.configuration(),
             Prepared::Registered { backend, .. } => backend.configuration(),
+            Prepared::Compio(backend) => backend.configuration(),
         }
     }
 
@@ -191,6 +206,7 @@ impl Prepared {
             Prepared::Pool(backend) => run_job(backend, job, weakness).await,
             Prepared::Plain { backend, .. } => run_job(backend, job, weakness).await,
             Prepared::Registered { backend, .. } => run_job(backend, job, weakness).await,
+            Prepared::Compio(backend) => run_job(backend, job, weakness).await,
         }?;
         outcome.submitted = match (before, self.submission_counts()) {
             (Some(before), Some(after)) => Some(SubmissionCounts {
@@ -206,7 +222,11 @@ impl Prepared {
     /// for a backend that has no ring.
     fn submission_counts(&self) -> Option<SubmissionCounts> {
         match self {
-            Prepared::Pool(_) => None,
+            // Not applicable, and deliberately not zero. Neither of these has a
+            // ring, so "how many submissions did the ring make" has no answer
+            // rather than the answer none — and a zero would render in the
+            // account as a measured figure instead of an absent one.
+            Prepared::Pool(_) | Prepared::Compio(_) => None,
             Prepared::Plain { handle, .. } | Prepared::Registered { handle, .. } => {
                 Some(handle.submission_counts())
             }
@@ -221,6 +241,7 @@ impl Prepared {
     pub fn block_on<T>(&self, f: impl Future<Output = T>) -> T {
         match self {
             Prepared::Pool(backend) => backend.block_on(f),
+            Prepared::Compio(backend) => backend.block_on(f),
             Prepared::Plain { driver, .. } | Prepared::Registered { driver, .. } => {
                 drive_while(driver, f)
             }
@@ -238,7 +259,7 @@ impl Prepared {
     /// [`Driver::drive`]'s "poll exactly one of these per driver" forbids.
     pub fn finish(self) -> io::Result<()> {
         match self {
-            Prepared::Pool(_) => Ok(()),
+            Prepared::Pool(_) | Prepared::Compio(_) => Ok(()),
             Prepared::Plain { driver, handle, .. }
             | Prepared::Registered { driver, handle, .. } => {
                 handle.shutdown_now();

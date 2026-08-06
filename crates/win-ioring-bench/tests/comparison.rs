@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use win_ioring_bench::account::{Budget, RUN_BUDGET};
 use win_ioring_bench::backend::Availability;
-use win_ioring_bench::backends::ioring;
+use win_ioring_bench::backends::{compio, ioring};
 use win_ioring_bench::concurrency::{Shape, predicted_mean_depth};
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
@@ -39,6 +39,35 @@ fn ring_available() -> bool {
     matches!(ioring::availability(), Availability::Available)
 }
 
+/// Whether compio can run here.
+///
+/// Probes exactly what preparation will do — build a `compio` runtime, which is
+/// what acquires the completion port.
+///
+/// **The false branch is defensive and effectively unreachable on this
+/// platform.** IOCP is not an optional Windows facility and the probe builds a
+/// `compio` runtime, which needs only the completion port, so this is expected
+/// to be true on every host that can build the crate at all. It guards against
+/// a future host, not against a build configuration: `compio` is a hard
+/// dependency with `fs` on unconditionally (`Cargo.toml`), so a build without
+/// it does not compile rather than reporting `Unavailable`. It is stated that
+/// way rather than presented as a tested condition, because an untestable
+/// branch described as tested is worse than an honest comment. The gate exists
+/// because without it compio would go *red* on a host where the ring backends
+/// merely go quiet, and that inconsistency would be introduced by this work.
+/// (`tests/fairness.rs` deliberately does the opposite and panics; that file's
+/// policy is to fail rather than skip, since a fairness check that quietly
+/// stops running is the thing it exists to prevent.)
+fn compio_available() -> bool {
+    matches!(compio::availability(), Availability::Available)
+}
+
+/// Whether this backend should be skipped on this host.
+fn unavailable_here(which: Which) -> bool {
+    (!ring_available() && which.builds_a_driver())
+        || (!compio_available() && which == Which::Compio)
+}
+
 /// FR-001: one shared piece of application logic runs against every backend,
 /// with no scenario code naming an implementation.
 ///
@@ -55,7 +84,7 @@ fn every_backend_runs_every_scenario() {
         let mut ledger = Ledger::new();
 
         for which in Which::all() {
-            if !ring_available() && which.builds_a_driver() {
+            if unavailable_here(which) {
                 continue;
             }
             let job = Job {
@@ -108,7 +137,7 @@ fn every_backend_runs_every_scenario() {
 /// rather than through a copy of that comparison written here.
 #[test]
 fn every_backend_does_the_same_work() {
-    if !ring_available() {
+    if !ring_available() || !compio_available() {
         return;
     }
     let config = Config::small();
@@ -570,7 +599,7 @@ fn each_scenario_drives_the_shape_it_declares() {
         let mut ledger = Ledger::new();
 
         for which in Which::all() {
-            if !ring_available() && which.builds_a_driver() {
+            if unavailable_here(which) {
                 continue;
             }
             let job = Job {
@@ -877,8 +906,8 @@ fn the_matrix_is_what_the_depth_lists_say_and_the_rotation_is_undisturbed() {
 /// **1.79 to 2.06 times the floor**, so the floor is not the constraint; twice
 /// the floor is. A matrix whose floor exceeds half the budget will overrun it in
 /// practice while still looking affordable on paper, which is exactly the
-/// mistake this check exists to prevent. At forty benchmarks the floor is 120
-/// seconds against a 150-second limit, leaving room for about two more
+/// mistake this check exists to prevent. At fifty benchmarks the floor is 150
+/// seconds against a 180-second limit, leaving room for about two more
 /// combinations before something has to be traded away.
 #[test]
 fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
@@ -897,8 +926,10 @@ fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
         floor <= limit,
         "{benchmarks} benchmarks have a floor of {floor:?} against a {limit:?} limit, which is \
          half the {RUN_BUDGET:?} budget; recorded runs cost 1.8x to 2.1x their floor, so this \
-         matrix would overrun the budget in practice. Drop a scenario or a depth rather than \
-         raising the budget"
+         matrix would overrun the budget in practice. The multiplier is measured and the limit \
+         derived from it, so neither is the thing to change. RUN_BUDGET was raised once, from \
+         300 to 360 seconds, to admit a fifth backend; raising it again should be a decision \
+         someone argues for in the same terms rather than the reflex when this fires"
     );
 }
 
@@ -911,7 +942,7 @@ fn the_matrix_fits_the_run_budget_with_room_for_what_criterion_adds() {
 /// of this test: at forty-eight benchmarks the floor is 144 seconds, still
 /// inside the limit, so only the count noticed.
 #[test]
-fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
+fn the_matrix_is_fifty_benchmarks_costing_two_and_a_half_minutes_of_floor() {
     let config = Config::default();
     let benchmarks: usize = Scenario::all()
         .iter()
@@ -919,12 +950,12 @@ fn the_matrix_is_forty_benchmarks_costing_two_minutes_of_floor() {
         .sum();
 
     assert_eq!(
-        benchmarks, 40,
-        "the matrix is ten combinations of four backends"
+        benchmarks, 50,
+        "the matrix is ten combinations of five backends"
     );
     assert_eq!(
         Budget::CHOSEN.floor(benchmarks),
-        Duration::from_secs(120),
-        "forty benchmarks at one second of warm-up and two of measurement"
+        Duration::from_secs(150),
+        "fifty benchmarks at one second of warm-up and two of measurement"
     );
 }

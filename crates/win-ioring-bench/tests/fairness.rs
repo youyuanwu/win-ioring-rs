@@ -13,7 +13,7 @@
 //! passing on.
 
 use win_ioring_bench::backend::Availability;
-use win_ioring_bench::backends::ioring;
+use win_ioring_bench::backends::{compio, ioring};
 use win_ioring_bench::concurrency::Depth;
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::{FairnessFailure, Ledger};
@@ -56,20 +56,57 @@ fn prepare(tag: &str, config: &Config) -> (std::path::PathBuf, std::path::PathBu
 /// than skipping them — a weakened-backend test that quietly did nothing would be
 /// worse than no test at all.
 ///
-/// **Only [`an_honest_matrix_agrees`] walks the whole list.** The weakening tests
-/// take fixed positions from it, so on every host — ring or not — they weaken
-/// `tokio-pool-1` or `tokio-pool-512` and never a ring backend. The weakening is
-/// applied inside `harness::measure_combination`, which is backend-agnostic, so
-/// this establishes the rejection rather than any one backend's honesty; that the
-/// ring backends are honest is what the control case above establishes. The gap
-/// is recorded in `docs/pending-work.md`.
+/// **Only [`an_honest_matrix_agrees`] walks the whole list.** Five of the
+/// weakening tests take fixed positions from it, so on every host — ring or not
+/// — those five weaken `tokio-pool-1` or `tokio-pool-512` and never a ring
+/// backend. The weakening is applied inside `harness::measure_combination`,
+/// which is backend-agnostic, so this establishes the rejection rather than any
+/// one backend's honesty; that the ring backends are honest is what the control
+/// case above establishes. The two compio tests at the end of this file are the
+/// exception: they select their backend by identity, so they do weaken compio
+/// itself. The ring backends remain unweakened, and the gap is recorded in
+/// `docs/pending-work.md`.
 fn available() -> Vec<Which> {
     let mut backends = vec![Which::TokioOne, Which::TokioMany];
     if matches!(ioring::availability(), Availability::Available) {
         backends.push(Which::RingPlain);
         backends.push(Which::RingRegistered);
     }
+    // Appended last, and the position is load-bearing. The weakening tests below
+    // take fixed indices from this list — `backends[0]`, `backends[1]`,
+    // `available()[0]` — so inserting compio anywhere but the end would silently
+    // re-target them at a different backend and change what they establish
+    // without changing a line of their own source.
+    if matches!(compio::availability(), Availability::Available) {
+        backends.push(Which::Compio);
+    }
     backends
+}
+
+/// The compio backend, taken from [`available`] by identity.
+///
+/// By identity and never by index, for two reasons. Indices are what pins the
+/// tests above to the thread-pool backends, and compio's index is
+/// host-dependent — it sits at 2 on a host without an I/O ring and at 4 on one
+/// with, since `available()` only pushes the ring backends when the host has a
+/// ring. And sourcing it from `available()` rather than naming
+/// `Which::Compio` directly is what makes "remove compio from `available()`"
+/// a mutation the compio tests can fail: a test that named the variant itself
+/// would be decoupled from the list and would pass with compio absent from it,
+/// which is the reach this phase exists to establish.
+///
+/// This *panics* on a host without compio rather than skipping, which is the
+/// opposite of what `tests/comparison.rs` does for the same condition. Both are
+/// deliberate and the difference is the two files' standing policies, not an
+/// oversight: this file fails rather than skips (see the module doc above),
+/// because a fairness property that silently stops being checked is the failure
+/// it exists to prevent, while the comparison suite skips whatever the host
+/// cannot build so that a ring-less host still gets a green run.
+fn compio_backend() -> Which {
+    available()
+        .into_iter()
+        .find(|which| matches!(which, Which::Compio))
+        .expect("compio is available on this host")
 }
 
 /// Runs one combination through the measured path.
@@ -105,7 +142,7 @@ fn job<'a>(
 
 /// The control case: nothing weakened, so the ledger must agree throughout.
 ///
-/// Without it the three tests below would be satisfied by a comparator that
+/// Without it the seven tests below would be satisfied by a comparator that
 /// rejected everything.
 #[test]
 fn an_honest_matrix_agrees() {
@@ -160,10 +197,7 @@ fn a_backend_that_skips_work_fails_a_run() {
         let failure = run(backends[1], Weakness::SkipsWork, &config, &job, &mut ledger)
             .expect_err("a backend that skipped a quarter of its reads must be rejected");
         assert!(
-            matches!(
-                failure.mismatch,
-                Mismatch::DeliveredBytes { .. } | Mismatch::CompletionCount { .. }
-            ),
+            matches!(failure.mismatch, Mismatch::DeliveredBytes { .. }),
             "{} was rejected for the wrong reason: {failure}",
             scenario.name()
         );
@@ -239,9 +273,7 @@ fn a_weakened_backend_still_issues_the_same_operations() {
             assert!(
                 matches!(
                     mismatch,
-                    Mismatch::DeliveredBytes { .. }
-                        | Mismatch::Delivered { .. }
-                        | Mismatch::CompletionCount { .. }
+                    Mismatch::DeliveredBytes { .. } | Mismatch::Delivered { .. }
                 ),
                 "{weakness:?} on {} differed in the issue trace, not in delivery: {mismatch}",
                 scenario.name()
@@ -342,5 +374,113 @@ fn trace_of(which: Which, weakness: Weakness, config: &Config, job: &Job<'_>) ->
     match run(which, weakness, config, job, &mut ledger) {
         Ok(Record::Measured { trace, .. }) => trace,
         other => panic!("{weakness:?} did not produce a measurement: {other:?}"),
+    }
+}
+
+// The two tests below are the fairness machinery's reach over compio. Every
+// weakening test above this point takes a fixed index and so only ever weakens a
+// thread-pool backend; these two weaken compio itself, by identity.
+//
+// They are two tests and not one because the requirement names two checks — the
+// trace and the digest — and one weakening reaches only one of them. Which arm a
+// weakening lands on is decided by the comparison order in
+// `Trace::agrees_with`, where `delivered_bytes` is compared before the digest.
+//
+// # The three arms no backend-level weakening can reach
+//
+// `Mismatch::OperationCount`, `Mismatch::IssueOrder` and
+// `Mismatch::CompletionCount` are structurally unreachable from here, and that
+// is recorded rather than left as an apparent gap — an unexplained hole is what
+// gets closed later by weakening a check.
+//
+// The first two are unreachable because `Trace::issued` is pushed by the
+// *scenario*, with the offset and length the scenario chose, and nothing the
+// backend does can perturb it. (The scenario may open the file first —
+// `read_only` calls `open_read` at `scenario.rs:228` before its issue loop at
+// `:231` — but an open does not touch the trace, and the issue loop's shape is
+// fixed by `operations` and `offset_of`.) A weakened backend is handed the same
+// operations in the same order by construction, so neither the count nor the
+// order of issues can diverge.
+//
+// The third is unreachable because a skipped read still completes.
+// `Runner::run` awaits an outcome and then calls `trace.delivered(..)`
+// (`concurrency.rs:303-304`); the only path that skips the call is the `?` on
+// the line above, and an `Err` there propagates out and aborts the whole run
+// rather than shortening the trace. `SkipsWork` returns `Ok(0)`, never `Err`,
+// so the completion count is the same whether the backend did the work or
+// returned `Ok(0)` without doing it. That is also why the two existing
+// `SkipsWork` assertions no longer hedge with `CompletionCount` — that branch
+// was dead, and a hedge that cannot fire makes an assertion weaker than it
+// looks. `CompletionCount` is compared *before* `DeliveredBytes`
+// (`verify.rs:118` and `:127`), so had it been reachable it would have fired
+// first and the hedge would have been the branch that ran.
+
+/// A weakened compio backend fails a run on the delivered-byte count.
+///
+/// `SkipsWork` returns `Ok(0)` without reading for one index in four, starting
+/// at index 0 — so every scenario's read phase diverges, not just those long
+/// enough to reach a later multiple. Fewer bytes reach application-readable
+/// memory than the honest reference put there, and `delivered_bytes` is compared
+/// before the digest, so this lands on `DeliveredBytes` rather than `Delivered`.
+#[test]
+fn a_weakened_compio_backend_fails_on_the_delivered_byte_count() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("compio-skips", &config);
+
+    for scenario in Scenario::all() {
+        let job = job(scenario, &read_path, &write_path, &config);
+        let mut ledger = Ledger::new();
+
+        run(available()[0], Weakness::None, &config, &job, &mut ledger)
+            .unwrap_or_else(|f| panic!("the reference backend was rejected: {f}"));
+
+        let failure = run(
+            compio_backend(),
+            Weakness::SkipsWork,
+            &config,
+            &job,
+            &mut ledger,
+        )
+        .expect_err("a compio backend that skipped a quarter of its reads must be rejected");
+        assert!(
+            matches!(failure.mismatch, Mismatch::DeliveredBytes { .. }),
+            "{} was rejected for the wrong reason: {failure}",
+            scenario.name()
+        );
+    }
+}
+
+/// A weakened compio backend fails a run on the digest.
+///
+/// The subtler half, and the one the digest exists for: `HollowDelivery` reports
+/// full transfers and overwrites the buffer, so every count agrees and only the
+/// bytes differ. Nothing short of comparing what reached application-visible
+/// memory catches it — and this establishes that the comparison reaches compio's
+/// buffers and not only the thread-pool backends'.
+#[test]
+fn a_weakened_compio_backend_fails_on_the_digest() {
+    let config = Config::small();
+    let (read_path, write_path) = prepare("compio-hollow", &config);
+
+    for scenario in Scenario::all() {
+        let job = job(scenario, &read_path, &write_path, &config);
+        let mut ledger = Ledger::new();
+
+        run(available()[0], Weakness::None, &config, &job, &mut ledger)
+            .unwrap_or_else(|f| panic!("the reference backend was rejected: {f}"));
+
+        let failure = run(
+            compio_backend(),
+            Weakness::HollowDelivery,
+            &config,
+            &job,
+            &mut ledger,
+        )
+        .expect_err("a compio backend delivering nothing from the file must be rejected");
+        assert!(
+            matches!(failure.mismatch, Mismatch::Delivered { .. }),
+            "{} was rejected for the wrong reason: {failure}",
+            scenario.name()
+        );
     }
 }

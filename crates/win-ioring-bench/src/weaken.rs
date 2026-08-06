@@ -204,12 +204,12 @@ impl<B: Backend> Backend for Weakened<'_, B> {
         )
     }
 
-    fn open_read(&self, path: &Path) -> io::Result<Self::File> {
-        self.inner.open_read(path)
+    async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
+        self.inner.open_read(path).await
     }
 
-    fn open_write(&self, path: &Path) -> io::Result<Self::File> {
-        self.inner.open_write(path)
+    async fn open_write(&self, path: &Path) -> io::Result<Self::File> {
+        self.inner.open_write(path).await
     }
 
     fn take_buffer(&self, capacity: usize) -> io::Result<Self::Buf> {

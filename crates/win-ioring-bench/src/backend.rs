@@ -43,10 +43,23 @@ pub trait Backend {
     fn configuration(&self) -> String;
 
     /// Opens a file for reading.
-    fn open_read(&self, path: &std::path::Path) -> io::Result<Self::File>;
+    ///
+    /// Async because a completion-based backend may have no synchronous way to
+    /// open at all: its constructor may be async, with a raw-handle route that
+    /// would skip attaching the file to the completion port and so yield a file
+    /// whose operations never complete. A synchronous signature would force a
+    /// re-entrant `block_on` inside such a runtime's own `block_on`.
+    ///
+    /// The opens sit inside the timed region, and awaiting in place keeps them
+    /// there — nothing moves across that boundary. Open cost is charged to the
+    /// backend that pays it, which is what makes a difference in open cost a
+    /// result rather than a distortion.
+    fn open_read(&self, path: &std::path::Path) -> impl Future<Output = io::Result<Self::File>>;
 
     /// Opens a file for writing, creating or truncating it.
-    fn open_write(&self, path: &std::path::Path) -> io::Result<Self::File>;
+    ///
+    /// Async for the reason given on [`Backend::open_read`].
+    fn open_write(&self, path: &std::path::Path) -> impl Future<Output = io::Result<Self::File>>;
 
     /// Takes a buffer of at least `capacity` bytes from the backend's pool.
     ///

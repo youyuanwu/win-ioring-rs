@@ -142,13 +142,13 @@ impl Backend for TokioFs {
         )
     }
 
-    fn open_read(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         Ok(PoolFile(Arc::new(
             std::fs::OpenOptions::new().read(true).open(path)?,
         )))
     }
 
-    fn open_write(&self, path: &Path) -> io::Result<Self::File> {
+    async fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         Ok(PoolFile(Arc::new(
             std::fs::OpenOptions::new()
                 .write(true)
