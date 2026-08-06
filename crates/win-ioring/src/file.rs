@@ -154,12 +154,12 @@ impl File {
     /// ```
     ///
     /// Whether this function should set the flag itself is an open question,
-    /// recorded in `docs/pending-work.md`. It is not changed here because the
-    /// twenty `win-ioring` cells of the published matrix in
-    /// `docs/performance.md` were all measured through handles from this
-    /// function, and that matrix is a single-run artefact that is never patched
-    /// from a second run (`docs/performance.md:236-242`) — so re-measuring a
-    /// fifth of it means re-running all fifty.
+    /// which `docs/pending-work.md` will record with its cost. It is not
+    /// changed here because the twenty `win-ioring` cells of the fifty in the
+    /// published matrix (see "Full result" in `docs/performance.md`) were all
+    /// measured through handles from this function and from [`File::create`],
+    /// and that matrix is a single-run artefact that is never patched from a
+    /// second run — so re-measuring any part of it means re-running all fifty.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::open(path)?))
     }

@@ -18,15 +18,16 @@
 //! results**. The twenty `win-ioring` cells of the matrix in
 //! `docs/performance.md` were all measured through handles from
 //! `win_ioring::file::File::open` and `File::create`, and that matrix is a
-//! single-run artefact that is never patched from a second run
-//! (`docs/performance.md:236-242`), so setting the flag would force a full
+//! single-run artefact that is never patched from a second run (see "Full
+//! result" in `docs/performance.md`), so setting the flag would force a full
 //! re-run and republication of the whole table. That is deliberately out of
-//! scope; the question is recorded in `docs/pending-work.md` with its cost.
+//! scope; the question is scheduled to be recorded in `docs/pending-work.md`
+//! with its cost, by this feature's documentation phase.
 //!
 //! So the behaviour is *pinned* rather than changed. If someone later adds the
-//! flag — which is a reasonable thing to want, and the pending-work note invites
-//! it — this test fails and says why, instead of the change silently
-//! invalidating a published matrix that nothing else would notice.
+//! flag — which is a reasonable thing to want, and the pending-work note is
+//! meant to invite it — this test fails and says why, instead of the change
+//! silently invalidating a published matrix that nothing else would notice.
 //!
 //! Under a warm page cache the flag is expected to make no measurable
 //! difference, because a cached read returns synchronously after a memory copy
@@ -46,7 +47,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use win_ioring_bench::unbuffered_workload::{FILE_NO_INTERMEDIATE_BUFFERING, file_mode};
 
 /// `FILE_FLAG_OVERLAPPED`, from the same source the rest of the crate uses.
-use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+use windows::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
 
 /// The exact mode a synchronous, buffered handle reports.
 ///
@@ -99,12 +100,12 @@ fn file_open_produces_a_synchronous_handle() {
          \n\
          If FILE_FLAG_OVERLAPPED was just added: that is a defensible change — \
          the flag's absence is a real limitation, documented on File::open and \
-         recorded in docs/pending-work.md. But the twenty win-ioring cells of \
-         the published matrix in docs/performance.md were all measured through \
-         handles from this function, and that matrix is a single-run artefact \
-         that is never patched from a second run, so the whole table must be \
-         re-run and republished rather than merely re-read. Update this test \
-         as part of doing so."
+         tracked in docs/pending-work.md. But the twenty win-ioring cells of \
+         the fifty in the published matrix in docs/performance.md were all \
+         measured through handles from File::open and File::create, and that \
+         matrix is a single-run artefact that is never patched from a second \
+         run, so the whole table must be re-run and republished rather than \
+         merely re-read. Update this test as part of doing so."
     );
 }
 
@@ -164,7 +165,34 @@ fn an_adopted_overlapped_handle_is_not_synchronous() {
     );
 
     // Neither handle is unbuffered: this file was opened without
-    // FILE_FLAG_NO_BUFFERING, so the two axes are independent and the pin above
-    // is specifically about synchronicity.
+    // FILE_FLAG_NO_BUFFERING. Asserted as a difference between two live
+    // measurements rather than as `mode & K == 0`, which would hold for every
+    // K — including a wrong one — given that the mode above is already pinned
+    // to exactly zero. That masked form was instance six of the gate that
+    // cannot fail, and it sat in the file whose own header names the species:
+    // setting FILE_NO_INTERMEDIATE_BUFFERING to 0xFFFF_FFFF left all three
+    // tests passing.
+    let unbuffered = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0)
+        .open(scratch("compare.dat"))
+        .unwrap();
+    let unbuffered = win_ioring::file::File::from_std(unbuffered);
+    assert_eq!(
+        mode_of(&unbuffered) & FILE_NO_INTERMEDIATE_BUFFERING,
+        FILE_NO_INTERMEDIATE_BUFFERING,
+        "the no-buffering bit does not read back, so asserting its absence \
+         elsewhere in this file proves nothing"
+    );
     assert_eq!(mode_of(&file) & FILE_NO_INTERMEDIATE_BUFFERING, 0);
+
+    // The doctest on File::open hardcodes FILE_FLAG_OVERLAPPED as a literal,
+    // because rustdoc examples in `win-ioring` cannot name this crate's
+    // `windows` dependency. Nothing in that crate would catch the literal
+    // drifting, so it is pinned from here.
+    assert_eq!(
+        FILE_FLAG_OVERLAPPED.0, 0x4000_0000,
+        "the literal in File::open's doctest example no longer matches \
+         FILE_FLAG_OVERLAPPED"
+    );
 }
