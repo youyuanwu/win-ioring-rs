@@ -40,10 +40,16 @@
 //!
 //! # What CI covers here, and what it deliberately does not
 //!
-//! Every *code path* below is exercised by `cargo test` at small sizes: the
-//! aligned allocation, the unbuffered open, one real read per configuration,
-//! and the handle-count arithmetic. None of it asserts a duration, an
-//! ordering, or a ratio.
+//! Covered by `cargo test` at small sizes: the aligned allocation, the
+//! unbuffered open, one real read per configuration end to end, the flags each
+//! backend's `open_read` actually establishes, the handle-count arithmetic, and
+//! the open-cost measurement. None of it asserts a duration, an ordering, or a
+//! ratio against a wall clock.
+//!
+//! Not covered, and stated rather than implied: the write paths (this arm reads
+//! only, and every `open_write`/`write_at` returns the same refusal), the
+//! display names, and the buffer-return paths. These are reachable only from
+//! the opt-in bench target.
 //!
 //! That split is deliberate rather than an omission. **A flaky device-bound
 //! gate is worse than no gate, because it trains people to ignore failures** —
@@ -69,16 +75,55 @@ use windows::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVER
 use crate::aligned::AlignedBuf;
 use crate::backend::{Availability, Backend, OpResult};
 
-/// The flags every read handle in this arm is opened with.
+/// The flags the *completion-based* read handles in this arm are opened with.
 ///
 /// `FILE_FLAG_NO_BUFFERING` is the point of the arm. `FILE_FLAG_OVERLAPPED` is
 /// not optional decoration: without it the kernel serialises operations at the
 /// file object, so a backend submitting at depth 64 gets a depth of one. See
 /// the rustdoc on `win_ioring::file::File::open`, which does *not* set it, and
 /// `crates/win-ioring-bench/tests/open_mode.rs`, which pins that.
+///
+/// This is **not** what the thread-pool configurations use. See
+/// [`POOL_READ_FLAGS`].
 pub const READ_FLAGS: u32 = FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0;
 
+/// The flags the *thread-pool* read handles in this arm are opened with.
+///
+/// Unbuffered, and deliberately **synchronous** — no `FILE_FLAG_OVERLAPPED`.
+/// Two independent reasons, either of which alone would be sufficient:
+///
+/// 1. **It is the configuration under measurement.** Spec R3.3: the thread-pool
+///    backends use synchronous handles as they do today; that is not an
+///    oversight to be corrected. Handing them overlapped handles would quietly
+///    remove the file-object serialisation that `TokioPool512H1` exists to
+///    exhibit, and the finding that pool width is not the variable — handle
+///    count is — depends on that control being intact.
+/// 2. **`seek_read` is not usable on an overlapped handle under concurrency.**
+///    `std`'s positional read requires the operation to complete synchronously
+///    and calls `rtabort!` if the kernel returns `STATUS_PENDING`, because
+///    otherwise the kernel could write into a buffer whose stack frame is gone.
+///    On an overlapped handle a real device read *does* return `STATUS_PENDING`.
+///
+/// The second was measured, not reasoned about, because the first attempt to
+/// measure it was wrong in a way worth recording. Probe 8 ran sixty-four
+/// threads issuing `seek_read` against one handle:
+///
+/// | file | synchronous handle | overlapped handle |
+/// |------|--------------------|-------------------|
+/// | `set_len` only, no content written | survived | survived |
+/// | real content written and flushed   | survived | **aborted the process** |
+///
+/// The first row is the trap. A file extended with `set_len` has a valid data
+/// length of zero, so the filesystem serves reads from it as zeros without ever
+/// reaching the device — and a read that never reaches the device always
+/// completes synchronously. That experiment could not have failed, and it
+/// reported that the overlapped handle was fine.
+pub const POOL_READ_FLAGS: u32 = FILE_FLAG_NO_BUFFERING.0;
+
 /// Opens a file for unbuffered, overlapped reading.
+///
+/// For the completion-based configurations. The thread-pool configurations use
+/// [`open_unbuffered_synchronous`] instead.
 ///
 /// # Errors
 ///
@@ -87,6 +132,22 @@ pub fn open_unbuffered(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(READ_FLAGS)
+        .open(path)
+}
+
+/// Opens a file for unbuffered, *synchronous* reading.
+///
+/// For the thread-pool configurations. See [`POOL_READ_FLAGS`] for why they do
+/// not get an overlapped handle, and why using one would both change what is
+/// being measured and abort the process.
+///
+/// # Errors
+///
+/// If the file cannot be opened with those flags.
+pub fn open_unbuffered_synchronous(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(POOL_READ_FLAGS)
         .open(path)
 }
 
@@ -100,15 +161,22 @@ pub fn open_unbuffered(path: &Path) -> io::Result<std::fs::File> {
 /// should be able to see what the approach costs to set up as well as what it
 /// delivers per operation.
 ///
+/// Scope, stated because the asymmetry would otherwise run in this crate's
+/// favour: this measures **opens only**. It does not include `IoRing` and
+/// driver construction, buffer registration, or async runtime startup — all of
+/// which the completion-based configurations pay and the thread pool does not.
+/// So the figure understates the ring's setup cost and is fair to the
+/// competitor, not to this crate. Read it as a lower bound on setup, not a
+/// total.
+///
 /// # Errors
 ///
 /// If any handle cannot be opened.
 pub fn open_cost(config: Config, path: &Path, depth: usize) -> io::Result<std::time::Duration> {
     let n = config.handles(depth);
+    let open = config.opener();
     let start = std::time::Instant::now();
-    let handles = (0..n)
-        .map(|_| open_unbuffered(path))
-        .collect::<io::Result<Vec<_>>>()?;
+    let handles = (0..n).map(|_| open(path)).collect::<io::Result<Vec<_>>>()?;
     let elapsed = start.elapsed();
     drop(handles);
     Ok(elapsed)
@@ -119,8 +187,8 @@ pub fn open_cost(config: Config, path: &Path, depth: usize) -> io::Result<std::t
 /// Deliberately **not** `crate::harness::Which`. Sharing that enum would put
 /// this arm's variants into `slug()` and into the position-balance invariant
 /// that governs the published warm-cache matrix, and the Criterion baseline
-/// keys under `target/criterion/` are derived from those slugs. Three colliding
-/// names would silently overwrite the primary published result.
+/// keys under `target/criterion/` are derived from those slugs. A colliding
+/// name would silently overwrite the primary published result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Config {
     /// The ring with caller-owned aligned buffers.
@@ -203,6 +271,32 @@ impl Config {
             Config::TokioPool1 => Some(1),
             Config::TokioPool512H1 | Config::TokioPool512Hn => Some(512),
             _ => None,
+        }
+    }
+
+    /// The exact flags this configuration's read handles must be opened with.
+    ///
+    /// The completion-based configurations get [`READ_FLAGS`]; the thread-pool
+    /// configurations get [`POOL_READ_FLAGS`], which omits
+    /// `FILE_FLAG_OVERLAPPED`. See [`POOL_READ_FLAGS`] for the two reasons.
+    ///
+    /// This exists so the read-back test can bind each backend's *actual*
+    /// handle to a per-configuration expectation. Before it did, a backend
+    /// could be mutated to open plainly buffered and every test still passed.
+    pub fn read_flags(self) -> u32 {
+        match self {
+            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => POOL_READ_FLAGS,
+            _ => READ_FLAGS,
+        }
+    }
+
+    /// The opener this configuration's handles are established with.
+    fn opener(self) -> fn(&Path) -> io::Result<std::fs::File> {
+        match self {
+            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
+                open_unbuffered_synchronous
+            }
+            _ => open_unbuffered,
         }
     }
 
@@ -345,6 +439,9 @@ pub struct UnbufferedIoRingRegistered {
     driver: Option<win_ioring::runtime::Driver>,
     buffers: std::cell::RefCell<Option<win_ioring::runtime::RegisteredBuffers>>,
     free: std::cell::RefCell<Vec<u32>>,
+    /// The size each registered buffer was established with, so `take_buffer`
+    /// can refuse a read that would not fit rather than truncating it.
+    buffer_len: std::cell::Cell<usize>,
 }
 
 impl UnbufferedIoRingRegistered {
@@ -367,6 +464,7 @@ impl UnbufferedIoRingRegistered {
             driver: Some(driver),
             buffers: std::cell::RefCell::new(None),
             free: std::cell::RefCell::new(Vec::new()),
+            buffer_len: std::cell::Cell::new(0),
         })
     }
 
@@ -393,6 +491,7 @@ impl UnbufferedIoRingRegistered {
             win_ioring::runtime::Registered::Ok(collection) => {
                 *self.free.borrow_mut() = (0..count as u32).rev().collect();
                 *self.buffers.borrow_mut() = Some(collection);
+                self.buffer_len.set(capacity);
                 Ok(())
             }
             win_ioring::runtime::Registered::Failed(e, _) => Err(io::Error::other(e)),
@@ -422,7 +521,21 @@ impl Backend for UnbufferedIoRingRegistered {
         Err(unsupported_write())
     }
 
-    fn take_buffer(&self, _capacity: usize) -> io::Result<Self::Buf> {
+    fn take_buffer(&self, capacity: usize) -> io::Result<Self::Buf> {
+        // `capacity` is validated here rather than ignored. The registered
+        // buffers are fixed-size and established once by `register`, so an
+        // over-large read would silently truncate at the registration size
+        // instead of failing -- and a truncated read is faster than a complete
+        // one, which is the wrong direction for a benchmark to be wrong in.
+        if capacity > self.buffer_len.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a {capacity}-byte read exceeds the {}-byte registered buffer size",
+                    self.buffer_len.get()
+                ),
+            ));
+        }
         let index = self.free.borrow_mut().pop().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
         })?;
@@ -674,6 +787,14 @@ pub struct PoolFiles {
 }
 
 impl PoolFiles {
+    /// The handles this file set holds.
+    ///
+    /// Exists so tests can read the mode back off the handles the backend
+    /// really opened, rather than off a handle the test opened itself.
+    pub fn handles(&self) -> &[Arc<std::fs::File>] {
+        &self.handles
+    }
+
     fn pick(&self) -> Arc<std::fs::File> {
         let i = self.next.fetch_add(1, Ordering::Relaxed);
         Arc::clone(&self.handles[i % self.handles.len()])
@@ -764,8 +885,12 @@ impl Backend for UnbufferedTokioFs {
     }
 
     async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
+        // `open_unbuffered_synchronous`, never `open_unbuffered`: no
+        // `FILE_FLAG_OVERLAPPED`. This is the configuration under measurement
+        // (R3.3), and `seek_read` aborts the process on an overlapped handle.
+        // See `POOL_READ_FLAGS`.
         let handles = (0..self.handles)
-            .map(|_| open_unbuffered(path).map(Arc::new))
+            .map(|_| open_unbuffered_synchronous(path).map(Arc::new))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(PoolFiles {
             handles,
@@ -778,11 +903,26 @@ impl Backend for UnbufferedTokioFs {
     }
 
     fn take_buffer(&self, capacity: usize) -> io::Result<Self::Buf> {
+        // Fail loudly on exhaustion, exactly as the ring and compio do. An
+        // earlier version allocated a replacement here instead. That runs
+        // inside the timed region, so it would have charged the honest
+        // competitor a hidden per-operation `alloc_zeroed` that this crate's
+        // configurations never pay -- a silent cost, in this crate's favour,
+        // in the one configuration that beats it.
         let mut pool = self.buffers.lock().map_err(|_| poisoned())?;
-        match pool.pop() {
-            Some(buffer) if buffer.capacity() >= capacity => Ok(buffer),
-            Some(_) | None => AlignedBuf::new(capacity, self.align),
+        let buffer = pool.pop().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
+        })?;
+        if buffer.capacity() < capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a {capacity}-byte read needs a buffer of at least that capacity, not {}",
+                    buffer.capacity()
+                ),
+            ));
         }
+        Ok(buffer)
     }
 
     fn put_buffer(&self, buffer: Self::Buf) {
@@ -890,10 +1030,15 @@ mod tests {
     use super::*;
 
     /// Baseline keys under `target/criterion/` are derived from slugs, and the
-    /// warm-cache matrix is the project's primary published result. Three
-    /// colliding names would overwrite it silently — no test would notice and
-    /// no reader could tell from the output. So the disjointness is asserted
-    /// rather than maintained by convention.
+    /// warm-cache matrix is the project's primary published result. A colliding
+    /// name would overwrite it silently — no test would notice and no reader
+    /// could tell from the output. So the disjointness is asserted rather than
+    /// maintained by convention.
+    ///
+    /// No count of collisions is stated here. The unprefixed names this arm
+    /// would otherwise have used collide on two of the five warm slugs, not
+    /// three; an earlier version of this comment said three. The number is not
+    /// load-bearing and the assertion below enumerates rather than counts.
     #[test]
     fn slugs_do_not_collide_with_the_warm_cache_arm() {
         let warm: Vec<&str> = crate::harness::Which::all()
@@ -987,11 +1132,21 @@ mod tests {
 
     #[test]
     fn the_read_flags_carry_both_bits() {
+        // Neither constant may be zero. Without this, `X & 0 == 0` satisfies
+        // the mask assertions below and the test passes while proving nothing.
+        assert_ne!(FILE_FLAG_NO_BUFFERING.0, 0);
+        assert_ne!(FILE_FLAG_OVERLAPPED.0, 0);
         assert_eq!(
             READ_FLAGS & FILE_FLAG_NO_BUFFERING.0,
             FILE_FLAG_NO_BUFFERING.0
         );
         assert_eq!(READ_FLAGS & FILE_FLAG_OVERLAPPED.0, FILE_FLAG_OVERLAPPED.0);
+        // The pool's flags are unbuffered but deliberately NOT overlapped.
+        assert_eq!(
+            POOL_READ_FLAGS & FILE_FLAG_NO_BUFFERING.0,
+            FILE_FLAG_NO_BUFFERING.0
+        );
+        assert_eq!(POOL_READ_FLAGS & FILE_FLAG_OVERLAPPED.0, 0);
         assert_ne!(
             FILE_FLAG_NO_BUFFERING.0, FILE_FLAG_OVERLAPPED.0,
             "the two flags must be distinct bits, or the assertions above are \
@@ -1236,41 +1391,176 @@ mod tests {
         );
     }
 
-    /// Every handle this arm opens must read back as unbuffered *and* as
-    /// asynchronous. A synchronous handle serialises at the file object, so a
-    /// backend submitting at depth 64 would silently achieve a depth of one and
-    /// report a plausible, believable, wrong number.
+    /// Every handle **each backend actually opens** must read back with exactly
+    /// the flags its configuration promises.
+    ///
+    /// The point is the phrase "actually opens". An earlier version of this
+    /// test called the free function `open_unbuffered` and checked *its*
+    /// result, which proved only that the helper works — no backend's
+    /// `open_read` was bound to anything. Under that version, mutating
+    /// `UnbufferedIoRing::open_read` to a plainly buffered, synchronous
+    /// `std::fs::File::open` left the entire suite green. A buffered ring
+    /// handle reads from the page cache at warm-cache speed, so that mutation
+    /// would have manufactured exactly the ring victory this arm was built to
+    /// avoid manufacturing, and additionally poisoned the working file for
+    /// every later cell.
+    ///
+    /// Expectations differ by configuration and the test asserts the whole
+    /// mode word against `Config::read_flags`, not a mask: the completion-based
+    /// backends must be unbuffered *and* asynchronous, the thread-pool backends
+    /// unbuffered *and* synchronous (R3.3).
     #[test]
-    fn every_configuration_opens_a_handle_that_is_unbuffered_and_asynchronous() {
-        use crate::unbuffered_workload::{is_synchronous, is_unbuffered};
-
+    fn every_backend_opens_handles_with_exactly_its_configured_flags() {
         let fx = fixture("flag-readback");
-        let handle = open_unbuffered(fx.file.path().as_raw_path()).expect("an unbuffered open");
+        let path = fx.file.path();
+
+        for config in Config::all() {
+            let expect_sync = config.read_flags() & FILE_FLAG_OVERLAPPED.0 == 0;
+            let seen = backend_handle_modes(config, path).expect("the backend's handles");
+
+            assert!(
+                !seen.is_empty(),
+                "{}: no handle was inspected, so this test proved nothing",
+                config.slug()
+            );
+
+            for (i, (unbuffered, synchronous)) in seen.iter().copied().enumerate() {
+                assert!(
+                    unbuffered,
+                    "{} handle {i}: the backend opened a handle WITHOUT \
+                     FILE_NO_INTERMEDIATE_BUFFERING, so it reads from the page \
+                     cache and every figure it produces is a warm-cache figure \
+                     wearing an unbuffered label",
+                    config.slug()
+                );
+                assert_eq!(
+                    synchronous,
+                    expect_sync,
+                    "{} handle {i}: expected synchronous={expect_sync}. \
+                     A completion-based backend on a synchronous handle \
+                     silently collapses to depth one; a thread-pool backend on \
+                     an overlapped handle stops measuring the file-object \
+                     serialisation it exists to exhibit, and aborts the process \
+                     in `seek_read`",
+                    config.slug()
+                );
+            }
+        }
+    }
+
+    /// The open cost is measured, not assumed, and it really does scale with
+    /// the handle count.
+    ///
+    /// `open_cost` is the entire honesty mechanism for this arm's decision to
+    /// open outside the timed region, so a test of it that cannot fail would
+    /// leave that decision unguarded. An earlier version asserted only
+    /// `cost <= 60s` — unfalsifiable — and separately re-asserted
+    /// `Config::handles`, which tests the enum and not `open_cost`. Forcing
+    /// `open_cost`'s handle count to 1 left every target green.
+    #[test]
+    fn open_cost_scales_with_the_handle_count() {
+        let fx = fixture("open-cost");
+        let path = fx.file.path().as_raw_path();
+        const DEPTH: usize = 32;
+
+        // Take the best of a few repeats on each side. This is a ratio between
+        // two measurements on the same host in the same process, and the claim
+        // is 32x apart, so it does not need the arm's noise band -- but a
+        // single sample of a syscall can be preempted arbitrarily.
+        let best = |config: Config| {
+            (0..5)
+                .map(|_| open_cost(config, path, DEPTH).expect("an open"))
+                .min()
+                .expect("five samples")
+        };
+
+        let one = best(Config::IoRingPlain);
+        let many = best(Config::TokioPool512Hn);
+
+        assert_eq!(Config::IoRingPlain.handles(DEPTH), 1);
+        assert_eq!(Config::TokioPool512Hn.handles(DEPTH), DEPTH);
         assert!(
-            is_unbuffered(&handle).expect("a mode read-back"),
-            "the arm's read handles must carry FILE_NO_INTERMEDIATE_BUFFERING"
-        );
-        assert!(
-            !is_synchronous(&handle).expect("a mode read-back"),
-            "the arm's read handles must not be synchronous, or depth collapses \
-             to one and every figure in this arm is wrong by an order of \
-             magnitude"
+            many > one,
+            "opening {DEPTH} handles ({many:?}) must cost more than opening one \
+             ({one:?}); if it does not, `open_cost` is not counting handles and \
+             the separately-reported setup cost of the multi-handle \
+             configuration is understated"
         );
     }
 
-    /// The open cost is measured, not assumed — and it scales with the handle
-    /// count, which is the whole reason it is reported separately.
-    #[test]
-    fn open_cost_is_measured_per_handle_set() {
-        let fx = fixture("open-cost");
-        let path = fx.file.path().as_raw_path();
-        for config in Config::all() {
-            let cost = open_cost(config, path, 8).expect("an open");
-            // No duration assertion: this proves the measurement runs and is
-            // attributed to the right handle count, not what it costs here.
-            assert!(cost <= std::time::Duration::from_secs(60));
+    /// Collects `(unbuffered, synchronous)` for every handle a backend's
+    /// `open_read` actually established.
+    ///
+    /// The modes are read while the backend still owns its handles, so nothing
+    /// here has to borrow a handle past the backend's life.
+    fn backend_handle_modes(
+        config: Config,
+        path: &crate::unbuffered_workload::UnbufferedPath,
+    ) -> io::Result<Vec<(bool, bool)>> {
+        use crate::unbuffered_workload::{is_synchronous, is_unbuffered};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+        /// Reads the mode off a raw handle without taking ownership of it.
+        fn modes(raw: std::os::windows::io::RawHandle) -> io::Result<(bool, bool)> {
+            // SAFETY: `raw` is a live file handle owned by the backend. The
+            // `File` is wrapped in `ManuallyDrop` and never dropped, so the
+            // handle is not closed here and ownership stays with the backend.
+            let view = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw) });
+            Ok((is_unbuffered(&view)?, is_synchronous(&view)?))
         }
-        assert_eq!(Config::TokioPool512Hn.handles(8), 8);
+
+        let raw = path.as_raw_path();
+        Ok(match config {
+            Config::IoRingPlain => {
+                let mut backend = UnbufferedIoRing::new(4, 1, 4096, 4096)?;
+                let driver = backend.take_driver().expect("a driver");
+                let handle = backend.handle();
+                let seen = drive_while(&driver, async {
+                    let file = backend.open_read(raw).await?;
+                    modes(file.as_raw_handle().0)
+                })?;
+                handle.shutdown();
+                futures::executor::block_on(driver.drive());
+                vec![seen]
+            }
+            Config::IoRingRegistered => {
+                let mut backend = UnbufferedIoRingRegistered::new(4)?;
+                let driver = backend.take_driver().expect("a driver");
+                let handle = backend.handle();
+                let seen = drive_while(&driver, async {
+                    let file = backend.open_read(raw).await?;
+                    modes(file.as_raw_handle().0)
+                })?;
+                handle.shutdown();
+                futures::executor::block_on(driver.drive());
+                vec![seen]
+            }
+            Config::Compio => {
+                let backend = UnbufferedCompio::new(1, 4096, 4096)?;
+                let seen = backend.block_on(async {
+                    let file = backend.open_read(raw).await?;
+                    modes(file.as_raw_handle())
+                })?;
+                vec![seen]
+            }
+            Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
+                let backend = UnbufferedTokioFs::new(
+                    config.pool_width().expect("a pool width"),
+                    config.handles(4),
+                    1,
+                    4096,
+                    4096,
+                )?;
+                backend.block_on(async {
+                    let files = backend.open_read(raw).await?;
+                    files
+                        .handles()
+                        .iter()
+                        .map(|f| modes(f.as_raw_handle()))
+                        .collect::<io::Result<Vec<_>>>()
+                })?
+            }
+        })
     }
 
     /// Writes are refused rather than half-implemented, and the refusal is
