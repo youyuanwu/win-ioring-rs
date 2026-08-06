@@ -10,19 +10,21 @@ futures.workspace = true
 win-ioring.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 # `Win32_System_SystemInformation` for the available-physical-memory query the
-# report needs. `Win32_Storage_FileSystem` for the volume alignment query the
-# unbuffered arm cannot proceed without. The `Wdk_*` pair and `Win32_System_IO`
-# reach `NtQueryInformationFile`/`FileModeInformation`, which is the only way to
-# read back whether a handle really is unbuffered and really is overlapped —
+# report needs; `Wdk_Foundation`, `Wdk_Storage_FileSystem` and `Win32_System_IO`
+# to reach `NtQueryInformationFile`/`FileModeInformation`, which is the only way
+# to read back whether a handle really is unbuffered and really is overlapped —
 # `GetFileInformationByHandleEx` cannot report either.
 #
-# All declared here rather than widened into the workspace `windows` entry so
-# the features never enter `win-ioring`'s declared surface and a downstream
-# consumer never compiles them — the same reasoning as the `Win32_System_Pipes`
-# dev-dependency.
+# Declared here rather than widened into the workspace `windows` entry so they
+# never enter `win-ioring`'s declared surface and a downstream consumer never
+# compiles them — the same reasoning as the `Win32_System_Pipes` dev-dependency.
+#
+# `Win32_Storage_FileSystem` is deliberately *not* repeated here: the volume
+# alignment query needs it, but it is already enabled at
+# `[workspace.dependencies.windows]` in the root manifest, so naming it again
+# would be a no-op dressed up as a decision.
 windows = { workspace = true, features = [
     "Win32_System_SystemInformation",
-    "Win32_Storage_FileSystem",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_System_IO",

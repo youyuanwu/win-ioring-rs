@@ -48,7 +48,8 @@ impl AlignedBuf {
     ///
     /// # Errors
     ///
-    /// If `align` is not a power of two, or the allocation fails.
+    /// If `align` is not a power of two, if rounding `cap` up would overflow,
+    /// or if the allocation fails.
     pub fn new(cap: usize, align: usize) -> io::Result<Self> {
         if !align.is_power_of_two() {
             return Err(io::Error::new(
@@ -56,11 +57,27 @@ impl AlignedBuf {
                 format!("alignment {align} is not a power of two"),
             ));
         }
-        let cap = cap.max(align).div_ceil(align) * align;
+        // Checked, not merely rounded. An unchecked `div_ceil(align) * align`
+        // wraps to 0 for `cap` near `usize::MAX`, and `Layout::from_size_align`
+        // accepts a zero size — so the wrap would carry a *safe* caller all the
+        // way into `alloc_zeroed` with a zero-sized layout, which is undefined
+        // behaviour. The invariant the SAFETY comment below relies on has to be
+        // established here rather than assumed.
+        let cap = cap
+            .max(align)
+            .checked_next_multiple_of(align)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("rounding a capacity of {cap} up to a multiple of {align} overflows"),
+                )
+            })?;
         let layout = Layout::from_size_align(cap, align)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        // SAFETY: `layout` has non-zero size, since `cap >= align >= 1`.
+        // SAFETY: `layout` has non-zero size — `cap >= align >= 1` holds
+        // because `align` is a non-zero power of two and the rounding above is
+        // checked, so it cannot have wrapped.
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             return Err(io::Error::new(
@@ -169,5 +186,81 @@ impl Buffer for AlignedBuf {
         self.spare()[..src.len()].copy_from_slice(src);
         self.len = src.len();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The overflow path is unreachable through the benchmark's own call sites,
+    /// which is exactly why it needs a test: `AlignedBuf::new` is a safe public
+    /// function, so a caller that reaches it must get an error rather than
+    /// undefined behaviour. Before this was checked, the rounding wrapped to
+    /// zero and carried a safe caller into `alloc_zeroed` with a zero-sized
+    /// layout.
+    #[test]
+    fn an_overflowing_capacity_is_an_error_not_a_wrap() {
+        let err = AlignedBuf::new(usize::MAX, 4096)
+            .err()
+            .expect("a capacity that cannot be rounded up must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_non_power_of_two_alignment_is_rejected() {
+        assert!(AlignedBuf::new(4096, 0).is_err());
+        assert!(AlignedBuf::new(4096, 3).is_err());
+        assert!(AlignedBuf::new(4096, 4095).is_err());
+    }
+
+    #[test]
+    fn capacity_is_rounded_up_and_never_down() {
+        for (requested, align, expected) in [
+            (1usize, 4096usize, 4096usize),
+            (4096, 4096, 4096),
+            (4097, 4096, 8192),
+            (0, 512, 512),
+        ] {
+            let buf = AlignedBuf::new(requested, align).expect("allocation failed");
+            assert_eq!(buf.capacity(), expected);
+            assert!(buf.is_aligned());
+        }
+    }
+
+    #[test]
+    fn a_fresh_buffer_reports_no_delivered_bytes() {
+        let buf = AlignedBuf::new(4096, 4096).expect("allocation failed");
+        assert!(buf.filled().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "delivered length")]
+    fn a_length_past_the_capacity_panics_rather_than_aliasing() {
+        let mut buf = AlignedBuf::new(4096, 4096).expect("allocation failed");
+        buf.set_len(4097);
+    }
+
+    #[test]
+    fn fill_rejects_a_source_larger_than_the_buffer() {
+        let mut buf = AlignedBuf::new(4096, 4096).expect("allocation failed");
+        assert!(buf.fill(&vec![0u8; 4097]).is_err());
+        assert!(buf.fill(&vec![0u8; 4096]).is_ok());
+    }
+
+    #[test]
+    fn fill_then_bytes_round_trips() {
+        let mut buf = AlignedBuf::new(4096, 4096).expect("allocation failed");
+        buf.fill(b"the quick brown fox").expect("fill failed");
+        assert_eq!(buf.bytes(), b"the quick brown fox");
+    }
+
+    /// The allocation is zeroed so that a bug reading past the delivered length
+    /// sees zeros rather than whatever the allocator last held, which makes
+    /// such a bug reproducible instead of dependent on process history.
+    #[test]
+    fn the_allocation_starts_zeroed() {
+        let mut buf = AlignedBuf::new(4096, 4096).expect("allocation failed");
+        assert!(buf.spare().iter().all(|&b| b == 0));
     }
 }

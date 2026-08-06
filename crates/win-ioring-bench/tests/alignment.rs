@@ -51,12 +51,22 @@ fn the_host_reports_a_usable_alignment() {
     let alignment = Alignment::query(&path).expect("the volume alignment query failed");
 
     assert!(alignment.logical_sector.is_power_of_two());
-    assert!(alignment.physical_sector.is_power_of_two());
+    assert!(
+        alignment.physical_performance == 0 || alignment.physical_performance.is_power_of_two()
+    );
     assert!(alignment.granularity() >= alignment.logical_sector as usize);
-    assert!(alignment.granularity() >= alignment.physical_sector as usize);
+    assert!(alignment.granularity() >= alignment.physical_performance as usize);
+    assert!(alignment.granularity() >= alignment.alignment_requirement as usize);
 
     // R1.4: the figures are uninterpretable without this, so it must render.
-    assert!(alignment.describe().contains("logical sector"));
+    // Every source the host was asked, not only the one acted on: a reader on
+    // a different volume needs to see what this one reported.
+    for field in ["AlignmentRequirement", "LogicalBytesPerSector", "using"] {
+        assert!(
+            alignment.describe().contains(field),
+            "describe() omitted {field}"
+        );
+    }
 }
 
 #[test]
@@ -65,10 +75,10 @@ fn rounding_lands_on_legal_lengths() {
     let alignment = Alignment::query(&path).expect("the volume alignment query failed");
     let g = alignment.granularity();
 
-    assert_eq!(alignment.round_up(0), 0);
-    assert_eq!(alignment.round_up(1), g);
-    assert_eq!(alignment.round_up(g), g);
-    assert_eq!(alignment.round_up(g + 1), 2 * g);
+    assert_eq!(alignment.round_up(0).unwrap(), 0);
+    assert_eq!(alignment.round_up(1).unwrap(), g);
+    assert_eq!(alignment.round_up(g).unwrap(), g);
+    assert_eq!(alignment.round_up(g + 1).unwrap(), 2 * g);
 
     assert!(alignment.is_aligned(0));
     assert!(alignment.is_aligned(g as u64));
@@ -134,6 +144,11 @@ fn a_correctly_aligned_unbuffered_read_succeeds() {
         .read(buf.spare())
         .expect("a correctly aligned unbuffered read should succeed");
     assert_eq!(n, g, "expected a full sector, got {n}");
+    assert!(
+        buf.spare()[..n].iter().all(|&b| b == 0xAB),
+        "the bytes delivered are not the bytes the file was written with — a \
+         byte count alone would also pass if the read had landed elsewhere"
+    );
 }
 
 #[test]
@@ -156,21 +171,33 @@ fn a_misaligned_unbuffered_read_is_rejected() {
     let misaligned_base = file.read(&mut buf.spare()[1..1 + g]).is_err();
     let misaligned_len = file.read(&mut buf.spare()[..g - 1]).is_err();
 
-    if !misaligned_base && !misaligned_len {
-        // Not a pass. This host does not enforce what the arm is built around,
-        // so the control cannot run — say so rather than report success.
-        eprintln!(
-            "SKIPPED: this volume enforced neither a misaligned base nor a \
-             misaligned length at {g}-byte granularity, so the unbuffered \
-             alignment control cannot be exercised here. The measurement is \
-             unaffected; the guarantee this test provides is not available on \
-             this host."
-        );
+    if misaligned_base || misaligned_len {
         return;
     }
 
+    // Reaching here means this volume enforced neither violation, so the
+    // control could not be exercised. That must not be reported as a pass.
+    //
+    // `eprintln!` would not do: libtest captures stderr for passing tests, so
+    // the reason would be invisible in a default `cargo test` log and the run
+    // would show a green `ok` — which is precisely the "quietly passes where it
+    // cannot run" outcome this control exists to rule out. Worse, this is the
+    // same branch taken if `FILE_FLAG_NO_BUFFERING` were silently dropped by
+    // `custom_flags`, or if the alignment query returned a granularity nothing
+    // enforces. Every failure mode the control guards against funnels here.
+    //
+    // So it fails, and an operator on such a host acknowledges it explicitly.
+    let acknowledged = std::env::var_os("WIN_IORING_BENCH_ALIGNMENT_UNENFORCED").is_some();
     assert!(
-        misaligned_base || misaligned_len,
-        "at least one alignment violation must be rejected"
+        acknowledged,
+        "This volume rejected neither a misaligned base address nor a misaligned \
+         length at {g}-byte granularity, so the unbuffered alignment control could \
+         not be exercised. That is not a pass: the same branch is taken if \
+         FILE_FLAG_NO_BUFFERING is silently dropped or the queried granularity is \
+         enforced by nothing.\n\
+         If this host genuinely does not enforce unbuffered alignment, set \
+         WIN_IORING_BENCH_ALIGNMENT_UNENFORCED=1 to acknowledge that the guarantee \
+         this test provides is unavailable here. Measurements are unaffected; the \
+         check is not."
     );
 }
