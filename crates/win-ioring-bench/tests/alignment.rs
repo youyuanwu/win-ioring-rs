@@ -23,7 +23,7 @@
 //! indistinguishable from a test that was deleted.
 
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::fs::OpenOptionsExt;
 
 use win_ioring_bench::align::Alignment;
@@ -57,6 +57,14 @@ fn the_host_reports_a_usable_alignment() {
     assert!(alignment.granularity() >= alignment.logical_sector as usize);
     assert!(alignment.granularity() >= alignment.physical_performance as usize);
     assert!(alignment.granularity() >= alignment.alignment_requirement as usize);
+    // A non-power-of-two granularity would make `AlignedBuf` unconstructible and
+    // every offset computation suspect, so assert the property directly rather
+    // than leaning on `validate()` to have caught it upstream.
+    assert!(
+        alignment.granularity().is_power_of_two(),
+        "granularity {} is not a power of two",
+        alignment.granularity()
+    );
 
     // R1.4: the figures are uninterpretable without this, so it must render.
     // Every source the host was asked, not only the one acted on: a reader on
@@ -164,6 +172,20 @@ fn a_misaligned_unbuffered_read_is_rejected() {
         .expect("could not open unbuffered");
 
     let mut buf = AlignedBuf::new(4 * g, g).expect("could not allocate");
+
+    // Establish first that this handle can read at all. Without this, a handle
+    // broken for any unrelated reason would fail every read, and the control
+    // below would read those failures as evidence of alignment enforcement —
+    // passing while testing nothing. The control must distinguish "misaligned
+    // reads are rejected" from "reads are rejected".
+    let healthy = file.read(&mut buf.spare()[..g]).expect(
+        "an aligned read on this handle failed, so any rejection below \
+                 would be evidence of a broken handle rather than of alignment \
+                 enforcement",
+    );
+    assert_eq!(healthy, g, "expected a full sector from the aligned read");
+    file.seek(SeekFrom::Start(0))
+        .expect("could not rewind after the health check");
 
     // Two independent violations, either of which the host may or may not
     // enforce: a base address one byte off, and a length that is not a whole

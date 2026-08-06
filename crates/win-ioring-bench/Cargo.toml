@@ -78,7 +78,8 @@ harness = false
 # `comparison` above is reached by `cargo test` only because it is `bench = true`
 # by default, so its precedent does not transfer here. With `test = true` this
 # target is compiled, linted and smoke-run in test mode by CI, at the small
-# configuration, on every push. See `docs/testing.md`.
+# configuration, on every push. The same reasoning is recorded in
+# `docs/testing.md`, under the discussion of what `cargo test --benches` covers.
 [[bench]]
 name = "unbuffered"
 harness = false

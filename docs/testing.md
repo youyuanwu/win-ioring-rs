@@ -216,7 +216,7 @@ fails if any measured combination comes back **not timed**, which is what a time
 that stopped driving the closure would produce. Neither establishes that
 Criterion timed *that* closure; that rests on reading those ten lines.
 
-`cargo test --benches` runs the Criterion target in **test mode** — one iteration
+`cargo test --benches` runs the `comparison` Criterion target in **test mode** — one iteration
 per benchmark, against `Config::small()` and a working directory of its own — so
 `cargo test --workspace --all-targets` exercises preparation, warm-up,
 verification and teardown end to end for **thirty-five** combinations.
@@ -229,6 +229,18 @@ read was added, then twenty-eight; the path is the same one, but fifteen fewer
 combinations travel it.) The bench target detects test mode by
 Criterion's own rule rather than by testing for `--test` alone: a target that read
 it wrongly would build a 256 MiB working file inside the test suite.
+
+There are now **two** bench targets, and `--benches` does not reach both.
+`--benches` and `--all-targets` select bench targets by the manifest's `bench`
+flag, so they run `comparison` (which is `bench = true` by default) and skip
+`unbuffered` (which is `bench = false`, being opt-in). The unbuffered target is
+reached instead by its explicit `test = true`, which is what puts it in front of
+`cargo test`. That flag is load-bearing rather than decorative: `bench = false`
+on its own removes a target from *every* default command, including
+`cargo check --all-targets`, so a planted type error in it goes undetected and
+the target rots unnoticed while the build stays green. This was established by
+experiment, not inference, and the reasoning is recorded in full beside the
+stanza in `crates/win-ioring-bench/Cargo.toml`.
 
 The depths `Config::small()` resolves to are the ones with teeth. They are what
 every `cargo test` actually checks, so the closed-form depth predictions are
