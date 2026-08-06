@@ -72,29 +72,41 @@
 //! `Duration`s, asserting that opening 32 handles takes longer than opening 1.
 //! Nothing else in this module asserts a duration, an ordering, or a ratio
 //! against a wall clock, and nothing asserts throughput or a published figure.
-//! The exemption is narrow on purpose: the comparison is within one process,
-//! best-of-five, and the measured margin is about **10x** on this host (seven
-//! runs, 9.6x to 10.4x; an independent run on the same host saw 4.7x to 10.2x,
-//! its low end coming from a noisy single-open sample). Even the smallest
-//! observed margin leaves the assertion far from its boundary.
+//! The exemption is narrow on purpose: the comparison is within one process
+//! and best-of-five. The margin is not stable — across fifteen measurements
+//! (seven mine, eight an independent reviewer's) it ranged from **4.1x to
+//! 10.4x**, with roughly a third of runs landing in a 4–5x band and the rest
+//! near 10x. The spread comes entirely from the single-open side: `many` is
+//! consistently ~380–420 µs, while `one` varies from ~38 µs to ~120 µs
+//! depending on scheduling. Even the smallest observed margin, 4.1x, is far
+//! from the `many > one` boundary the test actually asserts.
 //!
-//! An earlier revision of this comment claimed the margin was "~32x". That
-//! figure was never measured — it was inferred from the handle count, 32. The
-//! per-handle cost falls sharply with count (one open ~39 µs, thirty-two ~400
-//! µs, so ~12 µs each after the first), which is why the ratio is nowhere near
-//! the handle ratio. The claim was wrong in the direction that made this gate
-//! look more robust than it is.
+//! Two earlier revisions of this sentence overstated that robustness. The
+//! first claimed "~32x", a figure never measured — it was inferred from the
+//! handle count, 32. The per-handle cost falls sharply after the first open
+//! (one ~39 µs, thirty-two ~400 µs, so ~12 µs each thereafter), so the ratio
+//! was never going to approach the handle ratio. The second replaced it with
+//! "about 10x, 9.6x to 10.4x" and a parenthetical low of 4.7x — a range that a
+//! third of subsequent runs fell outside, and a floor below the true minimum.
+//! Both errors ran in the direction that made this gate look sturdier than it
+//! is, which is the direction this work has erred in repeatedly. The
+//! distribution is given above rather than a range, because a range is what
+//! concealed the tail both times.
 //!
 //! The guard is kept rather than dropped because without it the fix that made
 //! `open_cost` count handles has no cover at all. A flaky device-bound gate
 //! would be worse than no gate, since it teaches people to ignore failures; a
-//! within-process comparison with a 4.7x worst observed margin is not that.
+//! within-process comparison with a 4.1x worst observed margin is not that.
 //!
-//! Not covered, and stated rather than implied: `write_at`. It is unreachable
-//! in practice — every configuration's `open_write` refuses first, so nothing
-//! can obtain the file handle `write_at` would need — which is why no test
-//! drives it. It is not reachable from the opt-in bench target either; this
-//! arm reads only.
+//! Not covered, and stated rather than implied: `write_at`. The reason is that
+//! nothing calls it — this arm reads only, and the opt-in bench target
+//! references neither it nor `open_write`. It is *not* unreachable in the type
+//! system: `write_at` takes the same `&Self::File` that `open_read` returns, so
+//! a caller holding a read handle could call it. An earlier revision of this
+//! comment claimed the `open_write` refusals made it unobtainable, which is
+//! mechanically false. Its body is an unconditional refusal in all six
+//! configurations, so nothing is at risk either way — but the reason given for
+//! not testing it should be the true one.
 //!
 //! That split is deliberate rather than an omission. **A flaky device-bound
 //! gate is worse than no gate, because it trains people to ignore failures** —
@@ -624,14 +636,34 @@ impl Backend for UnbufferedIoRingRegistered {
         let index = self.free.borrow_mut().pop().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "the pool holds no free buffer")
         })?;
+        // From here on the index is off the free list, so every failure path
+        // must put it back. Dropping it would shrink the pool permanently and
+        // the rest of the measurement would run at lower concurrency than it
+        // was configured for. The other three pools had the same defect on
+        // their over-capacity paths; this is the fourth.
+        //
+        // NOT COVERED BY A TEST, and stated rather than left to look covered.
+        // Both failure paths below are unreachable from a unit test. The
+        // `buffers`-unset path cannot be reached because `buffer_len` is 0
+        // before `register`, so the capacity check above fires first for any
+        // non-zero read. The `check_out` path fails only on shutdown or a
+        // superseded registration, which imply the run is already collapsing.
+        // An attempt to test the first path was written and then removed: it
+        // passed with this put-back deleted, because it was re-testing the
+        // capacity guard and never reached the free list at all.
+        let put_back = || self.free.borrow_mut().push(index);
         let borrowed = self.buffers.borrow();
-        let collection = borrowed.as_ref().ok_or_else(|| {
-            io::Error::new(
+        let Some(collection) = borrowed.as_ref() else {
+            put_back();
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "buffers were taken before `register` established them",
-            )
-        })?;
-        collection.check_out(index).map_err(io::Error::other)
+            ));
+        };
+        collection.check_out(index).map_err(|e| {
+            put_back();
+            io::Error::other(e)
+        })
     }
 
     fn put_buffer(&self, buffer: Self::Buf) {
