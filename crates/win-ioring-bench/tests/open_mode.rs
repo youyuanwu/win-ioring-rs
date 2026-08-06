@@ -53,11 +53,12 @@ use windows::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVER
 ///
 /// Asserted as a whole value rather than only as a masked bit. Masking against
 /// `FILE_SYNCHRONOUS_IO_NONALERT` and comparing to that same constant is
-/// satisfied by *any* value of the constant, including zero — `mode & 0 == 0`
-/// holds for every handle in existence. That is the fourth instance in this
-/// work of a check that cannot distinguish "the guard held" from "the guard
-/// never ran", so these tests pin the literal values the host actually reports
-/// and the constant is left to document rather than to decide.
+/// satisfied whenever the constant's bits are a subset of the mode, and
+/// unconditionally when it is zero — `mode & 0 == 0` holds for every handle in
+/// existence. That is the fourth instance in this work of a check that cannot
+/// distinguish "the guard held" from "the guard never ran", so these tests pin
+/// the literal values the host actually reports and the constant is left to
+/// document rather than to decide.
 const MODE_SYNCHRONOUS: u32 = 0x0000_0020;
 
 /// The exact mode an overlapped, buffered handle reports.
@@ -100,12 +101,13 @@ fn file_open_produces_a_synchronous_handle() {
          \n\
          If FILE_FLAG_OVERLAPPED was just added: that is a defensible change — \
          the flag's absence is a real limitation, documented on File::open and \
-         tracked in docs/pending-work.md. But the twenty win-ioring cells of \
-         the fifty in the published matrix in docs/performance.md were all \
-         measured through handles from File::open and File::create, and that \
-         matrix is a single-run artefact that is never patched from a second \
-         run, so the whole table must be re-run and republished rather than \
-         merely re-read. Update this test as part of doing so."
+         due to be recorded in docs/pending-work.md by this feature's \
+         documentation phase. But the twenty win-ioring cells of the fifty in \
+         the published matrix in docs/performance.md were all measured through \
+         handles from File::open and File::create, and that matrix is a \
+         single-run artefact that is never patched from a second run, so the \
+         whole table must be re-run and republished rather than merely \
+         re-read. Update this test as part of doing so."
     );
 }
 
@@ -165,13 +167,17 @@ fn an_adopted_overlapped_handle_is_not_synchronous() {
     );
 
     // Neither handle is unbuffered: this file was opened without
-    // FILE_FLAG_NO_BUFFERING. Asserted as a difference between two live
-    // measurements rather than as `mode & K == 0`, which would hold for every
-    // K — including a wrong one — given that the mode above is already pinned
-    // to exactly zero. That masked form was instance six of the gate that
-    // cannot fail, and it sat in the file whose own header names the species:
-    // setting FILE_NO_INTERMEDIATE_BUFFERING to 0xFFFF_FFFF left all three
-    // tests passing.
+    // FILE_FLAG_NO_BUFFERING. The bare `mode & K == 0` below proves nothing on
+    // its own — the mode above is already pinned to exactly zero, so it holds
+    // for every K — which is what made it instance six of the gate that cannot
+    // fail, in the file whose own header names the species: setting
+    // FILE_NO_INTERMEDIATE_BUFFERING to 0xFFFF_FFFF left all three tests
+    // passing. It is kept only behind the positive read-back below, which
+    // establishes that the constant names a bit a genuinely unbuffered handle
+    // actually reports. That guard still has a residue: it is itself masked, so
+    // K = 0 satisfies both assertions. The whole-value assertion in
+    // `unbuffered_workload`'s `the_three_open_modes_are_distinguishable` is
+    // what closes that case, and the crate suite fails if it is broken.
     let unbuffered = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0)

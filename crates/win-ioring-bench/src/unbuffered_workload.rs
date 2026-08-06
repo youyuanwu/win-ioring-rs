@@ -503,11 +503,13 @@ mod tests {
 
         // Synchronous: caps outstanding operations at one regardless of what
         // the caller submits. This is the defect Phase 3 documents.
-        // Asserted as whole values, not as masked bits. `mode & K == K` is
-        // satisfied by any K including zero, so a masked assertion cannot
-        // distinguish "the bit means what we think" from "the constant is
-        // wrong" — which is the same failure species as the gate that cannot
-        // fail, and it went unnoticed here once already.
+        // Asserted as whole values, not as masked bits. `mode & K == K` holds
+        // for K = 0 whatever the handle reports, and for any K whose bits are a
+        // subset of the mode, so a masked assertion cannot distinguish "the bit
+        // means what we think" from "the constant is wrong" — which is the same
+        // failure species as the gate that cannot fail, and it went unnoticed
+        // here once already. A whole-value assertion has no such hole: it fails
+        // for K = 0 as readily as for any other wrong K.
         let plain = std::fs::File::open(&path).unwrap();
         assert_eq!(
             file_mode(&plain).unwrap(),
