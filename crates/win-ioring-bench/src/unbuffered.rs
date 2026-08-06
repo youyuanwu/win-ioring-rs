@@ -57,13 +57,14 @@
 //!
 //! Covered by `cargo test` at small sizes: the aligned allocation, the
 //! unbuffered open, one real read per configuration end to end, the flags each
-//! backend's `open_read` actually establishes, the handle-count arithmetic, and
-//! the open-cost measurement. None of it asserts a duration, an ordering, or a
+//! backend's `open_read` actually establishes, each backend's real `open_write`
+//! refusal, buffer-pool exhaustion and over-capacity refusal in all four pools,
+//! the published configuration strings, the handle-count arithmetic, and the
+//! open-cost measurement. None of it asserts a duration, an ordering, or a
 //! ratio against a wall clock.
 //!
-//! Not covered, and stated rather than implied: the write paths (this arm reads
-//! only, and every `open_write`/`write_at` returns the same refusal), the
-//! display names, and the buffer-return paths. These are reachable only from
+//! Not covered, and stated rather than implied: `write_at`, which is
+//! unreachable because every `open_write` refuses first. Reachable only from
 //! the opt-in bench target.
 //!
 //! That split is deliberate rather than an omission. **A flaky device-bound
@@ -170,7 +171,8 @@ pub fn open_unbuffered_synchronous(path: &Path) -> io::Result<std::fs::File> {
 ///
 /// Reported beside the throughput rather than folded into it. This arm opens
 /// outside the timed region — see the module header for why keeping the
-/// buffered arms' convention would have manufactured a win — but the cost is
+/// buffered arms' convention would have biased the comparison in this crate's
+/// favour — but the cost is
 /// real and belongs in the record: sixty-four handles are not free, and a
 /// reader weighing the multi-handle approach against the ring's single handle
 /// should be able to see what the approach costs to set up as well as what it
@@ -1595,10 +1597,18 @@ mod tests {
         let fx = fixture("write-refusal");
         let path = fx.file.path();
 
-        let mut checked = 0usize;
+        // Collect a witness from each backend rather than counting loop
+        // iterations. An earlier version incremented a counter once per
+        // iteration and compared it to `Config::all().len()` — a tautology,
+        // and its failure message named a hazard it could not detect.
+        // Reintroducing the defect for three of the six configurations left it
+        // green. The witness is the backend's own `name()`, which only exists
+        // if a backend was actually constructed.
+        let mut witnesses = Vec::new();
         for config in Config::all() {
-            let e = backend_write_refusal(config, path)
-                .expect_err("this arm reads only; a backend that opens for writing is a defect");
+            let (name, e) = backend_write_refusal(config, path);
+            let e =
+                e.expect_err("this arm reads only; a backend that opens for writing is a defect");
             assert_eq!(
                 e.kind(),
                 io::ErrorKind::Unsupported,
@@ -1606,44 +1616,63 @@ mod tests {
                 config.slug(),
                 e.kind()
             );
-            checked += 1;
+            witnesses.push(name);
         }
+
+        // `Config::name()` is a template: the multi-handle configuration
+        // carries a literal `N handles`, which the constructed backend
+        // substitutes with its real count. Substituting here as well keeps the
+        // comparison a pin on "this config produced a backend naming itself
+        // per its own template" rather than weakening it to a length check.
+        // `handles(4)` mirrors what the helper above passes, so the two stay in
+        // step if the small-config size changes.
+        let mut expected: Vec<String> = Config::all()
+            .iter()
+            .map(|c| {
+                c.name()
+                    .replace("N handles", &format!("{} handles", c.handles(4)))
+            })
+            .collect();
+        expected.sort();
+        witnesses.sort();
         assert_eq!(
-            checked,
-            Config::all().len(),
-            "every configuration must be exercised, or this test proves less \
-             than its name claims"
+            witnesses, expected,
+            "every configuration must have had a backend constructed and its \
+             own `open_write` driven; a missing or duplicated name means some \
+             configuration was never exercised"
         );
     }
 
-    /// Drives one configuration's real `open_write` and returns its result.
+    /// Drives one configuration's real `open_write`, returning the backend's own
+    /// name as a witness that a backend was constructed at all.
     fn backend_write_refusal(
         config: Config,
         path: &crate::unbuffered_workload::UnbufferedPath,
-    ) -> io::Result<()> {
+    ) -> (String, io::Result<()>) {
         let raw = path.as_raw_path();
         match config {
             Config::IoRingPlain => {
-                let mut backend = UnbufferedIoRing::new(4, 1, 4096, 4096)?;
+                let mut backend = UnbufferedIoRing::new(4, 1, 4096, 4096).expect("a backend");
                 let driver = backend.take_driver().expect("a driver");
                 let handle = backend.handle();
                 let r = drive_while(&driver, async { backend.open_write(raw).await.map(|_| ()) });
                 handle.shutdown();
                 futures::executor::block_on(driver.drive());
-                r
+                (backend.name(), r)
             }
             Config::IoRingRegistered => {
-                let mut backend = UnbufferedIoRingRegistered::new(4)?;
+                let mut backend = UnbufferedIoRingRegistered::new(4).expect("a backend");
                 let driver = backend.take_driver().expect("a driver");
                 let handle = backend.handle();
                 let r = drive_while(&driver, async { backend.open_write(raw).await.map(|_| ()) });
                 handle.shutdown();
                 futures::executor::block_on(driver.drive());
-                r
+                (backend.name(), r)
             }
             Config::Compio => {
-                let backend = UnbufferedCompio::new(1, 4096, 4096)?;
-                backend.block_on(async { backend.open_write(raw).await.map(|_| ()) })
+                let backend = UnbufferedCompio::new(1, 4096, 4096).expect("a backend");
+                let r = backend.block_on(async { backend.open_write(raw).await.map(|_| ()) });
+                (backend.name(), r)
             }
             Config::TokioPool1 | Config::TokioPool512H1 | Config::TokioPool512Hn => {
                 let backend = UnbufferedTokioFs::new(
@@ -1652,13 +1681,15 @@ mod tests {
                     1,
                     4096,
                     4096,
-                )?;
-                backend.block_on(async { backend.open_write(raw).await.map(|_| ()) })
+                )
+                .expect("a backend");
+                let r = backend.block_on(async { backend.open_write(raw).await.map(|_| ()) });
+                (backend.name(), r)
             }
         }
     }
 
-    /// The buffer pools fail loudly on exhaustion rather than quietly
+    /// All four buffer pools fail loudly on exhaustion rather than quietly
     /// allocating a replacement inside the timed region.
     ///
     /// This guards a correction that runs *against* this crate: the thread-pool
@@ -1666,6 +1697,12 @@ mod tests {
     /// charging the honest competitor a hidden per-operation cost the ring
     /// never pays. Without a test, restoring that behaviour left the suite
     /// green.
+    ///
+    /// An earlier version of this test said "the buffer pools" while exercising
+    /// two of the four, leaving the ring's own `take_aligned` path — where a
+    /// silent allocation would charge *this crate* — unguarded. All four are
+    /// covered now: an untested pool is an untested pool whichever way its
+    /// failure would bias the result.
     #[test]
     fn an_exhausted_buffer_pool_is_an_error_not_a_silent_allocation() {
         /// `expect_err` needs `Debug` on the success type; the buffers do not
@@ -1696,6 +1733,37 @@ mod tests {
         );
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
         drop(held);
+
+        // The ring's owned-buffer pool goes through `take_aligned`, a separate
+        // path. A silent allocation here would charge *this crate*, which is
+        // the safe direction, but an untested pool is an untested pool.
+        let ring = UnbufferedIoRing::new(4, 1, 4096, 4096).expect("a backend");
+        let held = ring.take_buffer(4096).expect("the pool's only buffer");
+        let e = err_or_panic(
+            ring.take_buffer(4096),
+            "an exhausted owned-buffer pool must refuse, not allocate",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        drop(held);
+
+        // And the registered pool, whose free list is indices rather than
+        // buffers.
+        let mut reg = UnbufferedIoRingRegistered::new(4).expect("a backend");
+        let driver = reg.take_driver().expect("a driver");
+        let handle = reg.handle();
+        let e = drive_while(&driver, async {
+            reg.register(1, 4096, 4096).await.expect("registration");
+            let held = reg.take_buffer(4096).expect("the pool's only buffer");
+            let e = err_or_panic(
+                reg.take_buffer(4096),
+                "an exhausted registered pool must refuse, not allocate",
+            );
+            drop(held);
+            e
+        });
+        handle.shutdown();
+        futures::executor::block_on(driver.drive());
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
     }
 
     /// A read larger than the buffer it was given is refused, not truncated.
@@ -1736,8 +1804,8 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// Each backend's published self-description must match the handles it
-    /// actually opens.
+    /// Each backend's published self-description must match the handle mode its
+    /// configuration declares.
     ///
     /// `configuration()` is printed into the report, so a wrong word here is a
     /// wrong statement in the published record rather than a private comment.
@@ -1745,8 +1813,21 @@ mod tests {
     /// for the whole of the phase in which it did — and kept doing so after the
     /// flags were split, because the split touched the opener and not the
     /// sentence about it.
+    ///
+    /// This compares the string against `Config::read_flags`, a declaration.
+    /// The binding to a *live* handle is
+    /// `every_backend_opens_handles_with_exactly_its_configured_flags`; the two
+    /// together pin string → declaration → handle.
     #[test]
-    fn each_backend_describes_the_handle_mode_it_actually_opens() {
+    fn each_backend_describes_the_handle_mode_it_declares() {
+        /// Whole-word match. `"asynchronous".contains("synchronous")` is true,
+        /// so a substring test would fail a backend that improved its string
+        /// to "overlapped (asynchronous) handle" — punishing a correction.
+        fn says(text: &str, word: &str) -> bool {
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w.eq_ignore_ascii_case(word))
+        }
+
         for config in Config::all() {
             let text = backend_configuration(config).expect("a backend");
             let expect_sync = config.read_flags() & FILE_FLAG_OVERLAPPED.0 == 0;
@@ -1756,18 +1837,18 @@ mod tests {
                 ("overlapped", "synchronous")
             };
             assert!(
-                text.contains(wanted),
+                says(&text, wanted),
                 "{}: the published configuration string must say \"{wanted}\": {text:?}",
                 config.slug()
             );
             assert!(
-                !text.contains(forbidden),
+                !says(&text, forbidden),
                 "{}: the published configuration string says \"{forbidden}\", \
                  which is the opposite of the handles this configuration opens: {text:?}",
                 config.slug()
             );
             assert!(
-                text.contains("unbuffered"),
+                says(&text, "unbuffered"),
                 "{}: the published configuration string must say \"unbuffered\": {text:?}",
                 config.slug()
             );
