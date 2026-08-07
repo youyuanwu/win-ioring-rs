@@ -554,6 +554,52 @@ Scrutinise a finding because it is surprising *or* because it is expected, not
 only because it is convenient.
 
 
+### Two rules where there should be one
+
+The handle-mode work found `docs/performance.md` applying **two different
+resolution rules** in the same revision. Backend-against-backend comparisons had
+to clear the −18%/+24% noise band *and* have disjoint intervals. Within-backend
+comparisons — one backend's rolling shape against its own batched shape, or its
+cost at depth 64 against depth 1 — were being settled by disjointness alone.
+
+Neither rule is unreasonable in isolation. The damage is that **the split was
+invisible and it did not fall neutrally.** In one revision:
+
+- this crate's shape comparison was published as **resolved** at −9.6%, on
+  disjoint intervals, under the looser rule;
+- compio's depth comparison was published as **unresolved** at −9.0%, on equally
+  disjoint intervals, under the stricter rule, four sections later.
+
+Same run, same kind of comparison, nearly the same magnitude, opposite verdicts —
+and the loose rule landed on the result that flattered this crate. Nobody chose
+that; it emerged from two locally-sensible rules meeting in one document.
+
+Worse, the loose rule certified a compio shape difference whose intervals were
+disjoint by **0.004 µs**. A rule that turns four-thousandths of a microsecond
+into a finding is not a resolution rule.
+
+The fix was to state one rule, apply it to every ratio the document resolves, and
+re-derive every affected claim under it. Four previously-published "resolved"
+shape results became unresolved. That is the correct outcome: the −18%/+24% band
+is wide enough to swallow every shape effect in that table, and the document now
+says so rather than reporting single-digit-percent differences as findings.
+
+**The generalisation.** When a document applies a criterion, check that it
+applies *the same* criterion everywhere, and check which direction the exceptions
+favour. A criterion with an undocumented exception is a degree of freedom, and
+degrees of freedom drift toward the flattering answer without anyone intending
+it. This is the same species as a threshold met exactly, and the same species as
+an analysis ordering that cannot be blind: the defect is not a wrong number, it
+is a choice left open that should have been closed.
+
+**A corollary, learned the hard way in the same session.** Re-deriving these
+verdicts with a *symmetric* ±18% band instead of the document's asymmetric
+−18%/+24% band "found" two extra resolved cells and nearly produced a correction
+to a set of figures that were right. When checking a published figure, re-read
+the rule from the document rather than reconstructing it from memory — an
+approximate rule generates confident, wrong corrections.
+
+
 ### Proving a wakeup cannot be lost
 
 The wakeup guarantee is the easiest thing in this crate to get subtly wrong and

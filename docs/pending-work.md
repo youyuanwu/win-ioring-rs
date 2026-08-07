@@ -310,7 +310,7 @@ question rather than by changing the answer. At depth 64 it batches 64.0 entries
 per submission — the same 256 entries over 4 submissions as the rolling
 sequential read, digit for digit — while reaching a mean depth of 32.5 against
 the rolling 56.1, so it is demonstrably a different shape that produces identical
-batching. Its timings sit inside the rolling band: 1.15x-1.28x against
+batching. Its timings sit inside the rolling band: 1.14x-1.28x against
 `tokio::fs`, where rolling sequential read at the same depth is 0.92x-1.61x.
 
 **What this leaves open.** The published figures still run the wrong way — this
@@ -318,8 +318,10 @@ crate wins at depth 1 and loses by a widening margin as depth rises — and the
 explanation this document previously offered for that, "paying close to one
 submission per operation", is now known to be false. The crate's central claimed
 advantage was already fully in effect in every figure ever published here, and it
-loses anyway. Nothing currently establishes why. Candidates worth measuring, none
-of them supported by evidence yet: single-threaded completion processing becoming
+loses anyway. Nothing currently establishes why. **One candidate has since been
+measured and eliminated** — handle mode; see the closed item below. Candidates
+worth measuring, none of them supported by evidence yet: single-threaded
+completion processing becoming
 the bottleneck where a 512-thread pool gains real parallelism; per-completion
 dequeue cost; the cache effects raised in the wake-path entries above. Picking
 one of these to write down without measuring it would repeat the mistake this
@@ -432,17 +434,21 @@ has been replaced by one. See
 **What was learned, and it was not what was predicted.**
 
 The change was made expecting it to narrow the crate's unexplained warm-cache
-loss against `tokio::fs` at pool width 1 — recorded here and in `performance.md`
-as 1.24x sequential and 1.40x random at depth 64, cause unknown. The prediction
-was registered before any number existed, quantified as a 0.24 and 0.40 reduction
-in those ratios, and **it was wrong**.
+loss against `tokio::fs` at pool width 1 — recorded, **at the time the prediction
+was registered**, as 1.24x sequential and 1.40x random at depth 64, cause unknown.
+(The re-run published in `performance.md` now reads that sequential cell at 1.30x
+with owned buffers; the prediction was made against the figures then in print, and
+those are the ones quoted here.) The prediction was registered before any number
+existed, quantified as a 0.24 and 0.40 reduction in those ratios, and **it was
+wrong**.
 
 A paired A/B, with both handle modes present in the same run as separate backend
 configurations, measured across two independent five-run sets — the second
 collected after the entire analysis was frozen — found **no effect of the
 predicted size in any of the eight cells**, and none of the four depth-1 negative
-controls flagged. The gap to `tokio::fs` reproduces at the published size on
-overlapped handles.
+controls flagged. The gap to `tokio::fs` reproduces in the arm on overlapped
+handles, at a similar size to the figures that motivated the prediction, though
+the arm's numbers are not directly comparable to matrix cells.
 
 Three things that buys, none of them a consolation:
 
@@ -457,10 +463,10 @@ Three things that buys, none of them a consolation:
   explain, because the matrix and the unbuffered arm now both use overlapped
   handles, and the reason the arm always had to is stated in both places.
 
-**What it does not buy.** The instrument resolves about 6% on the paired ratio at
+**What it does not buy.** The instrument resolves about 10% on the paired ratio at
 the median, so what is excluded is an effect of the *predicted magnitude*, not
-any effect at all. An effect of a few percent would not have been visible and is
-not ruled out. The open question at
+any effect at all. An effect of around 10% or less would not have been reliably
+visible and is not ruled out. The open question at
 [performance.md](performance.md#what-that-leaves-unexplained) remains open, with
 three candidates left.
 

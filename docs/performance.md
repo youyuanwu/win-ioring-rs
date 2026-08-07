@@ -70,7 +70,10 @@ its twelve non-baseline cells resolve in this run.
 
 **The sequential-read result at depth 1 is a change of *ranking* against what
 this document used to publish, and it is not claimed as an improvement in this
-crate.** The previous revision reported that cell at 1.90x — a loss. Nothing in
+crate.** The last revision published *before the harness changed* reported that
+cell at 1.90x — a loss. (It is two revisions back now, not one: the intervening
+revision already published the current ranking. The reference is kept because the
+1.90x figure is the one the ranking changed against.) Nothing in
 the crate changed between the two. What changed is the instrument, and the old
 number for that one cell is independently known to be unreliable: re-running the
 *unchanged* old harness twice, minutes apart, produced figures 35% and 75% higher
@@ -193,33 +196,38 @@ never registers a file, so every backend in the comparison passes an owned
 handle. Harmless to the measurement, since that makes all five alike, but the
 printed string is wrong; it is tracked in [pending-work.md](pending-work.md).
 
-**compio opens its files asynchronously, and that costs it about 32 µs per
+**compio opens its files asynchronously, and that costs it about 29 µs per
 open.** Every scenario opens inside the timed iteration, so this is a real
 fairness item rather than a curiosity, and it is measured in-tree rather than
-estimated. The run above recorded **std 14.0 µs (p90 14.9 µs) against compio
-45.9 µs (p90 82.3 µs)**, medians over 200 opens each — compio costs **3.3x, or
-31.9 µs more per open**. It is produced by `cargo bench -p win-ioring-bench` and
+estimated. The run above recorded **std 15.1 µs (p90 23.8 µs) against compio
+44.2 µs (p90 76.5 µs)**, medians over 200 opens each — compio costs **2.9x, or
+29.1 µs more per open**. It is produced by `cargo bench -p win-ioring-bench` and
 printed in the teardown section of `target/bench-data/fairness.md`. The probe can
 be exercised without a full run by `cargo bench -p win-ioring-bench -- --list`,
 which builds the whole working set and runs the preparation path
 (see [pending-work.md](pending-work.md)) — note that it **overwrites the
 account**, so do not run it against a run whose account you still need. The p90s
-are worth reading beside the medians: the syscall's sits about 1 µs above its
+are worth reading beside the medians: the syscall's sits about 9 µs above its
 median, the async open's at nearly twice its own — the cost is not merely larger,
 it is *variable* in a way the syscall is not.
 
-The quantity that matters is the **delta**, 31.9 µs, not compio's absolute
-45.9 µs: the other four backends also open a file, and only the difference is a
+The previous publication recorded 14.0 µs against 45.9 µs, a 3.3x ratio and a
+31.9 µs delta. Those are **historical** and are not the figures the shares below
+are computed from; the probe is re-measured by every run and this run's numbers
+are the ones used.
+
+The quantity that matters is the **delta**, 29.1 µs, not compio's absolute
+44.2 µs: the other four backends also open a file, and only the difference is a
 fairness question. Multiplied by the opens per iteration — **one** for the three
 read scenarios, **two** for write-then-read, which opens for the write and again
 for the read — it is this share of a depth-64 iteration:
 
 | scenario | opens | extra | iteration | share |
 | --- | --- | --- | --- | --- |
-| sequential read | 1 | 31.9 µs | 19.56 ms | **0.16%** |
-| random read | 1 | 31.9 µs | 5.00 ms | **0.64%** |
-| write then read | 2 | 63.8 µs | 42.75 ms | **0.15%** |
-| bulk read | 1 | 31.9 µs | 18.89 ms | **0.17%** |
+| sequential read | 1 | 29.1 µs | 18.11 ms | **0.16%** |
+| random read | 1 | 29.1 µs | 5.08 ms | **0.57%** |
+| write then read | 2 | 58.2 µs | 44.08 ms | **0.13%** |
+| bulk read | 1 | 29.1 µs | 18.48 ms | **0.16%** |
 
 **The direction is asymmetric, and that is the whole reason the figure matters.**
 The cost biases compio *slower*. So it is **conservative for any conclusion that
@@ -436,9 +444,19 @@ of the matrix are `tokio::fs` and compio, neither of which has a ring, and both
 report the figure as not applicable rather than as zero — and **three full runs
 produced bit-identical
 figures**, so this is not an average over noise. The fifty-benchmark run
-published above is a fourth, and it reproduced every figure in this table to the
-digit again, with a fifth backend in the matrix and nine of the ten combinations
-in a different backend order.
+published above is a **fifth** run of this table, and it reproduced every figure
+to the digit again — this time with all twenty ring cells re-measured on
+*overlapped* handles, which the previous four runs were not. That is the more
+interesting robustness check anyway: submission batching is a property of the
+ring's driver, and changing how the file object was opened did not perturb it by
+a single entry.
+
+An earlier revision of this sentence described this run as "a fourth, … with a
+fifth backend in the matrix and nine of the ten combinations in a different
+backend order". All three clauses were carried forward from the previous
+publication and are wrong for this run: it is the fifth, the fifth backend was
+already present in the fourth, and the rotation is deterministic over the same
+five backends so the order is **identical** to the previous run's, not different.
 
 The mechanism: the executor drains every ready completion in one pass before the
 driver submits again, so against a warm cache a rolling refill rebuilds the whole
@@ -472,54 +490,88 @@ divided by its 256 reads, not the time for the iteration:
 | batched | compio (IOCP) | [71.35, 72.20, 73.11] | 1.16x |
 
 Read by interval overlap within the run. A comparison is treated as **resolved**
-only when the intervals settle it; where it depends on a ratio between two
-backends, the null band is applied to that ratio as a **conservative proxy** —
-the band was measured on single-cell repeats, not on ratios, so using it this way
-can only under-claim, never over-claim. A comparison that does not clear both is
+only when the two intervals are disjoint **and** the ratio between the two
+midpoints clears the −18%/+24% null band. The band is applied to **every** ratio
+this document resolves — backend against backend, shape against shape, and depth
+against depth within a single backend. It was measured on single-cell repeats
+rather than on ratios, so using it this way is a **conservative proxy** that can
+only under-claim, never over-claim. A comparison that does not clear both tests is
 recorded as **unresolved** rather than reported as a direction.
 
-- **Reversed, and in the flattering direction, so read it carefully: this crate
-  now resolves as *faster* in the batched shape.** Owned buffers
-  [76.84, 79.91] against [70.13, 71.54], and registered [73.82, 75.78] against
-  [71.09, 72.14] — both disjoint, by 9.6% and 4.2% per I/O. **The previous three
-  runs all found the two shapes indistinguishable for this crate**, and this is
-  the first to separate them. Two reasons not to take it at face value. First,
-  the separation is driven mostly by the rolling/owned cell, which reads 1.30x
-  here against 1.24x in the previous run while its registered twin barely moved —
-  that is the cell moving, not the batched shape improving, and a single cell that
-  moves 0.06 in the relative is well inside what the repeat-run analysis above
-  says a relative is worth. Second, the two shapes differ in sustained depth as
-  well as in shape, so any difference between them mixes the two. **Treat this as
-  one run disagreeing with three, not as a finding.** It is recorded because
-  suppressing a result that favours this crate would be the same error as
-  suppressing one that does not.
-- **Resolved for the fourth time: `tokio::fs` is slower in the batched shape.**
+An earlier revision of this document applied the band only to backend-against-
+backend ratios and let disjointness alone settle within-backend ones. That is not
+a defensible split, and it did not fall neutrally: it made this crate's shape
+comparison "resolve" at −9.6% while compio's depth comparison, at −9.0% and
+equally disjoint, was published as unresolved four sections later. The looser rule
+landed on the favourable result and the stricter on the unfavourable one. The rule
+above is the uniform one, and the bullets below are stated under it.
+
+- **Unresolved, and it would have been reported as a finding under a looser rule:
+  this crate is faster in the batched shape by point estimate, in both buffer
+  modes.** Owned buffers [76.84, 79.91] against [70.13, 71.54], and registered
+  [73.82, 75.78] against [71.09, 72.14]. Both pairs are disjoint, but the ratios
+  are −9.6% and −4.2%, well inside the −18% band, so **neither resolves** and no
+  direction is claimed from either. **The previous three runs all found the two
+  shapes indistinguishable for this crate**, and under the uniform rule this run
+  agrees with them.
+
+  Two drafts of this bullet got this wrong in the same direction. The first
+  reported the separation as resolved and explained it away as "the rolling/owned
+  cell moving, not the batched shape improving" — a decomposition the log
+  contradicts: rolling/owned rose 74.40 → 78.29 (+3.89) but batched/owned *fell*
+  74.11 → 70.80 (−3.31), and for registered buffers rolling barely moved
+  (75.16 → 74.77) while batched fell 74.77 → 71.60 (−3.17), so the batched cells
+  are what moved. The second kept "resolves" and dropped the bad explanation. Both
+  drafts left a favourable claim standing on disjointness alone, which is the
+  looser of the two rules this document was applying. Under the uniform rule the
+  claim does not stand at all, and the point estimates are reported here only as
+  point estimates.
+
+  What is worth noting without claiming: the batched movement is consistent in
+  sign across both buffer modes, and both batched `tokio::fs` cells moved the
+  other way (61.11 → 61.98 and 65.98 → 67.50). That is a pattern to watch in the
+  next run, not a result from this one. The two shapes also differ in sustained
+  depth as well as in shape, so any difference between them mixes the two.
+- **Unresolved under the uniform rule, though the direction has now appeared four
+  times: `tokio::fs` is slower in the batched shape by point estimate.**
   [59.96, 60.71] against [61.36, 62.61] — disjoint, and disjoint in all three
   earlier runs too ([61.66, 62.33] against [66.53, 68.24], and
-  [66.34, 67.78] against [70.90, 72.94]). **The direction has now reproduced four
-  times; the magnitude has not.** The one-thread pool paid about 8% more per I/O
-  in the first two runs, about 1.7% in the third and **2.7%** in this one. Take
-  the direction, not the size. The 512-thread pool is with it at 6.0%.
-- **Reversed, and on the thinnest possible margin: compio is now *slower* in the
-  batched shape.** [70.18, 71.35] against [71.35, 73.11], about 2.1% per I/O. The
-  previous run resolved this in the opposite direction, at about 3.4% faster
-  batched. The intervals here are disjoint by **0.004 µs** — they touch to four
-  decimal places — so this clears the resolution bar by an amount that no reader
-  should weight. Two runs disagreeing, one of them marginal, is no direction at
-  all. The async-open cost does **not** confound it — both shapes issue 256 I/Os
-  per iteration behind one open, so the per-open cost is identical on both rows
-  and cancels in the comparison.
+  [66.34, 67.78] against [70.90, 72.94]). But the magnitude is **2.7%** per I/O
+  this run, against about 8% in the first two and 1.7% in the third, and none of
+  those clears the −18% band. **The direction has reproduced four times; no single
+  run resolves it.** That is a weaker statement than the previous revision made and
+  a more accurate one: four consistent point estimates are suggestive, and
+  suggestive is what they are. The 512-thread pool is with it at 6.0%, also
+  unresolved.
+- **Unresolved, and it was never anything else: compio's shape difference.**
+  [70.18, 71.35] against [71.35, 73.11], about 2.1% per I/O — nominally in the
+  opposite direction to the previous run's 3.4%. The intervals are disjoint by
+  **0.004 µs**, touching to four decimal places, which is why a disjointness-only
+  rule was the wrong rule: it certified a difference of two-thousandths of a
+  percent of separation as a finding. Under the band it is unresolved, as is the
+  previous run's opposite result. Two runs disagreeing, both inside the band, is
+  no direction at all. For the record, the async-open cost does **not** confound
+  it — both shapes issue 256 I/Os per iteration behind one open, so the per-open
+  cost is identical on both rows and cancels in the comparison.
+
+  Taken together, these bullets say something about the instrument rather than
+  about the code: **the −18%/+24% band is wide enough to swallow every shape
+  effect in this table.** Rolling against batched is a single-digit-percent
+  comparison across the board, and this document's noise band cannot see
+  single-digit percentages. Anyone wanting to resolve shape effects needs a
+  tighter instrument — the paired within-run design used for the handle-mode arm
+  below is one, and it resolves about 10%.
 - **Unresolved, still: whether the gap between this crate and `tokio::fs`
   narrows.** Within this run the ratio is smaller in the batched shape for both
   buffer modes — 1.30x against 1.14x owned, 1.24x against 1.16x registered — which
   is a larger apparent narrowing than any previous run showed. It is still not a
-  result, for the reason in the first bullet: the rolling/owned cell is the one
-  that moved, and across four runs bulk read at depth 64 has run 1.14x to 1.28x
-  while rolling sequential read has run 0.92x to 1.61x — ranges that overlap
-  heavily. The narrowing is what a run shows; it is not a result. What the
-  interval evidence does support is only the statements above, and none of them is
-  a claim that this crate closes the gap. It does not: every ring cell in the
-  table is slower than every `tokio::fs` cell.
+  result: across four runs bulk read at depth 64 has run 1.14x to 1.28x while
+  rolling sequential read has run 0.92x to 1.61x — ranges that overlap heavily —
+  and the shape-versus-depth confound applies here in full. The narrowing is what
+  a run shows; it is not a result. And under the uniform rule none of the bullets
+  above resolves either, so there is no interval evidence here for any shape
+  effect in either direction. What the table does show without needing a rule:
+  every ring cell in it is slower than every `tokio::fs` cell.
 
 **These two shapes are not directly comparable to each other.** Rolling and
 batched sustain different depths by construction — 56.1 against 32.5 — so a
@@ -673,9 +725,11 @@ the instrument rather than the code.
 
 **Resolved, and stated because the data resolves it: compio beats `tokio::fs` at
 depth 1 on random read** — 0.40x, the largest advantage any backend achieves over
-`tokio::fs` anywhere in the matrix. Sequential read at depth 1 is 0.82x and sits
-exactly on the band's −18% edge, so it does not resolve and no direction is
-claimed from it; the previous run had it at 0.81x and just inside. It is reported
+`tokio::fs` anywhere in the matrix. Sequential read at depth 1 is 0.8225x, which
+is inside the −18% band by a quarter of a percentage point, so it does not resolve
+and no direction is claimed from it; the previous run had it at 0.81x and just
+outside. Two runs on either side of a band edge is the clearest possible signal
+that the cell is at the instrument's limit, not that it changed. It is reported
 here rather than left to the table because enumerating only the losses would be a
 one-sided reading of a result that cuts both ways.
 
@@ -687,9 +741,13 @@ comparisons at depth 8 and depth 64 are unresolved — sequential read 1.00x,
 any of them, and none is needed: two implementations that share no kernel
 interface, no submission mechanism and no buffer-handling strategy land inside
 each other's noise at every depth where this crate loses. **This is the second
-independent run to find it**, on a matrix where this crate's twenty cells were
-re-measured on overlapped handles in between — so it is not an artefact of the
-two having shared a handle mode, because they no longer differ in one.
+independent run to find it**, and the two runs differ in exactly the way that
+matters: in the previous run the two backends **differed** in handle mode (the
+ring synchronous, compio overlapped), and in this one they **share** it. The
+finding survives both configurations, which is a stronger statement than either
+run could make alone — it is not an artefact of the handle-mode difference,
+because it held when there was one, and it is not an artefact of the two having
+been aligned, because it held when they were not.
 
 ### Does compio's per-I/O cost fall with depth?
 
@@ -708,7 +766,9 @@ as depth rises. It does so on one scenario of three:
 **None of the three clears the −18% band this run**, against one of three in the
 previous one. Random read falls visibly and does not clear it — its intervals are
 disjoint ([10.69, 11.13] against [9.73, 10.12]) but the fall is 9.0%, half the
-band. Write-then-read, which was the one scenario that resolved last time at
+band. This is the same test that the shape bullets above now fail, applied the
+same way: disjoint but inside the band is unresolved, whoever it favours.
+Write-then-read, which was the one scenario that resolved last time at
 −23.7%, reads −1.8% here on overlapping intervals; its previous appearance rested
 on the widest depth-1 interval in the matrix, the same cell flagged above as
 having given three answers in three runs.
@@ -911,16 +971,25 @@ test rather than by a preference.
 This is the limit the conclusion rests on, and it belongs beside the conclusion
 rather than in a footnote.
 
-The paired statistic's 95% interval has a **median half-width of about 6% on the
+The paired statistic's 95% interval has a **median half-width of about 10% on the
 ratio**, ranging from 0.9% in the best cell to 27.6% in the worst of the
 confirmatory set (118.6% in the worst pilot cell). Per-cell within-run spread has
 a median of 13.3% and a p90 of 24.5%.
 
+The twelve confirmatory half-widths, in percent, are 0.95, 4.40, 4.50, 4.85,
+5.90, 6.00, 9.90, 9.90, 10.65, 12.50, 24.05 and 27.60. They are listed because a
+draft of this section published the median as "about 6%", which is the sixth of
+twelve — the lower of the two middle values, and a convention used nowhere else in
+this analysis. The mean of the two middle values is 7.95% and the convention the
+analysis scripts use throughout gives 9.90%. **The error made the instrument look
+sharper than it is, which is the flattering direction**, and it is recorded rather
+than silently corrected.
+
 So: **what is excluded is an effect of the predicted magnitude — 0.24 and 0.40 —
-not any effect at all.** An effect of a few percent would not be visible here and
-is not ruled out. Every statement of this result should carry that distinction,
-and the distinction is why the outcome is "the predicted mechanism does not
-explain the loss" rather than "handle mode does nothing".
+not any effect at all.** An effect of around 10% or less would not be reliably
+visible here and is not ruled out. Every statement of this result should carry
+that distinction, and the distinction is why the outcome is "the predicted
+mechanism does not explain the loss" rather than "handle mode does nothing".
 
 ### The transient, and the rule that did not catch it
 
@@ -964,11 +1033,15 @@ Three things follow, and none of them is a consolation prize.
   can take. It is not "we failed to find an effect"; it is "an effect of the size
   we predicted is not there".
 
-The gap itself reproduces in the arm, on overlapped handles, at the size this
-document publishes: 1.24x sequential and 1.52x random at depth 64 with owned
-buffers. The loss is real, it is not handle mode, and at depth 1 the crate is
-still ahead — 0.57x to 0.83x across the four control cells — so whatever the
-cause is, it appears as depth rises and is unchanged by how the file was opened.
+The gap itself reproduces in the arm, on overlapped handles: 1.24x sequential and
+1.52x random at depth 64 with owned buffers. Those are **not** the matrix's
+figures for the same cells — the matrix reads 1.30x and 1.40x — and they are not
+supposed to be, for the reasons given above about comparability. What reproduces
+is the loss's existence, its direction and its rough size, measured on a handle
+mode the previous matrix never used. The loss is real, it is not handle mode, and
+at depth 1 the crate is still ahead — 0.57x to 0.83x across the four control
+cells — so whatever the cause is, it appears as depth rises and is unchanged by
+how the file was opened.
 
 ### Why the default changed anyway
 
