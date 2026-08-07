@@ -86,5 +86,21 @@ harness = false
 bench = false
 test = true
 
+# The handle-mode arm, opt-in, for the same reasons as `unbuffered` above and
+# with the same load-bearing `test = true` — see that block for why deleting it
+# as redundant would remove this target from CI entirely.
+#
+# It is out of a bare `cargo bench` because it deliberately measures a
+# configuration nobody should choose: `win-ioring` opening synchronous handles.
+# Its figures are also not comparable to the matrix above, because it opens
+# outside the timed region and runs its own flat depth set. Running it is a
+# deliberate act:
+# `cargo bench -p win-ioring-bench --bench handle-mode`.
+[[bench]]
+name = "handle-mode"
+harness = false
+bench = false
+test = true
+
 [lints]
 workspace = true

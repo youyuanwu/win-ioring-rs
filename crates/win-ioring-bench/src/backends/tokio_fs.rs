@@ -88,6 +88,20 @@ impl BufferPool {
 /// `Arc` because each operation moves a reference onto a pool thread.
 pub struct PoolFile(Arc<std::fs::File>);
 
+impl std::os::windows::io::AsRawHandle for PoolFile {
+    /// Exposed so the `handle-mode` arm can read this file's mode back off the
+    /// kernel.
+    ///
+    /// That check has a specific job here. `docs/performance.md` discloses that
+    /// `tokio::fs` opens through `std` and therefore gets a **synchronous**
+    /// handle, unlike `compio` and unlike this crate after the overlapped
+    /// default. The disclosure was an argument from how `std` opens files; with
+    /// this it is a fact the run confirms every time it executes.
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.0.as_raw_handle()
+    }
+}
+
 /// The thread-pool-backed backend, parameterised by blocking-pool width.
 pub struct TokioFs {
     runtime: tokio::runtime::Runtime,

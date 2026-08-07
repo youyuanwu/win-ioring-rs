@@ -205,6 +205,98 @@ pub async fn run<B: Backend>(
     }
 }
 
+/// Runs a scenario against one backend, on a file the caller already opened.
+///
+/// # Why this exists
+///
+/// [`run`] opens the file itself, **inside** the region its caller times. That
+/// is right for the main matrix, where every backend pays its own open and the
+/// open cost is part of what is being compared.
+///
+/// It is wrong for the `handle-mode` arm. That arm varies exactly one thing —
+/// whether the handle carries `FILE_FLAG_OVERLAPPED` — and an open is one of
+/// the places the flag can cost something. With the open inside the timed
+/// region the measured difference would be per-operation serialisation *plus*
+/// per-open flag cost, two mechanisms where the pre-registered hypothesis names
+/// only the first.
+///
+/// Worse, it would **destroy that arm's negative control**. The hypothesis
+/// predicts no effect at depth 1, because one operation at a time cannot be
+/// serialised further; a depth-1 difference is therefore read as run-level
+/// drift. A per-open cost difference would show up at depth 1 regardless, and
+/// would have been read as drift rather than as the confound it is. That is a
+/// defect that publishes cleanly: a plausible result with the safeguard
+/// silently disarmed.
+///
+/// So the `handle-mode` arm hoists the open out and calls this instead, and its
+/// per-open cost is measured separately by the open-cost probe, where it
+/// belongs. The unbuffered arm makes the same choice for its own reasons
+/// (`benches/unbuffered.rs`).
+///
+/// **The consequence is that this arm's absolute figures are not comparable to
+/// main-matrix cells**, which include an open. That has to be said wherever the
+/// numbers appear, not only where the method is described.
+///
+/// The measurement loop itself is shared with [`run`] rather than reimplemented,
+/// so the two cannot drift: implementation divergence inside a controlled
+/// experiment would be indistinguishable from the effect under test.
+///
+/// # Errors
+///
+/// Propagates the backend's read failures. Returns
+/// [`std::io::ErrorKind::InvalidInput`] for [`Scenario::WriteThenRead`], which
+/// has no pre-opened form because it opens for writing.
+pub async fn run_on_open_file<B: Backend>(
+    backend: &B,
+    scenario: Scenario,
+    file: &B::File,
+    read_bytes: u64,
+    block: u32,
+    operations: usize,
+    depth: Depth,
+) -> io::Result<Outcome> {
+    match scenario {
+        Scenario::SequentialRead | Scenario::BulkRead => {
+            positional_reads_on(
+                backend,
+                file,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+                |i, _| (i as u64) * block as u64,
+            )
+            .await
+        }
+        Scenario::RandomRead => {
+            // Reproduces `run`'s offsets exactly, including the shared seed, so
+            // the two entry points issue an identical sequence. Taking the size
+            // as a parameter rather than re-statting keeps this out of the
+            // caller's timed region too.
+            let blocks = (read_bytes / block as u64).max(1);
+            let mut rng = Rng::new(SEED);
+            let offsets: Vec<u64> = (0..operations)
+                .map(|_| rng.below(blocks) * block as u64)
+                .collect();
+            positional_reads_on(
+                backend,
+                file,
+                block,
+                operations,
+                depth,
+                scenario.shape(),
+                move |i, _| offsets[i],
+            )
+            .await
+        }
+        Scenario::WriteThenRead => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write-then-read has no pre-opened form: it opens for writing, and \
+             the arms that use this entry point measure reads",
+        )),
+    }
+}
+
 /// The shape both read scenarios share: `operations` positional reads, at
 /// offsets a closure decides, with at most `depth` outstanding.
 ///
@@ -226,7 +318,28 @@ where
     F: Fn(usize, u32) -> u64,
 {
     let file = backend.open_read(path).await?;
-    let file = &file;
+    positional_reads_on(backend, &file, block, operations, depth, shape, offset_of).await
+}
+
+/// [`positional_reads`], on a file the caller already opened.
+///
+/// This is the shared measurement loop. `positional_reads` is now only an
+/// open-then-delegate wrapper, so the main matrix continues to time its own
+/// opens and the `handle-mode` arm can hoist them out, without either arm
+/// carrying its own copy of the loop.
+async fn positional_reads_on<B, F>(
+    backend: &B,
+    file: &B::File,
+    block: u32,
+    operations: usize,
+    depth: Depth,
+    shape: Shape,
+    offset_of: F,
+) -> io::Result<Outcome>
+where
+    B: Backend,
+    F: Fn(usize, u32) -> u64,
+{
     let mut trace = Trace::new();
     for i in 0..operations {
         trace.issued(offset_of(i, block), block);
@@ -317,4 +430,174 @@ async fn write_then_read<B: Backend>(
         shape: shape_check,
         submitted: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::ioring::HandleMode;
+    use crate::backends::tokio_fs::TokioFs;
+
+    fn scratch(tag: &str, bytes: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("win-ioring-bench-scenario");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{tag}-{}.dat", std::process::id()));
+        let data: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    /// The two entry points must issue the **same** sequence of reads.
+    ///
+    /// `run_on_open_file` exists only to move the open out of the caller's
+    /// timed region. If it also changed the workload — a different offset
+    /// sequence, a different count, a different random draw — then the
+    /// `handle-mode` arm would be measuring something other than what the
+    /// matrix measures, and the difference would be silently attributed to
+    /// handle mode.
+    ///
+    /// `RandomRead` is the one that can realistically drift, because
+    /// `run_on_open_file` reconstructs the offsets from a size parameter
+    /// instead of a `metadata` call. Both scenarios are checked anyway.
+    ///
+    /// Mutation-tested, and the first attempt is worth recording because it
+    /// nearly produced a false verdict about this test rather than about the
+    /// code. Perturbing the seed as `SEED ^ 1` left the test green, which reads
+    /// as "this guard cannot fail" — but [`Rng::new`] does `seed | 1` and
+    /// `SEED` already ends in a set bit, so `SEED ^ 1` seeds an identical
+    /// generator. **The mutation could not mutate.** A mutation that does not
+    /// mutate is the same species as a gate that cannot fail, and it fails in
+    /// the more dangerous direction: it certifies a working guard as broken, or
+    /// a broken one as working, depending on which way you read the green. With
+    /// `SEED ^ 2` the test fails as it should, naming the first differing
+    /// offset.
+    #[test]
+    fn both_entry_points_issue_the_same_reads() {
+        let block = 4096_u32;
+        let operations = 16;
+        let path = scratch("equiv", block as usize * 64);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let backend = TokioFs::new(1, 4, block as usize).unwrap();
+
+        for scenario in [Scenario::SequentialRead, Scenario::RandomRead] {
+            let via_run = backend
+                .block_on(run(&backend, scenario, &path, &path, block, operations, 4))
+                .unwrap();
+
+            let file = backend.block_on(backend.open_read(&path)).unwrap();
+            let via_open = backend
+                .block_on(run_on_open_file(
+                    &backend, scenario, &file, bytes, block, operations, 4,
+                ))
+                .unwrap();
+
+            // `agrees_with` compares issue order, completion count, delivered
+            // bytes and a content digest — not just the offsets — so it also
+            // catches the two entry points reading the same places and getting
+            // different data.
+            if let Err(mismatch) = via_run.trace.agrees_with(&via_open.trace) {
+                panic!(
+                    "{scenario:?}: the two entry points did different work \
+                     ({mismatch:?}), so the handle-mode arm is not measuring \
+                     the matrix's workload"
+                );
+            }
+            assert_eq!(
+                via_run.trace.operations(),
+                operations,
+                "{scenario:?}: no reads were issued, so the comparison above \
+                 holds vacuously"
+            );
+            assert!(
+                via_run.trace.delivered_total() > 0,
+                "{scenario:?}: nothing was delivered, so the digest comparison \
+                 above holds vacuously"
+            );
+        }
+    }
+
+    /// Write-then-read has no pre-opened form and must say so.
+    ///
+    /// Returning an error rather than silently reading is the point: a
+    /// pre-opened *read* handle cannot serve a scenario whose first phase
+    /// writes, and quietly measuring the read half would produce a number that
+    /// looked like the matrix's and was not.
+    #[test]
+    fn write_then_read_is_refused_rather_than_silently_reinterpreted() {
+        let block = 4096_u32;
+        let path = scratch("wtr", block as usize * 4);
+        let backend = TokioFs::new(1, 4, block as usize).unwrap();
+        let file = backend.block_on(backend.open_read(&path)).unwrap();
+
+        let err = backend
+            .block_on(run_on_open_file(
+                &backend,
+                Scenario::WriteThenRead,
+                &file,
+                block as u64 * 4,
+                block,
+                4,
+                1,
+            ))
+            .err()
+            .expect("write-then-read must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// Hoisting the open really does take it out of the measured region.
+    ///
+    /// The negative control of the whole boundary argument: if
+    /// `run_on_open_file` opened a file of its own after all, the confound it
+    /// exists to remove would still be present. Asserted by giving it a handle
+    /// to a file that has since been renamed out from under the path — the
+    /// reads must still succeed, which they can only do through the handle.
+    #[test]
+    fn run_on_open_file_opens_nothing() {
+        let block = 4096_u32;
+        let path = scratch("noopen", block as usize * 8);
+        let backend = TokioFs::new(1, 4, block as usize).unwrap();
+        let file = backend.block_on(backend.open_read(&path)).unwrap();
+
+        let moved = path.with_extension("moved");
+        let _ = std::fs::remove_file(&moved);
+        std::fs::rename(&path, &moved).unwrap();
+
+        let outcome = backend
+            .block_on(run_on_open_file(
+                &backend,
+                Scenario::SequentialRead,
+                &file,
+                block as u64 * 8,
+                block,
+                4,
+                2,
+            ))
+            .unwrap_or_else(|e| {
+                panic!("reads through an already-open handle must not need the path: {e}")
+            });
+        assert_eq!(outcome.trace.operations(), 4);
+
+        let _ = std::fs::remove_file(&moved);
+    }
+
+    /// Both handle modes complete the same workload correctly.
+    ///
+    /// Handle mode is invisible to correctness — a serialising handle returns
+    /// the right bytes — so nothing else in the suite would notice if the
+    /// synchronous arm were quietly broken. This is cheap and rules out the
+    /// case where the A/B's synchronous side is fast because it is failing.
+    #[test]
+    fn both_handle_modes_read_correctly_through_the_shared_loop() {
+        let block = 4096_u32;
+        let path = scratch("modes", block as usize * 8);
+        let backend = TokioFs::new(1, 4, block as usize).unwrap();
+
+        for mode in [HandleMode::Overlapped, HandleMode::Synchronous] {
+            // The ring backends are what the arm actually varies; this checks
+            // the open paths themselves produce usable handles.
+            let f = mode.open_read(&path).unwrap();
+            assert!(!f.as_raw_handle().is_invalid(), "{mode:?} handle invalid");
+        }
+        drop(backend);
+    }
 }

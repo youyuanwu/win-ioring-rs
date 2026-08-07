@@ -117,6 +117,38 @@ impl Which {
         }
     }
 
+    /// The handle mode the kernel should report for a file this backend opens.
+    ///
+    /// Distinct from [`Which::handle_mode`], which is an *input* to the ring
+    /// backends and says nothing about the others. This is the *output*: what
+    /// `NtQueryInformationFile` should say about the handle that comes back.
+    /// Two of these answers are claims this repository makes in prose, and
+    /// having them here turns each into something a run checks:
+    ///
+    /// - `compio` is [`HandleMode::Overlapped`] because `compio-fs`'s
+    ///   `OpenOptions` ORs `FILE_FLAG_OVERLAPPED` in unconditionally, and its
+    ///   `custom_flags` can only set flags, never clear them. That is the
+    ///   invariant this crate's overlapped default was modelled on.
+    /// - `tokio::fs` is [`HandleMode::Synchronous`] because it opens through
+    ///   `std`, which sets no such flag. This is the asymmetry
+    ///   `docs/performance.md` discloses rather than corrects — correcting it
+    ///   inside the handle-mode work would have confounded the variable the
+    ///   experiment is built around.
+    ///
+    /// A wrong answer here fails the run rather than skewing it, which is the
+    /// intent: the alternative is an A/B that quietly compares two identical
+    /// arms and reports a clean null.
+    pub fn expected_handle_mode(self) -> HandleMode {
+        match self {
+            Which::RingPlain | Which::RingRegistered | Which::Compio => HandleMode::Overlapped,
+            Which::RingPlainSync | Which::RingRegisteredSync => HandleMode::Synchronous,
+            // Every `tokio::fs` width, however wide the pool: the pool's width
+            // changes how many threads block on the handle, not how it was
+            // opened.
+            _ => HandleMode::Synchronous,
+        }
+    }
+
     /// The matrix backend this one shares everything but handle mode with.
     ///
     /// The pairing the A/B is computed over. Returns `self` for backends that
@@ -310,6 +342,70 @@ pub enum Record {
     },
 }
 
+/// Where the opens sit relative to the region the timer measures.
+///
+/// The published matrix opens **inside** it ([`Opens::PerIteration`]): every
+/// iteration opens the file it reads, and the per-open cost is part of what the
+/// matrix reports. That is a deliberate choice recorded on
+/// [`crate::backend::Backend::open_read`], and it is fair there because every
+/// backend in a (scenario, depth) pays the same open.
+///
+/// The `handle-mode` arm cannot inherit it. That arm's single variable is
+/// whether the handle carries `FILE_FLAG_OVERLAPPED`, and an open is one of the
+/// places that flag can itself cost something. With opens inside the timed
+/// region the measured delta would be *serialisation plus per-open flag cost*
+/// with no way to separate them — and worse, the depth-1 cell is that arm's
+/// negative control, where serialisation has nothing to serialise and the
+/// expected reading is "no difference". A per-open difference would show up
+/// there as an effect, and the arm's own drift check would have read it as
+/// run-level drift rather than as a confound. The control would have been
+/// silently disarmed while still appearing to pass, which is the failure mode
+/// this repository keeps finding: a clean, plausible, wrong result.
+///
+/// So that arm hoists its opens ([`Opens::Hoisted`]). The cost of hoisting is
+/// stated where its numbers appear, not only where its method is described: an
+/// arm that excludes opens is **not** comparable cell-for-cell with a matrix
+/// that includes them.
+///
+/// The next arm to be added faces this same choice, and the answer is not
+/// "copy whichever neighbour you read first". Hoist when the variable under
+/// test could change what an open costs, or when the configurations being
+/// compared hold different numbers of handles — the unbuffered arm hoists for
+/// that second reason. Keep opens inside when the arm is reporting the cost of
+/// the whole operation as a user would pay it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opens {
+    /// Each iteration opens the file it reads. What the published matrix does.
+    PerIteration,
+    /// The file is opened once, before the warm-up, and shared by every
+    /// iteration.
+    Hoisted,
+}
+
+/// Prepares one backend, warms it, times it, and puts its trace in front of the
+/// comparator.
+///
+/// Opens per iteration; see [`measure_combination_with`] for the general form
+/// and [`Opens`] for what that choice means.
+pub fn measure_combination(
+    which: Which,
+    weakness: Weakness,
+    config: &Config,
+    job: &Job<'_>,
+    ledger: &mut Ledger,
+    timer: &mut impl Timer,
+) -> Result<Record, FairnessFailure> {
+    measure_combination_with(
+        which,
+        weakness,
+        Opens::PerIteration,
+        config,
+        job,
+        ledger,
+        timer,
+    )
+}
+
 /// Prepares one backend, warms it, times it, and puts its trace in front of the
 /// comparator.
 ///
@@ -329,14 +425,32 @@ pub enum Record {
 /// function rather than by a copy of its comparison — which is the only way
 /// "a weakened backend fails a run" can be settled about the code a measurement
 /// actually runs.
-pub fn measure_combination(
+///
+/// `opens` decides whether the opens are timed. Both arms run through *this*
+/// function rather than through a copy of it: putting an implementation
+/// divergence inside a controlled experiment is how a difference between two
+/// measurement paths gets published as a difference between two handle modes.
+///
+/// # Panics
+///
+/// Panics if [`Opens::Hoisted`] is combined with a weakening. Hoisting exists
+/// for a single-variable experiment, and a weakened backend is a second
+/// variable; the combination has no legitimate caller, so it is a defect rather
+/// than a slow result.
+pub fn measure_combination_with(
     which: Which,
     weakness: Weakness,
+    opens: Opens,
     config: &Config,
     job: &Job<'_>,
     ledger: &mut Ledger,
     timer: &mut impl Timer,
 ) -> Result<Record, FairnessFailure> {
+    assert!(
+        !(opens == Opens::Hoisted && weakness != Weakness::None),
+        "hoisted opens exist for a single-variable experiment; weakening it \
+         adds a second variable"
+    );
     let prepared = match session::prepare(which, config, job) {
         Ok(prepared) => prepared,
         Err(unavailable) => {
@@ -349,12 +463,60 @@ pub fn measure_combination(
     let name = prepared.name();
     let configuration = prepared.configuration();
 
+    // Hoisted: the one open, before the warm-up and therefore before anything
+    // timed. A failure here is the backend's failure to open, reported the same
+    // way a failed warm-up would be.
+    let hoisted = match opens {
+        Opens::PerIteration => None,
+        Opens::Hoisted => match prepared.block_on(prepared.open_read(job.read_path)) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                let teardown = prepared.finish();
+                return Ok(Record::Failed {
+                    name,
+                    configuration,
+                    error: teardown.err().unwrap_or(error),
+                });
+            }
+        },
+    };
+
+    // The read-back. Everything above this line is the *intent* to open in a
+    // particular handle mode; this asks the kernel what it actually got.
+    //
+    // It exists because of what the failure would otherwise look like. If the
+    // synchronous configurations silently opened overlapped handles — a missing
+    // flag, a builder call dropped in a refactor, a `Which` arm widened to
+    // include the wrong variant — every A/B cell would compare a handle against
+    // an identical handle and the arm would report **no effect**, cleanly, at
+    // every depth, with every fairness and shape check passing. `docs/testing.md`
+    // records that this project under-scrutinises unflattering results, which
+    // makes a spurious null the cheapest error available here. So the null is
+    // made unavailable: a handle that is not what it claims aborts the run.
+    //
+    // A panic rather than a `Record::Failed` for the reason `Prepared::block_on`
+    // gives about its own: this is a defect, not a slow or failed measurement,
+    // and it must not be capable of being read as one.
+    //
+    // The matrix pays nothing for this. It runs `Opens::PerIteration`, where
+    // `hoisted` is `None` and neither the query nor the open it would inspect
+    // happens at all.
+    if let Some(file) = &hoisted {
+        verify_handle_mode(file.raw_handle(), which.expected_handle_mode(), &name);
+    }
+
     // One untimed warm-up: it pays for lazily created threads, first-touch page
     // faults, and anything else a backend defers until first use. A combination
     // whose warm-up could not run has nothing to time.
-    let warm = match prepared.block_on(prepared.one(job, weakness)) {
+    let warm = match prepared.block_on(async {
+        match &hoisted {
+            Some(file) => prepared.one_on(file, job).await,
+            None => prepared.one(job, weakness).await,
+        }
+    }) {
         Ok(outcome) => outcome,
         Err(error) => {
+            drop(hoisted);
             let teardown = prepared.finish();
             return Ok(Record::Failed {
                 name,
@@ -378,8 +540,13 @@ pub fn measure_combination(
         // single `Fut`.
         let prepared = &prepared;
         let evidence = &evidence;
+        let hoisted = &hoisted;
         timer.time(&benchmark, prepared, move || async move {
-            match prepared.one(job, weakness).await {
+            let result = match hoisted {
+                Some(file) => prepared.one_on(file, job).await,
+                None => prepared.one(job, weakness).await,
+            };
+            match result {
                 Ok(outcome) => evidence.borrow_mut().record(outcome),
                 Err(error) => evidence.borrow_mut().record_failure(error),
             }
@@ -387,7 +554,13 @@ pub fn measure_combination(
     }
     let evidence = evidence.into_inner();
 
+    // The hoisted file is closed before teardown, while the driver is still
+    // alive: a ring-backed file dropped after its driver has gone would have
+    // nothing left to complete a close against.
+    drop(hoisted);
+
     // Teardown happens before anything below can return, including the
+
     // comparator's rejection. A rejection that returned first would leave the
     // driver to be torn down by its own `Drop` in the middle of a caller's error
     // handling, which is the one path this design exists to keep off.
@@ -436,6 +609,62 @@ pub fn measure_combination(
         iterations: evidence.iterations,
         timed,
     })
+}
+
+/// Asks the kernel what handle mode a live handle actually has, and aborts if
+/// it is not `expected`.
+///
+/// See the call site for why this is a panic. The query itself is the same
+/// `NtQueryInformationFile(FileModeInformation)` the unbuffered arm uses; a
+/// query that cannot answer is treated as a failure rather than as agreement,
+/// because "could not tell" is not evidence that the experiment is sound.
+///
+/// Takes a raw handle rather than the [`session::PreparedFile`] the caller
+/// holds, so that a test can hand it handles it opened itself. A check that
+/// could only be reached through a fully prepared backend would be a check
+/// nothing could demonstrate failing.
+///
+/// # It is not redundant with the unit tests
+///
+/// This was checked rather than assumed. Replacing
+/// `.with_handle_mode(which.handle_mode())` in [`session::prepare`] with a
+/// hardcoded `HandleMode::Overlapped` — the shape a careless refactor of that
+/// wiring would take — leaves **all 122 library unit tests passing**, including
+/// the ones that assert the two modes really produce different handles and that
+/// each `Which` maps to the right mode. Every one of those tests is about a
+/// piece in isolation; none of them covers the wiring that connects the pieces,
+/// and the result is an A/B whose two arms are the same handle.
+///
+/// Under that mutation this check fails, in the integration test and in the
+/// bench target's own CI smoke run. It is the only thing that does.
+fn verify_handle_mode(raw: std::os::windows::io::RawHandle, expected: HandleMode, name: &str) {
+    use std::os::windows::io::FromRawHandle;
+
+    // SAFETY: the caller guarantees `raw` is a live file handle it owns. The
+    // wrapper is in a `ManuallyDrop` and never dropped, so the handle is not
+    // closed here and ownership stays with the caller.
+    let view = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw) });
+    let synchronous = crate::unbuffered_workload::is_synchronous(&view).unwrap_or_else(|error| {
+        panic!(
+            "HANDLE MODE UNVERIFIABLE for {name}: could not read the handle's \
+             mode ({error}). This arm's only variable is the handle mode, so a \
+             mode that cannot be confirmed leaves the measurement unable to \
+             mean anything; it is not evidence that the mode is correct."
+        )
+    });
+    let actual = if synchronous {
+        HandleMode::Synchronous
+    } else {
+        HandleMode::Overlapped
+    };
+    assert!(
+        actual == expected,
+        "HANDLE MODE MISMATCH for {name}: expected {expected:?}, the kernel \
+         reports {actual:?}. If this is one of the ring configurations, every \
+         A/B cell would compare a handle against an identical handle and report \
+         no effect — a clean null that is an artefact of this defect rather than \
+         a measurement."
+    );
 }
 
 /// A timer that runs a fixed number of iterations and times nothing.
@@ -715,6 +944,127 @@ mod tests {
             7,
             "every_variant has changed size; update this count deliberately, \
              and check the uniqueness test still covers what it should"
+        );
+    }
+
+    /// Opens a file in one handle mode and returns it plus its path.
+    ///
+    /// `std::fs` deliberately, not this crate's `File`: the point is to produce
+    /// a handle whose mode is known independently of anything under test.
+    fn open_in(mode: HandleMode, name: &str) -> (std::fs::File, std::path::PathBuf) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = std::env::temp_dir().join(format!("win-ioring-handle-mode-{name}.tmp"));
+        std::fs::write(&path, b"handle mode probe").expect("could not write the probe file");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        if mode == HandleMode::Overlapped {
+            // 0x4000_0000 is FILE_FLAG_OVERLAPPED. Spelled numerically here to
+            // keep this test independent of the constant the crate under test
+            // derives, so a wrong constant there cannot make this test agree
+            // with it.
+            options.custom_flags(0x4000_0000);
+        }
+        let file = options.open(&path).expect("could not open the probe file");
+        (file, path)
+    }
+
+    /// The read-back agrees with the truth, in both directions.
+    ///
+    /// Both directions matter. A check that only ever confirmed `Overlapped`
+    /// would pass against an implementation that always answered `Overlapped`,
+    /// which is exactly the defect it exists to catch.
+    #[test]
+    fn the_read_back_agrees_with_a_handle_of_each_mode() {
+        use std::os::windows::io::AsRawHandle;
+
+        let (overlapped, a) = open_in(HandleMode::Overlapped, "agrees-overlapped");
+        verify_handle_mode(overlapped.as_raw_handle(), HandleMode::Overlapped, "probe");
+        let (synchronous, b) = open_in(HandleMode::Synchronous, "agrees-synchronous");
+        verify_handle_mode(
+            synchronous.as_raw_handle(),
+            HandleMode::Synchronous,
+            "probe",
+        );
+
+        drop((overlapped, synchronous));
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+    }
+
+    /// The read-back can fail: an overlapped handle claimed synchronous aborts.
+    ///
+    /// The twin `docs/testing.md` asks for. Without it, the agreement test above
+    /// would still pass against a `verify_handle_mode` whose assertion had been
+    /// deleted — a gate that cannot fail, which is the failure this repository
+    /// has now found in enough places to name.
+    #[test]
+    #[should_panic(expected = "HANDLE MODE MISMATCH")]
+    fn the_read_back_rejects_an_overlapped_handle_claimed_synchronous() {
+        use std::os::windows::io::AsRawHandle;
+
+        let (file, _path) = open_in(HandleMode::Overlapped, "rejects-overlapped");
+        verify_handle_mode(file.as_raw_handle(), HandleMode::Synchronous, "probe");
+    }
+
+    /// And in the other direction, for the same reason.
+    #[test]
+    #[should_panic(expected = "HANDLE MODE MISMATCH")]
+    fn the_read_back_rejects_a_synchronous_handle_claimed_overlapped() {
+        use std::os::windows::io::AsRawHandle;
+
+        let (file, _path) = open_in(HandleMode::Synchronous, "rejects-synchronous");
+        verify_handle_mode(file.as_raw_handle(), HandleMode::Overlapped, "probe");
+    }
+
+    /// What the kernel should report is assigned per variant, in both
+    /// directions, and is **not** the same function as [`Which::handle_mode`].
+    ///
+    /// The `TokioOne` row is the one that would be got wrong by conflating them:
+    /// `handle_mode` reports `Overlapped` for it because that method describes
+    /// what the ring backends are told to do and says nothing about `tokio::fs`,
+    /// while the handle `tokio::fs` actually produces is synchronous. A
+    /// read-back driven by `handle_mode` would fail every `tokio::fs` cell of
+    /// the arm for a reason that is not a defect.
+    #[test]
+    fn expected_handle_mode_is_about_the_handle_not_about_the_request() {
+        assert_eq!(
+            Which::RingPlain.expected_handle_mode(),
+            HandleMode::Overlapped
+        );
+        assert_eq!(
+            Which::RingRegistered.expected_handle_mode(),
+            HandleMode::Overlapped
+        );
+        assert_eq!(Which::Compio.expected_handle_mode(), HandleMode::Overlapped);
+        assert_eq!(
+            Which::RingPlainSync.expected_handle_mode(),
+            HandleMode::Synchronous
+        );
+        assert_eq!(
+            Which::RingRegisteredSync.expected_handle_mode(),
+            HandleMode::Synchronous
+        );
+
+        // The disclosed asymmetry, pinned. `tokio::fs` opens through `std` and
+        // gets a synchronous handle at every pool width.
+        assert_eq!(
+            Which::TokioOne.expected_handle_mode(),
+            HandleMode::Synchronous
+        );
+        assert_eq!(
+            Which::TokioMany.expected_handle_mode(),
+            HandleMode::Synchronous
+        );
+
+        // And the two methods really do disagree, so neither can be quietly
+        // replaced by the other.
+        assert_ne!(
+            Which::TokioOne.handle_mode(),
+            Which::TokioOne.expected_handle_mode(),
+            "handle_mode and expected_handle_mode agree about tokio::fs; one of \
+             them has been changed to the other and the distinction they exist \
+             to draw has been lost"
         );
     }
 }
