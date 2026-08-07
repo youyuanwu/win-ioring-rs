@@ -600,6 +600,48 @@ the rule from the document rather than reconstructing it from memory — an
 approximate rule generates confident, wrong corrections.
 
 
+### Publishing the friendlier of two measurements of the same thing
+
+The sharpest instance of the bias hazard above, because nothing about it looked
+like a choice.
+
+The handle-mode work collected the per-cell noise spread **twice** — a pilot set
+and a frozen confirmatory set, five runs each. Asked whether the published
+−18%/+24% noise band still applied, `docs/performance.md` answered "yes, and it
+now has independent support", quoting a median of 13.3%, a mean of 17.1% and a
+p90 of 24.5%.
+
+Every one of those figures was the **pilot's**, unlabelled. The confirmatory set —
+the frozen, pre-registered, *primary* one — was in the tree, computed by the same
+script, and gives a p90 of **41.3%** with eleven of thirty-six cells past the
+band's upper edge, against the pilot's four. The sentence "lands close enough to
+−18%/+24% that adjusting the band would be fitting it to noise" is true of one
+set and false of the other, and the document had picked one without saying so.
+
+**Nobody chose the flattering set.** The pilot was analysed first, its numbers
+went into the draft, and when the confirmatory set arrived it was used for the
+result it was collected for — the A/B verdict — and not back-propagated into the
+band section. That is how this failure mode actually happens: not by suppression,
+but by a number being written down once and never revisited when better data
+lands beside it.
+
+**Two rules that would have caught it.**
+
+1. **When you have N measurements of a quantity, publish N or publish a stated
+   summary of N. Never publish one of them unlabelled.** The fix here was a
+   three-row table — pilot, confirmatory, pooled — which took less space than the
+   paragraph defending the single row.
+2. **When a second dataset arrives, grep the document for every claim the first
+   one supported.** The A/B verdict was correctly recomputed on the frozen set.
+   The band claim, four hundred lines away and in a different section, was not.
+   A dataset does not know which sections cite it.
+
+The correction also changed the conclusion, which is the point: the band is kept,
+but it is now published as "a reasonable central estimate, demonstrably optimistic
+in the tail" rather than as independently confirmed. That is a weaker claim and a
+true one.
+
+
 ### Proving a wakeup cannot be lost
 
 The wakeup guarantee is the easiest thing in this crate to get subtly wrong and

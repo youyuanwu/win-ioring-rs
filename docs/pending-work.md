@@ -463,7 +463,8 @@ Three things that buys, none of them a consolation:
   explain, because the matrix and the unbuffered arm now both use overlapped
   handles, and the reason the arm always had to is stated in both places.
 
-**What it does not buy.** The instrument resolves about 10% on the paired ratio at
+**What it does not buy.** The instrument resolves about 10% on the paired
+difference of ratios at
 the median, so what is excluded is an effect of the *predicted magnitude*, not
 any effect at all. An effect of around 10% or less would not have been reliably
 visible and is not ruled out. The open question at

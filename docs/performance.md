@@ -41,7 +41,8 @@ below establishes that the change does not account for the loss.
 which is completion-based on Windows but uses I/O completion ports rather than an
 I/O ring, loses to `tokio::fs` in the same places: at depth 64 it is 1.57x on
 random read against the ring's 1.40x with owned buffers, and 1.17x on sequential
-read against the ring's 1.30x — though only the random-read pair resolves. Of the
+read against the ring's 1.30x — though of those four figures only the two
+random-read ones resolve against `tokio::fs`. Of the
 twenty compio-against-ring comparisons in the matrix, **eighteen are unresolved,
 and those eighteen include every one of the fourteen at depth 8 and depth 64** —
 which is to say the two are indistinguishable everywhere the loss happens. That
@@ -395,8 +396,10 @@ absolutes:
 - **The two ring backends' order against each other flipped in two cells** —
   random read at depth 1 and write-then-read at depth 8 — which is why the
   registration reading below is reported as a count of cells rather than as a
-  winner. The fifty-benchmark run moved that count again, to nine cells behind
-  and one ahead.
+  winner. The fifty-benchmark run moved that count again, to **eight cells behind
+  and two ahead** — registered is ahead at sequential read depth 64 and at
+  write-then-read depth 64. (The previous publication's figure of nine and one was
+  carried forward here from its own run and is corrected against this one.)
 
 **This paragraph used to claim that every relative figure was reproduced**, with
 "the largest disagreement being random read at depth 64 with owned buffers (1.75x
@@ -644,9 +647,12 @@ It is not clear of it.
   backend that skipped the commit would be doing less work than the others.
   **This is a second compio-slower bias in write-then-read, and it is disclosed
   rather than quantified.** It matters where it lands: write-then-read holds the
-  widest intervals in the matrix and is the one scenario whose depth-scaling
-  result resolves, so the unmeasured part of compio's cost is concentrated in
-  exactly the cell doing the most argumentative work. Read the depth-scaling
+  widest intervals in the matrix, and in the *previous* run it was the one
+  scenario whose depth-scaling result resolved — so the unmeasured part of
+  compio's cost sat in exactly the cell then doing the most argumentative work.
+  In this run none of the three depth-scaling results resolves, so no conclusion
+  currently rests on that cell; the bias remains disclosed because it will matter
+  again the moment one does. Read the depth-scaling
   section below with that in mind.
 - **There is no submission figure for compio, and that is not a gap.** The
   entries-per-submission table exists because a ring batches entries into one
@@ -709,8 +715,9 @@ is claimed from it — here or in the prose below.
 **Resolved: compio loses to the one-thread pool as depth rises, in the same
 places this crate does.** Random read at depth 8 and 64, 1.32x and 1.57x. The
 async-open cost biases compio slower, so this direction is **conservative** —
-removing the open entirely would move random read at depth 64 by 0.64%, which
-does not shift a 1.57x anywhere near the band. Sequential read at depth 64 moved
+removing compio's open-cost *disadvantage* would move random read at depth 64 by
+0.57%, and removing the open entirely by 0.87%, neither of which shifts a 1.57x
+anywhere near the band. Sequential read at depth 64 moved
 the other way this run, to 1.17x, and no longer clears the band; it is reported
 unresolved. The load-bearing claim rests on random read, where it is unambiguous
 at both depths.
@@ -972,16 +979,19 @@ This is the limit the conclusion rests on, and it belongs beside the conclusion
 rather than in a footnote.
 
 The paired statistic's 95% interval has a **median half-width of about 10% on the
-ratio**, ranging from 0.9% in the best cell to 27.6% in the worst of the
-confirmatory set (118.6% in the worst pilot cell). Per-cell within-run spread has
-a median of 13.3% and a p90 of 24.5%.
+paired difference**, ranging from 0.9% in the best cell to 27.6% in the worst of
+the confirmatory set (118.6% in the worst pilot cell). Per-cell within-run spread
+has a median of 13.3% and a p90 of 24.5% **in the pilot set**, and 10.3% and
+41.3% in the confirmatory set — see
+["Reproduction and regression tracking"](#reproduction-and-regression-tracking)
+for why the two sets are quoted separately and what their disagreement means.
 
-The twelve confirmatory half-widths, in percent, are 0.95, 4.40, 4.50, 4.85,
-5.90, 6.00, 9.90, 9.90, 10.65, 12.50, 24.05 and 27.60. They are listed because a
+The twelve confirmatory half-widths, in percent, are 0.90, 4.41, 4.47, 4.86,
+5.91, 5.98, 9.89, 9.92, 10.64, 12.54, 24.04 and 27.64. They are listed because a
 draft of this section published the median as "about 6%", which is the sixth of
 twelve — the lower of the two middle values, and a convention used nowhere else in
-this analysis. The mean of the two middle values is 7.95% and the convention the
-analysis scripts use throughout gives 9.90%. **The error made the instrument look
+this analysis. The mean of the two middle values is 7.93% and the convention the
+analysis scripts use throughout gives 9.89%. **The error made the instrument look
 sharper than it is, which is the flattering direction**, and it is recorded rather
 than silently corrected.
 
@@ -1038,8 +1048,10 @@ The gap itself reproduces in the arm, on overlapped handles: 1.24x sequential an
 figures for the same cells — the matrix reads 1.30x and 1.40x — and they are not
 supposed to be, for the reasons given above about comparability. What reproduces
 is the loss's existence, its direction and its rough size, measured on a handle
-mode the previous matrix never used. The loss is real, it is not handle mode, and
-at depth 1 the crate is still ahead — 0.57x to 0.83x across the four control
+mode the previous matrix never used. The loss is real, **it is not explained by a
+handle-mode effect of the predicted size** — an effect of around 10% or less
+remains possible and is not ruled out — and at depth 1 the crate is still ahead
+— 0.57x to 0.83x across the four control
 cells — so whatever the cause is, it appears as depth rises and is unchanged by
 how the file was opened.
 
@@ -1169,22 +1181,49 @@ figure as an envelope and is corrected with it.
 **Does the band still apply after the handle-mode change?** It was measured on a
 thirty-six-benchmark suite whose ring backends opened synchronous handles, and
 both of those facts have changed. The question was asked deliberately rather than
-assumed away, and the answer is **yes, and it now has independent support**.
+assumed away. The answer is **yes, the band is kept — but the support for it is
+weaker than a first draft of this section claimed, and the weakness is worth more
+than the reassurance.**
 
 The handle-mode arm measures the same quantity by a different route: five whole
 runs of one configuration in fresh processes, which is a five-run version of the
-two-run comparison above. Its per-cell spread across those runs has a **median of
-13.3%, a mean of 17.1% and a p90 of 24.5%** — measured on a different suite, a
-different budget, and on both handle modes. That lands close enough to
-−18%/+24% that adjusting the band would be fitting it to noise. So the band is
-kept as published, and it is no longer resting on a single pair of runs of a
-suite that no longer exists.
+two-run comparison above. It was collected **twice** — a pilot and a frozen
+confirmatory set — so there are two independent estimates of per-cell spread, and
+**they disagree in the tail**:
 
-Two limits on that. The arm's figures are not comparable to matrix cells in
+| set | median | mean | p90 | max | cells over 24.5% |
+| --- | --- | --- | --- | --- | --- |
+| pilot (36 cells) | 13.3% | 17.1% | 24.5% | 134.6% | 4 of 36 |
+| **confirmatory (36 cells)** | 10.3% | 20.0% | **41.3%** | 108.9% | **11 of 36** |
+| pooled (72 cells) | 11.4% | 18.6% | 29.1% | 134.6% | 15 of 72 |
+
+A first draft of this section published **only the pilot's row**, unlabelled, and
+concluded that it "lands close enough to −18%/+24% that adjusting the band would
+be fitting it to noise". That conclusion does not survive the second set. The
+confirmatory set — the frozen, pre-registered, *primary* one — puts its p90 at
+**41.3%**, nearly twice the band's upper edge, with eleven of thirty-six cells
+past it. Publishing the pilot alone was selecting the more reassuring of two
+available measurements of the same quantity, and it is recorded here because the
+selection was not deliberate and would not have been visible to a reader.
+
+**Why the band is nevertheless kept.** Not because the tail is comfortable, but
+because widening it to cover a 41% p90 would be fitting the band to the arm's
+worst cells, which are concentrated in the low-absolute-cost random-read cells
+where a small absolute jitter is a large relative one — the same cells that
+produced the 2.63x transient discussed above. The honest statement is narrower
+than the draft's: **the band is a reasonable central estimate and is
+demonstrably optimistic in the tail.** A comparison that clears it by a wide
+margin is safe; one that clears it narrowly should be treated as unresolved in
+practice, which is what this document already does by requiring disjoint
+intervals as well.
+
+Three limits on that. The arm's figures are not comparable to matrix cells in
 absolute terms, for the reasons given in the handle-mode section; what transfers
-is the *spread*, which is a property of the host. And the arm covers two read
+is the *spread*, which is a property of the host. The arm covers two read
 scenarios, so it says nothing about write-then-read — which is where the widest
 intervals in the matrix are, and where the band is most likely to be optimistic.
+And the two sets' disagreement is itself a caution: a five-run spread estimate is
+not stable enough to retune a band on, in either direction.
 
 ## The fairness account
 
@@ -1323,8 +1362,13 @@ doing, which is the same fact the noise-floor finding above reports in a
 different unit. The account prints preparation and measurement separately — 0.2 s
 and 279.3 s in this run.
 
-It writes about **12 GiB** to `target/bench-data/write.dat` — 8 MiB per
-iteration, across roughly 1570 write-bearing iterations. The file itself stays
+It writes about **15 GiB** to `target/bench-data/write.dat` — 8 MiB per
+iteration, across roughly 1965 write-bearing iterations. (The previous
+publication said 12 GiB across 1570 iterations; that was the four-backend matrix,
+and the figure was carried forward when the fifth backend was added. Summed from
+this run's own account it is 1965 iterations. An understated wear figure is the
+kind of stale number that gets no scrutiny because nobody wants it to be larger.)
+The file itself stays
 8 MiB, because each iteration truncates and rewrites it; the wear is in the
 writing, not in the size. That is the price of statistics on a write-bearing
 scenario, and it is stated here so nobody discovers it from a wear indicator.

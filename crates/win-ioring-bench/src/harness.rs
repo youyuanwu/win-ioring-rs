@@ -682,7 +682,7 @@ pub fn handle_mode_checks() -> usize {
 /// This was checked rather than assumed. Replacing
 /// `.with_handle_mode(which.handle_mode())` in [`session::prepare`] with a
 /// hardcoded `HandleMode::Overlapped` — the shape a careless refactor of that
-/// wiring would take — leaves **all 122 library unit tests passing**, including
+/// wiring would take — leaves **all 125 library unit tests passing**, including
 /// the ones that assert the two modes really produce different handles and that
 /// each `Which` maps to the right mode. Every one of those tests is about a
 /// piece in isolation; none of them covers the wiring that connects the pieces,
