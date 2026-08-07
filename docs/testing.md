@@ -391,6 +391,98 @@ The sub-species worth recognising, each from a real instance:
   does not run `#[test]` functions.
 - **A `compile_fail` doctest that no longer names anything.** After a rename it
   fails to compile for the wrong reason and still reports `ok`.
+- **The decision is in a place nothing observes.** The `handle-mode` arm's
+  central premise — that file opens sit *outside* the region it times — lived as
+  an `Opens::Hoisted` literal inside a `harness = false` bench target. Reversing
+  it to `Opens::PerIteration` left every library test, every integration test and
+  the target's own smoke run green, while folding per-open cost into the
+  measured delta at the arm's negative control. The literal was covered by a
+  test asserting that `Opens::Hoisted` *behaves* correctly, which proved the
+  variant worked and said nothing about which variant was selected. Moving the
+  decision into the library was necessary but not sufficient: an
+  `assert_eq!(OPENS, Opens::Hoisted)` would only have restated the constant. The
+  guard that works counts opens and checks the *property* — non-zero, and
+  invariant under a fourfold change in iteration count.
+- **The counter that a parallel harness makes unsound.** The fix for the item
+  above initially used a process-global counter, copying an existing in-tree
+  one. Tests run in parallel threads in a single process, so an unrelated test
+  moved the counter between two readings. The positive assertion became a flake;
+  the *negative* one — "this path performs zero of these" — became an assertion
+  that fails for a reason unrelated to its claim, which is the shape that gets
+  "repaired" into a lower bound and thereby deleted. Scope a counter to whatever
+  actually performs the work: here the operation runs inline on the calling
+  thread, so thread-local was the accurate scope and it permitted an exact zero.
+- **A branch no real input can reach.** A `#[should_panic]` twin was written for
+  a "could not determine the handle's mode" branch using an anonymous pipe as
+  the vehicle. Pipes answer that query. Probing found that *every* obtainable
+  handle answers it — file, pipe and socket alike — and only a value that is not
+  a handle fails, which cannot be constructed without violating
+  `File::from_raw_handle`'s contract in order to test a function whose own
+  contract already requires a live handle. Splitting the judgement out from the
+  query made the branch reachable directly. When a branch has no legitimate
+  input, say so and test it at the level where it does; a twin that reaches it
+  by breaking two contracts is not evidence about the branch.
+- **A mutation that cannot mutate.** `Rng::new` does `seed | 1`, so mutating a
+  seed constant by `SEED ^ 1` is a no-op and the "surviving mutation" says
+  nothing. Check that the mutation changes behaviour before concluding anything
+  from a test that survives it.
+
+### A threshold something meets exactly is not a threshold
+
+Named after two instances in one feature, one of them caught in the author's own
+proposal and one in a document the reviewer had already approved.
+
+A budget option was rejected for passing its own affordability check with **zero
+margin** — a floor of exactly the permitted maximum. The replacement proposal
+was then written with the same defect and caught only on re-derivation. The rule
+adopted was that any such proposal must state its margin as a number; the chosen
+budget carries 104 s of margin on a 216 s requirement, and says so.
+
+The generalisation is the useful part, and it is not about budgets. **A
+constraint that a proposal satisfies with no room is indistinguishable from a
+constraint that was fitted to the proposal.** It provides no evidence, because
+it could not have rejected anything. The same reasoning applies to a tolerance
+chosen to admit a measurement, an outlier bound chosen to exclude a known
+excursion, and a deadline met to the day.
+
+The second instance is the more instructive one, because it did not look like a
+number at all.
+
+### An ordering that makes a blind analysis impossible
+
+The `handle-mode` plan scheduled: (4) measure the within-run noise band,
+(6) freeze the interpretation criterion *before* any numbers exist, (7) run the
+experiment. Phase 6 stated its own justification — *"a threshold chosen after
+seeing the data is not a threshold; this phase exists so that no such choice is
+possible."*
+
+The ordering could not deliver it. **The band is measured by repeating the whole
+benchmark target, and that target contains both arms of the experiment.**
+Measuring the instrument's spread necessarily measured the effect. There was no
+order in which the freeze could have been blind, so the criterion was in fact
+chosen with the estimates already visible.
+
+What makes this worth a section is who missed it. The author wrote the ordering;
+the reviewer read and approved it. In the same week, the author had rejected one
+option for the zero-margin defect above and then nearly shipped a second with
+it, and the reviewer had written that *"a threshold that a proposal meets
+exactly is not a threshold, and that generalises beyond budgets."* Both parties
+were attentive to this exact species, in these words, and both walked past an
+instance of it sitting in the plan's phase ordering.
+
+The lesson is not "check the ordering". It is that **attentiveness to a named
+pattern does not transfer to an instance wearing different clothes** — here a
+scheduling constraint rather than a numeric margin. If a document says a later
+step will be performed without knowledge an earlier step produces, check that
+the earlier step does not produce it.
+
+The recovery is the standard one and is worth knowing: relabel the first set a
+**pilot**, publish it as such, freeze the analysis in full — cells, criterion,
+predicted effect sizes, outlier rule, run count — and collect a **confirmatory**
+set against it. Freezing the threshold alone is not enough; every degree of
+freedom that could otherwise be exercised after the fact has to be spent in
+advance, and the outlier rule is the one that matters most once an excursion has
+already been seen.
 
 ### Confounds that produce a believable number, not an obvious failure
 
@@ -415,6 +507,33 @@ because nothing prompts you to look.
   one of them performed a buffered open on a file another was measuring
   unbuffered — which is precisely the failure the guard exists to prevent,
   committed to the repository by the guard's own tests.
+
+- **A confound that also disarms the control that would have caught it.** The
+  worst shape found so far. The `handle-mode` arm compares two handle modes and
+  uses depth 1 as a negative control, where the prediction is no effect. Had the
+  arm inherited the main matrix's boundary and opened files *inside* the timed
+  region, per-open cost would have entered the measured delta — and an open is
+  one of the places `FILE_FLAG_OVERLAPPED` itself costs something. So a
+  difference would have appeared at depth 1, where the arm's own guard reads a
+  difference as **run-level drift** rather than as a defect. The confound would
+  not merely have added noise; it would have converted the one arm capable of
+  saying "no effect here" into an arm showing an effect for the wrong reason,
+  with the safeguard silently disarmed and the result publishing cleanly.
+
+  Two consequences worth carrying forward. First, when adding an arm, ask not
+  only "does this confound the measurement" but "does this confound the thing
+  that would have caught it". Second, when a new arm's timing boundary differs
+  from an existing one's, record **why** it differs and not merely that it does —
+  the next person to add an arm faces the same choice with the same two
+  plausible answers.
+
+- **A second measurement inside the timed loop, wearing a doc comment that
+  denied it.** In the same arm, `std::fs::metadata` was being called per timed
+  iteration to size the file. On Windows that opens the path — so the arm whose
+  whole premise was "opens are outside the timed region" was performing one per
+  iteration, under a comment asserting the opposite. Dilution biases such an arm
+  toward a null, which is the direction this project is documented as
+  under-scrutinising.
 
 ### A standing bias hazard
 

@@ -196,7 +196,14 @@ impl File {
     ///
     /// The effect is invisible under a warm page cache, where a cached read
     /// returns synchronously after a memory copy and there is nothing to
-    /// overlap. It becomes decisive as soon as reads reach the device — the
+    /// overlap. **That is now a measurement rather than an argument**: a
+    /// pre-registered A/B running both handle modes in the same benchmark run,
+    /// over two independent five-run sets, found no effect of the predicted
+    /// size in any of the eight cells it was frozen over (`docs/performance.md`,
+    /// "Handle mode"). What is excluded is an effect of the predicted
+    /// magnitude, not any effect at all.
+    ///
+    /// It becomes decisive as soon as reads reach the device — the
     /// unbuffered arm measures the same mechanism at 8.75x to 10.27x, by
     /// handle count rather than handle mode (see `docs/performance.md`).
     ///

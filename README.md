@@ -154,14 +154,21 @@ far more than concurrency, buffer registration, or anything else measured here.
 
 **Against a warm page cache, only at low concurrency.** At one operation in
 flight this crate
-is ahead of `tokio::fs` on random reads at 0.58x — the one depth-1 result that
-resolves; its sequential-read and write-then-read leads (0.83x, 0.91x) sit inside
+is ahead of `tokio::fs` on random reads at 0.57x — the one depth-1 result that
+resolves; its sequential-read and write-then-read leads (0.87x, 0.91x) sit inside
 the noise band and claim nothing. At
 eight and sixty-four operations in flight `tokio::fs` is ahead on every point
-estimate, by 1.06x to
-1.40x with owned buffers and 1.11x to 1.47x with registered ones, though only six
+estimate, by 1.08x to
+1.44x with owned buffers and 1.03x to 1.60x with registered ones, though only five
 of those fourteen comparisons resolve statistically. That document is careful
 about which is which.
+
+**One candidate explanation has been measured and eliminated.** This crate now
+opens files with `FILE_FLAG_OVERLAPPED`, following `compio`. The change was
+predicted to narrow the warm-cache gap above, and a pre-registered A/B across two
+independent five-run sets found **no effect of the predicted size** — the
+mechanism argument the performance document had been making on reasoning alone is
+now confirmed by measurement, and a candidate cause is off the list.
 
 **Unbuffered, the ranking changes and the design pays.** A cached `ReadFile`
 never blocks, so there is nothing for a completion-based interface to overlap and
