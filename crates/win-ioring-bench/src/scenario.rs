@@ -228,9 +228,11 @@ pub async fn run<B: Backend>(
 /// defect that publishes cleanly: a plausible result with the safeguard
 /// silently disarmed.
 ///
-/// So the `handle-mode` arm hoists the open out and calls this instead, and its
-/// per-open cost is measured separately by the open-cost probe, where it
-/// belongs. The unbuffered arm makes the same choice for its own reasons
+/// So the `handle-mode` arm hoists the open out and calls this instead. Where
+/// the per-open cost of the flag belongs is the open-cost probe in
+/// `benches/comparison.rs`, which today measures `std` against `compio`; adding
+/// an overlapped third arm to it is a separate piece of work and has not
+/// happened yet. The unbuffered arm makes the same choice for its own reasons
 /// (`benches/unbuffered.rs`).
 ///
 /// **The consequence is that this arm's absolute figures are not comparable to
@@ -270,9 +272,10 @@ pub async fn run_on_open_file<B: Backend>(
         }
         Scenario::RandomRead => {
             // Reproduces `run`'s offsets exactly, including the shared seed, so
-            // the two entry points issue an identical sequence. Taking the size
-            // as a parameter rather than re-statting keeps this out of the
-            // caller's timed region too.
+            // the two entry points issue an identical sequence. The size is
+            // taken as a parameter rather than re-statted, because a stat opens
+            // the path on Windows and would put an open back inside the caller's
+            // timed region — see `session::PreparedFile::bytes`.
             let blocks = (read_bytes / block as u64).max(1);
             let mut rng = Rng::new(SEED);
             let offsets: Vec<u64> = (0..operations)

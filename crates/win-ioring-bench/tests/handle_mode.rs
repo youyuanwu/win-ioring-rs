@@ -24,9 +24,12 @@ use win_ioring_bench::backend::Availability;
 use win_ioring_bench::backends::ioring::{self, HandleMode};
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
-use win_ioring_bench::handle_mode::{CONFIGS, DEPTHS, grid};
-use win_ioring_bench::harness::{Job, Opens, Record, Untimed, Which, measure_combination_with};
+use win_ioring_bench::handle_mode::{CONFIGS, DEPTHS, OPENS, grid};
+use win_ioring_bench::harness::{
+    Job, Opens, Record, Untimed, Which, handle_mode_checks, measure_combination_with,
+};
 use win_ioring_bench::scenario::Scenario;
+use win_ioring_bench::session::opens;
 use win_ioring_bench::weaken::Weakness;
 use win_ioring_bench::workload;
 
@@ -125,8 +128,86 @@ fn hoisting_really_moves_the_opens_out_of_the_timed_region() {
     }
 }
 
-/// Hoisting refuses to be combined with a weakening.
+/// The boundary **the arm actually uses** keeps opens out of the timed region.
 ///
+/// The distinction from
+/// [`hoisting_really_moves_the_opens_out_of_the_timed_region`] is the whole
+/// point of this test. That one passes `Opens::Hoisted` as a literal, so it
+/// proves the *variant* behaves correctly and says nothing about which variant
+/// the arm selects. The selection used to be a literal in
+/// `benches/handle-mode.rs`, and because a `harness = false` target compiles
+/// `#[test]` without running it, reversing it to `Opens::PerIteration` left the
+/// whole suite green — the arm's central premise guarded by a gate that could
+/// not fail.
+///
+/// This drives [`OPENS`] itself, and checks the property rather than the value.
+/// Asserting `OPENS == Opens::Hoisted` would only restate the constant; a
+/// count of opens through [`opens`] observes what the constant causes.
+///
+/// Two readings are taken because one would not separate the two ways this can
+/// break. A non-zero count rules out the reversal, since the per-iteration path
+/// never reaches the hoisted open seam at all. Equality across a fourfold change
+/// in iterations rules out an open that has crept back into the loop — the B1
+/// defect, where a `std::fs::metadata` call (which opens the path on Windows)
+/// was running per iteration inside the timed region.
+#[test]
+fn the_boundary_the_arm_uses_keeps_opens_out_of_the_timed_region() {
+    if !ring_available() {
+        eprintln!("no io_ring on this host; skipping");
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("boundary", &config);
+    let (block, operations) = config.work(Scenario::SequentialRead);
+
+    let count = |iterations: usize| {
+        let job = Job {
+            scenario: Scenario::SequentialRead,
+            read_path: &read_path,
+            write_path: &write_path,
+            block,
+            operations,
+            depth: 1,
+        };
+        let mut ledger = Ledger::new();
+        let before = opens();
+        let record = measure_combination_with(
+            Which::RingPlain,
+            Weakness::None,
+            OPENS,
+            &config,
+            &job,
+            &mut ledger,
+            &mut Untimed { iterations },
+        )
+        .expect("the arm's own boundary should run the read scenario");
+        assert!(
+            matches!(record, Record::Measured { .. }),
+            "the arm's boundary did not measure: {record:?}"
+        );
+        opens() - before
+    };
+
+    let one = count(1);
+    let four = count(4);
+
+    assert!(
+        one > 0,
+        "the arm's boundary performed no hoisted open at all, which is what \
+         `Opens::PerIteration` does. Per-open cost is then inside the timed \
+         region, where it lands on the depth-1 negative control and is read as \
+         run-level drift rather than as the confound it is."
+    );
+    assert_eq!(
+        one, four,
+        "opens scaled with the iteration count ({one} for 1 iteration, {four} \
+         for 4), so an open is inside the timed region. The arm attributes its \
+         delta to per-operation cost; a per-open cost folded into it is a \
+         different quantity wearing the same label."
+    );
+}
+
+/// Hoisting refuses to be combined with a weakening.
 /// Hoisting exists for a single-variable experiment. A weakened backend is a
 /// second variable, and a second variable inside a controlled experiment is the
 /// experiment's whole failure mode rather than a degraded version of it.
@@ -157,13 +238,21 @@ fn hoisting_a_weakened_backend_is_refused() {
 }
 
 /// Every configuration in the arm runs end to end, through the hoisted path,
-/// with its handle mode read back off the kernel.
+/// with its handle mode read back off the kernel — and the read-back is
+/// **reached**, once per configuration.
 ///
 /// This is the arm's smoke test at the small configuration, and it is the check
 /// that would fire if a synchronous configuration silently opened an overlapped
 /// handle. That failure is the one worth spending a test on: it produces no
 /// error, no warning and no anomaly — just an A/B comparing a handle against an
 /// identical handle, reporting a clean null at every depth.
+///
+/// The counter assertion is the part that was missing at first, and its absence
+/// is instructive. `verify_handle_mode` has `#[should_panic]` twins proving it
+/// *can* fail — but nothing proved it was *called*, so deleting the one line
+/// that calls it left all the library tests, all the integration tests and the
+/// bench target's smoke run green. Twins for a function are not twins for its
+/// call site.
 #[test]
 fn every_configuration_runs_the_hoisted_path_with_its_mode_confirmed() {
     if !ring_available() {
@@ -186,6 +275,7 @@ fn every_configuration_runs_the_hoisted_path_with_its_mode_confirmed() {
             operations,
             depth: 1,
         };
+        let before = handle_mode_checks();
         let record = measure_combination_with(
             which,
             Weakness::None,
@@ -207,7 +297,60 @@ fn every_configuration_runs_the_hoisted_path_with_its_mode_confirmed() {
             Record::Measured { .. } => {}
             other => panic!("{which:?} did not measure: {other:?}"),
         }
+        assert_eq!(
+            handle_mode_checks(),
+            before + 1,
+            "{which:?} ran the hoisted path without its handle mode being read \
+             back. The safeguard against a clean null is not reached for this \
+             configuration."
+        );
     }
+}
+
+/// The published matrix pays nothing for this arm's safeguard.
+///
+/// The negative half of the counter assertion above, and a measurement rather
+/// than the structural argument it replaces. The matrix runs
+/// [`Opens::PerIteration`], so no handle is hoisted and no mode is queried; a
+/// read-back that leaked onto that path would add a syscall per measured
+/// combination to figures this repository publishes.
+#[test]
+fn the_per_iteration_path_performs_no_read_back() {
+    if !ring_available() {
+        eprintln!("no io_ring on this host; skipping");
+        return;
+    }
+    let config = Config::small();
+    let (read_path, write_path) = prepare("no-read-back", &config);
+    let (block, operations) = config.work(Scenario::SequentialRead);
+    let job = Job {
+        scenario: Scenario::SequentialRead,
+        read_path: &read_path,
+        write_path: &write_path,
+        block,
+        operations,
+        depth: 1,
+    };
+
+    let mut ledger = Ledger::new();
+    let before = handle_mode_checks();
+    let record = measure_combination_with(
+        Which::RingPlain,
+        Weakness::None,
+        Opens::PerIteration,
+        &config,
+        &job,
+        &mut ledger,
+        &mut Untimed { iterations: 2 },
+    )
+    .expect("the matrix path should measure");
+    assert!(matches!(record, Record::Measured { .. }));
+    assert_eq!(
+        handle_mode_checks(),
+        before,
+        "the matrix path performed a handle-mode read-back; the published \
+         figures would be paying for this arm's safeguard"
+    );
 }
 
 /// The two handle modes are assigned to different configurations, and the arm

@@ -105,6 +105,40 @@ pub const HANDLE_MODE_RUN_BUDGET: Duration = Duration::from_secs(320);
 /// misread as drift.
 pub const DEPTHS: [usize; 3] = [1, 8, 64];
 
+/// Where this arm's opens sit relative to the region it times.
+///
+/// The single most important design decision in the arm, and it lives here —
+/// in the library — rather than as a literal at the call site in
+/// `benches/handle-mode.rs`, because a literal there could not be tested.
+/// A `harness = false` bench target compiles a `#[test]` and never runs it, so
+/// reversing that literal to [`crate::harness::Opens::PerIteration`] left the entire suite
+/// green. That is a gate that cannot fail sitting on top of the arm's central
+/// premise.
+///
+/// # Why it is `Hoisted` where the matrix is `PerIteration`
+///
+/// The matrix opens inside its timed region, and must keep doing so: its
+/// figures are published and its boundary is not this work's to move. This arm
+/// must not, and the reason is specific rather than general. An open is one of
+/// the places `FILE_FLAG_OVERLAPPED` can itself cost something, so timing it
+/// would fold per-open cost into a delta the whole arm exists to attribute to
+/// per-operation cost. Worse, it would do so at **depth 1**, which is the
+/// negative control — the pre-registered prediction is no effect there, and a
+/// per-open difference would produce one. The guard that watches for exactly
+/// that reads a depth-1 difference as run-level drift, so the confound would
+/// not merely add noise; it would disarm the safeguard and publish cleanly.
+///
+/// The next person to add an arm faces the same choice, which is why the
+/// reasoning is recorded here and not only in the commit that made it.
+///
+/// # What checks it
+///
+/// Not an equality assertion against this constant, which would only restate
+/// it. [`crate::session::opens`] counts opens, and the property is checked
+/// directly: opens that scale with the iteration count are inside the timed
+/// region and opens that do not are outside it.
+pub const OPENS: crate::harness::Opens = crate::harness::Opens::Hoisted;
+
 /// The scenarios this arm measures.
 ///
 /// Both are pure reads. The write scenario is excluded because
@@ -122,8 +156,9 @@ pub const SCENARIOS: [Scenario; 2] = [Scenario::SequentialRead, Scenario::Random
 /// `tokio::fs` appears at pool width 1 only. It is included knowing that it
 /// opens through `std` and therefore gets a **synchronous** handle, which is
 /// disclosed rather than corrected: changing it inside this work would confound
-/// the variable the experiment is built around. Recorded in
-/// `docs/pending-work.md` as a follow-up.
+/// the variable the experiment is built around. To be recorded in
+/// `docs/pending-work.md` as a follow-up with its cost, in the phase that
+/// republishes the documents.
 pub const CONFIGS: [Which; 6] = [
     Which::RingPlain,
     Which::RingPlainSync,

@@ -68,12 +68,13 @@ use criterion::{
 };
 
 use win_ioring_bench::account::Budget;
+use win_ioring_bench::concurrency::ShapeCheck;
 use win_ioring_bench::config::Config;
 use win_ioring_bench::fairness::Ledger;
 use win_ioring_bench::handle_mode::{
-    Cell, HANDLE_MODE_RUN_BUDGET, SCENARIOS, affordable, benchmarks, grid, group_name,
+    self, Cell, DEPTHS, HANDLE_MODE_RUN_BUDGET, SCENARIOS, affordable, benchmarks, grid, group_name,
 };
-use win_ioring_bench::harness::{Job, Opens, Record, Timed, Timer, measure_combination_with};
+use win_ioring_bench::harness::{Job, Record, Timed, Timer, measure_combination_with};
 use win_ioring_bench::session::Prepared;
 use win_ioring_bench::weaken::Weakness;
 use win_ioring_bench::workload;
@@ -140,6 +141,11 @@ impl Timer for CriterionTimer<'_, '_> {
 }
 
 /// Measures one cell, through the shared path.
+///
+/// Returns whether the cell produced a usable measurement. The caller
+/// accumulates that, because in an A/B a missing configuration is a **dead
+/// run** rather than a gap in a table: a delta needs both arms, and a table
+/// with one arm absent still renders.
 fn run_cell(
     group: &mut BenchmarkGroup<'_, WallTime>,
     cell: Cell,
@@ -147,7 +153,7 @@ fn run_cell(
     read_path: &Path,
     write_path: &Path,
     ledger: &mut Ledger,
-) {
+) -> bool {
     let (block, operations) = config.work(cell.scenario);
     let job = Job {
         scenario: cell.scenario,
@@ -161,9 +167,11 @@ fn run_cell(
     let record = measure_combination_with(
         cell.config,
         Weakness::None,
-        // The one thing this arm does differently from the matrix, and the
-        // reason it needs a `_with` at all.
-        Opens::Hoisted,
+        // The one thing this arm does differently from the matrix. The decision
+        // lives in the library so that something can test it; see
+        // `handle_mode::OPENS` for why the boundary differs and for what
+        // checks it.
+        handle_mode::OPENS,
         config,
         &job,
         ledger,
@@ -174,22 +182,55 @@ fn run_cell(
         Ok(Record::Measured {
             name,
             configuration,
+            achieved,
+            trace,
+            submitted,
+            shape,
             iterations,
             timed,
-            ..
         }) => {
-            if !timed {
-                eprintln!(
-                    "NOTE {name} ({configuration}) ran no timed iteration; the \
-                     warm-up's trace was verified instead"
-                );
-            }
-            let _ = iterations;
+            // Printed rather than discarded because the A/B's verdict rests on
+            // more than a time. `achieved` and `shape` are the direct
+            // observables of serialisation — a synchronous handle that really is
+            // serialising cannot reach the depth it was asked for — and
+            // `submitted` says whether the two arms batched identically. A run
+            // that reported only durations would have to be repeated to answer
+            // the question the table is built to answer.
+            eprintln!(
+                "{} | {} | {:?} d{} | {} | peak {} mean {:.2} shortfall {:?} | {} | {} | {}",
+                if timed { "TIMED" } else { "WARM-UP ONLY" },
+                cell.config.slug(),
+                cell.scenario,
+                cell.depth,
+                name,
+                achieved.peak,
+                achieved.mean,
+                achieved.shortfall,
+                match shape {
+                    ShapeCheck::Matched {
+                        predicted,
+                        measured,
+                    } =>
+                        format!("shape matched (predicted {predicted:.2}, measured {measured:.2})"),
+                    other => format!("shape {other:?}"),
+                },
+                submitted.map_or_else(
+                    || "no ring".to_string(),
+                    |s| format!(
+                        "{} submissions / {} entries ({:.2} per submission)",
+                        s.submissions,
+                        s.entries,
+                        s.entries as f64 / s.submissions.max(1) as f64
+                    )
+                ),
+                configuration
+            );
+            let _ = (trace, iterations);
+            timed
         }
         Ok(Record::Unavailable { name, reason }) => {
-            // Loud rather than silent. A missing configuration is a missing arm
-            // of the A/B, and an A/B with one arm reports nothing.
             eprintln!("UNAVAILABLE {name}: {reason}");
+            false
         }
         Ok(Record::Failed {
             name,
@@ -254,6 +295,8 @@ fn handle_mode(c: &mut Criterion) {
         return;
     }
 
+    let mut incomplete: Vec<String> = Vec::new();
+
     for scenario in SCENARIOS {
         let mut group = c.benchmark_group(group_name(scenario));
         group
@@ -261,14 +304,7 @@ fn handle_mode(c: &mut Criterion) {
             .measurement_time(Budget::CHOSEN.measurement)
             .sample_size(Budget::CHOSEN.sample_size);
 
-        let mut depths: Vec<usize> = grid()
-            .into_iter()
-            .filter(|cell| cell.scenario == scenario)
-            .map(|cell| cell.depth)
-            .collect();
-        depths.dedup();
-
-        for depth in depths {
+        for depth in DEPTHS {
             // One ledger per (scenario, depth), shared across that combination's
             // six configurations — including across the two handle modes, which
             // is the point. A ledger per configuration would make each its own
@@ -278,19 +314,42 @@ fn handle_mode(c: &mut Criterion) {
                 if cell.scenario != scenario || cell.depth != depth {
                     continue;
                 }
-                run_cell(
+                if !run_cell(
                     &mut group,
                     cell,
                     &config,
                     &read_path,
                     &write_path,
                     &mut ledger,
-                );
+                ) {
+                    incomplete.push(format!(
+                        "{:?}/{}/{}",
+                        cell.scenario,
+                        cell.config.slug(),
+                        cell.depth
+                    ));
+                }
             }
         }
 
         group.finish();
     }
+
+    // Reported after the last group is finished, because a group holds the
+    // `Criterion` borrowed, and failed *after* every cell has been attempted so
+    // the message names all of them rather than only the first.
+    //
+    // A test run is exempt: CI runs Criterion's test mode, which executes each
+    // benchmark once without sampling, so nothing is timed by construction.
+    assert!(
+        test_mode || incomplete.is_empty(),
+        "{} of {} cells produced no timed measurement: {}. An A/B needs both \
+         arms of every pair; a run missing one of them cannot report a delta, \
+         and a table rendered from it would look complete.",
+        incomplete.len(),
+        benchmarks(),
+        incomplete.join(", ")
+    );
 
     let elapsed = started.elapsed();
     eprintln!("handle-mode arm finished in {elapsed:?}");

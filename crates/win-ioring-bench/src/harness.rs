@@ -554,9 +554,11 @@ pub fn measure_combination_with(
     }
     let evidence = evidence.into_inner();
 
-    // The hoisted file is closed before teardown, while the driver is still
-    // alive: a ring-backed file dropped after its driver has gone would have
-    // nothing left to complete a close against.
+    // The hoisted file is closed before teardown. `win_ioring::file::File` holds
+    // an `OwnedHandle`, so its close is a plain `CloseHandle` rather than a ring
+    // operation and this is not a correctness requirement — but the ordering is
+    // still what a reader should see, and it is what unwinding gives too, since
+    // `prepared` is declared before `hoisted` and drops after it.
     drop(hoisted);
 
     // Teardown happens before anything below can return, including the
@@ -611,6 +613,57 @@ pub fn measure_combination_with(
     })
 }
 
+thread_local! {
+/// How many handle-mode read-backs the calling thread has performed.
+///
+/// An observation seam rather than a test fixture, in the shape of/// [`crate::backends::ioring::drivers_built`] and for the same reason: it is not
+/// `#[cfg(test)]` because the property it settles is about a **real** run.
+///
+/// The property is that the read-back is *reached*, and its absence is the
+/// gap that makes the read-back's own two `#[should_panic]` twins insufficient.
+/// Those prove the function can fail when called. Nothing proved it was called:
+/// deleting the single line that calls it left every library test, every
+/// integration test and the bench target's smoke run green, which is exactly the
+/// "gate that never ran" species `docs/testing.md` names.
+///
+/// It settles the negative half too. The published matrix must pay **nothing**
+/// for this arm's safeguard, and "the matrix runs `Opens::PerIteration`, where
+/// `hoisted` is `None`" is a structural argument. A caller can now observe that
+/// a per-iteration combination performs zero read-backs, which is a measurement.
+///
+/// # Why this is thread-local where `DRIVERS_BUILT` is process-global
+///
+/// The difference is not cosmetic and was not free: the process-global version
+/// was written first, and both of its tests failed. The test harness runs tests
+/// in parallel threads in one process, so between a `before` reading and the
+/// assertion, an unrelated test's read-back moves a global counter. The
+/// positive half degrades to a flake; the **negative** half — "this path
+/// performs zero read-backs" — degrades to something worse, an assertion that
+/// fails for a reason unrelated to what it claims to check, which would
+/// eventually be "fixed" by relaxing it to a lower bound and thereby deleted.
+///
+/// `DRIVERS_BUILT` is global because a driver is built on whichever worker
+/// thread needs it, so a per-thread count there would answer a question nobody
+/// asked. The read-back is different: it runs inline on the thread that calls
+/// [`measure_combination_with`], always. Thread-local is therefore not a
+/// workaround for the parallel harness but the accurate scope, and it is
+/// strictly stronger — it lets the negative half assert an exact zero instead of
+/// an inequality.
+static HANDLE_MODE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many handle-mode read-backs have run **on the calling thread**.
+///
+/// Monotonic within a thread, so a caller compares two readings rather than
+/// reading an absolute. The scope is the thread rather than the process because
+/// the read-back runs inline on the thread that calls
+/// [`measure_combination_with`]; a process-global counter was tried first and
+/// made both of its own tests unsound under the parallel test harness.
+#[must_use]
+pub fn handle_mode_checks() -> usize {
+    HANDLE_MODE_CHECKS.with(std::cell::Cell::get)
+}
+
 /// Asks the kernel what handle mode a live handle actually has, and aborts if
 /// it is not `expected`.
 ///
@@ -640,11 +693,55 @@ pub fn measure_combination_with(
 fn verify_handle_mode(raw: std::os::windows::io::RawHandle, expected: HandleMode, name: &str) {
     use std::os::windows::io::FromRawHandle;
 
+    // Counted before the query, so a handle whose mode cannot be read still
+    // registers as an attempt. A counter incremented only on success would go
+    // quiet in precisely the case the caller most needs to notice.
+    HANDLE_MODE_CHECKS.with(|c| c.set(c.get() + 1));
+
     // SAFETY: the caller guarantees `raw` is a live file handle it owns. The
     // wrapper is in a `ManuallyDrop` and never dropped, so the handle is not
     // closed here and ownership stays with the caller.
     let view = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(raw) });
-    let synchronous = crate::unbuffered_workload::is_synchronous(&view).unwrap_or_else(|error| {
+    classify_handle_mode(crate::unbuffered_workload::file_mode(&view), expected, name);
+}
+
+/// The judgement half of [`verify_handle_mode`], split out from the query half.
+///
+/// # Why this is a separate function
+///
+/// So that the "could not determine" branch has a twin that can reach it. That
+/// branch is the one that must not be quietly replaced by something like
+/// `.unwrap_or(0)`, because an unreadable mode would then classify as
+/// `Overlapped` — agreement with whichever arm the experiment most wants to be
+/// true, arriving without a measurement.
+///
+/// Reaching it through a real handle turned out to be impossible, which was
+/// established by probing rather than assumed. `NtQueryInformationFile` with
+/// `FileModeInformation` **answers** for every handle kind that could be
+/// produced:
+///
+/// | handle | result |
+/// |---|---|
+/// | file opened synchronously | `Ok(0x20)` — `FILE_SYNCHRONOUS_IO_NONALERT` |
+/// | file opened overlapped | `Ok(0)` |
+/// | anonymous pipe (`std::io::pipe`) | `Ok(0x20)` |
+/// | TCP socket | `Ok(0)` |
+/// | a value that is not a handle | `Err` — `STATUS_INVALID_HANDLE` |
+///
+/// Only the last fails, and constructing it means handing
+/// `File::from_raw_handle` something that violates its documented contract, in
+/// order to test a function whose own contract already requires a live handle.
+/// A test that breaks two contracts to reach a branch is not evidence about the
+/// branch. Splitting the function is the cheaper honesty: the query half is
+/// covered end-to-end by the three handle-driven twins, and this half is covered
+/// directly, including the case no handle produces.
+///
+/// The probe also recorded something worth keeping: a **socket** answers `Ok(0)`
+/// and would therefore classify as `Overlapped`. Nothing in this arm hands it a
+/// socket, but "mode 0 means overlapped" is a claim about file objects only, and
+/// the table above is the record that it was checked rather than assumed.
+fn classify_handle_mode(mode: std::io::Result<u32>, expected: HandleMode, name: &str) {
+    let mode = mode.unwrap_or_else(|error| {
         panic!(
             "HANDLE MODE UNVERIFIABLE for {name}: could not read the handle's \
              mode ({error}). This arm's only variable is the handle mode, so a \
@@ -652,7 +749,24 @@ fn verify_handle_mode(raw: std::os::windows::io::RawHandle, expected: HandleMode
              mean anything; it is not evidence that the mode is correct."
         )
     });
-    let actual = if synchronous {
+
+    // There are two synchronous modes, and the classifier this shares with the
+    // unbuffered arm tests only `FILE_SYNCHRONOUS_IO_NONALERT`. A handle with
+    // `FILE_SYNCHRONOUS_IO_ALERT` would therefore be classified `Overlapped` —
+    // the direction that manufactures a null. It is not reachable through
+    // `CreateFileW`, which is why the classifier is left as it is rather than
+    // widened underneath the unbuffered arm's published figures, but "not
+    // reachable" is checked here instead of assumed.
+    const FILE_SYNCHRONOUS_IO_ALERT: u32 = 0x0000_0010;
+    assert!(
+        mode & FILE_SYNCHRONOUS_IO_ALERT == 0,
+        "HANDLE MODE UNCLASSIFIABLE for {name}: the handle carries \
+         FILE_SYNCHRONOUS_IO_ALERT, which is synchronous but is not the bit \
+         this classifier tests, so it would be reported as Overlapped. Mode: \
+         {mode:#010x}"
+    );
+
+    let actual = if mode & crate::unbuffered_workload::FILE_SYNCHRONOUS_IO_NONALERT != 0 {
         HandleMode::Synchronous
     } else {
         HandleMode::Overlapped
@@ -1015,6 +1129,81 @@ mod tests {
 
         let (file, _path) = open_in(HandleMode::Synchronous, "rejects-synchronous");
         verify_handle_mode(file.as_raw_handle(), HandleMode::Overlapped, "probe");
+    }
+
+    /// A handle whose mode cannot be read is a failure, not an agreement.
+    ///
+    /// The twin for the branch that distinguishes "could not determine" from
+    /// "not synchronous". Without it, that branch could be replaced by
+    /// `.unwrap_or(0)` — which reads as harmless and would report every
+    /// unreadable handle as overlapped, i.e. as agreeing with whichever arm the
+    /// experiment most wants to be true.
+    ///
+    /// It drives [`classify_handle_mode`] rather than [`verify_handle_mode`],
+    /// because no real handle reaches this branch. That was established by
+    /// probing — a pipe answers `0x20`, a socket answers `0`, and only a value
+    /// that is not a handle fails. See [`classify_handle_mode`] for the table
+    /// and for why reaching it through a fabricated handle would be worse
+    /// evidence than reaching it directly.
+    #[test]
+    #[should_panic(expected = "HANDLE MODE UNVERIFIABLE")]
+    fn the_read_back_refuses_a_handle_it_cannot_classify() {
+        classify_handle_mode(
+            Err(std::io::Error::other("probe: query failed")),
+            HandleMode::Overlapped,
+            "probe",
+        );
+    }
+
+    /// The split between query and judgement did not cost the end-to-end path.
+    ///
+    /// [`classify_handle_mode`] exists so one branch can be reached directly,
+    /// and the hazard of splitting a checker is that the half left in place
+    /// stops being exercised through a real handle. This pins that the three
+    /// handle-driven twins still run against live handles by checking the one
+    /// property the split could have broken: that `verify_handle_mode` passes
+    /// the query's *result* through rather than a default.
+    #[test]
+    fn the_read_back_still_reads_a_real_handle() {
+        use std::os::windows::io::AsRawHandle;
+
+        for mode in [HandleMode::Overlapped, HandleMode::Synchronous] {
+            let (file, path) = open_in(mode, "split");
+            let queried = crate::unbuffered_workload::file_mode(&file)
+                .expect("a real file handle answers the mode query");
+            // The same input the read-back is given, judged the same way.
+            classify_handle_mode(Ok(queried), mode, "probe");
+            verify_handle_mode(file.as_raw_handle(), mode, "probe");
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// The read-back counter moves when the read-back runs, and only then.
+    ///
+    /// A counter that never moved would make every assertion built on it
+    /// vacuous, so both halves are checked here before anything else relies on
+    /// it.
+    #[test]
+    fn the_read_back_counter_counts_read_backs() {
+        use std::os::windows::io::AsRawHandle;
+
+        let before = handle_mode_checks();
+        let (file, path) = open_in(HandleMode::Overlapped, "counter");
+        assert_eq!(
+            handle_mode_checks(),
+            before,
+            "opening a file moved the read-back counter"
+        );
+        verify_handle_mode(file.as_raw_handle(), HandleMode::Overlapped, "probe");
+        assert_eq!(
+            handle_mode_checks(),
+            before + 1,
+            "the read-back did not move its own counter"
+        );
+
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
 
     /// What the kernel should report is assigned per variant, in both
