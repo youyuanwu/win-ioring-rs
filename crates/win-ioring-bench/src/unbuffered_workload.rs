@@ -514,8 +514,10 @@ mod tests {
         assert_eq!(
             file_mode(&plain).unwrap(),
             FILE_SYNCHRONOUS_IO_NONALERT,
-            "a plain File::open handle is expected to be synchronous and \
-             buffered, reporting exactly FILE_SYNCHRONOUS_IO_NONALERT"
+            "a plain std::fs::File::open handle is expected to be synchronous \
+             and buffered, reporting exactly FILE_SYNCHRONOUS_IO_NONALERT. \
+             Note this is the std constructor, not win_ioring's — the latter \
+             sets FILE_FLAG_OVERLAPPED and reports 0x00."
         );
         assert!(!is_unbuffered(&plain).unwrap());
 

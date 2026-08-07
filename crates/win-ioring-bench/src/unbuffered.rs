@@ -136,9 +136,15 @@ use crate::backend::{Availability, Backend, OpResult};
 ///
 /// `FILE_FLAG_NO_BUFFERING` is the point of the arm. `FILE_FLAG_OVERLAPPED` is
 /// not optional decoration: without it the kernel serialises operations at the
-/// file object, so a backend submitting at depth 64 gets a depth of one. See
-/// the rustdoc on `win_ioring::file::File::open`, which does *not* set it, and
-/// `crates/win-ioring-bench/tests/open_mode.rs`, which pins that.
+/// file object, so a backend submitting at depth 64 gets a depth of one.
+///
+/// This arm sets both flags explicitly and always has, opening through
+/// `File::from_std` rather than `File::open`. That is why the change of
+/// `win_ioring::file::File::open`'s default to overlapped did **not** disturb
+/// the figures published for this arm: the handles here never came from that
+/// constructor, so their mode did not change. The flags remain spelled out
+/// rather than delegated, because [`POOL_READ_FLAGS`] below deliberately
+/// differs and the two must stay visibly distinct.
 ///
 /// This is **not** what the thread-pool configurations use. See
 /// [`POOL_READ_FLAGS`].
@@ -472,11 +478,14 @@ impl Backend for UnbufferedIoRing {
     }
 
     async fn open_read(&self, path: &Path) -> io::Result<Self::File> {
-        // `File::from_std`, never `File::open` — the latter produces a
-        // synchronous handle, which serialises the ring down to one
-        // outstanding operation. That is documented on `File::open` and pinned
-        // by `tests/open_mode.rs`; this is the additive route around it that
-        // leaves the buffered arms bit-identical.
+        // `File::from_std`, never `File::open` — this arm needs
+        // `FILE_FLAG_NO_BUFFERING`, which no `win-ioring` constructor sets.
+        // `File::open` now supplies `FILE_FLAG_OVERLAPPED` on its own, so the
+        // overlapped half of the requirement is no longer the reason to route
+        // around it, but the unbuffered half still is. Keeping the explicit
+        // route also means this arm's handles are unaffected by any future
+        // change to that constructor's default, which is what let its published
+        // figures survive the change to overlapped intact.
         Ok(win_ioring::file::File::from_std(open_unbuffered(path)?))
     }
 
