@@ -67,6 +67,14 @@ The same code runs unchanged on Tokio's `LocalSet` and on a hand-written
 executor. The test suite asserts that by running one scenario under both and
 comparing the recorded output line for line.
 
+One caveat worth knowing before you scale it up: `File::open` and `File::create`
+produce **synchronous** handles, because `std` does not pass
+`FILE_FLAG_OVERLAPPED`. Windows then serialises I/O at the file object, so
+submitting many operations against one such handle yields a depth of one however
+many the ring holds. This is invisible against a warm cache and decisive once
+reads reach the device. To avoid it, open the file yourself with that flag and
+adopt it with `File::from_std` — the rustdoc on `File::open` shows how.
+
 ## Buffers are owned, not borrowed
 
 An operation can outlive the future awaiting it, because the kernel keeps
@@ -141,7 +149,11 @@ println!("{:?}", &buffer[..result?  as usize]);
 ## Is it faster?
 
 Measured, in [docs/performance.md](docs/performance.md), and the short answer is
-**sometimes, and only at low concurrency**. At one operation in flight this crate
+**it depends on whether the reads reach the device** — which turned out to matter
+far more than concurrency, buffer registration, or anything else measured here.
+
+**Against a warm page cache, only at low concurrency.** At one operation in
+flight this crate
 is ahead of `tokio::fs` on random reads at 0.58x — the one depth-1 result that
 resolves; its sequential-read and write-then-read leads (0.83x, 0.91x) sit inside
 the noise band and claim nothing. At
@@ -150,6 +162,28 @@ estimate, by 1.06x to
 1.40x with owned buffers and 1.11x to 1.47x with registered ones, though only six
 of those fourteen comparisons resolve statistically. That document is careful
 about which is which.
+
+**Unbuffered, the ranking changes and the design pays.** A cached `ReadFile`
+never blocks, so there is nothing for a completion-based interface to overlap and
+its per-operation machinery buys nothing. Reads issued with
+`FILE_FLAG_NO_BUFFERING` pay real device latency, and there a separate opt-in arm
+measures this crate at **7.84x faster than `tokio::fs`** at blocking-pool width 1
+on random reads with sixty-four operations in flight — the depth at which the
+warm-cache table has it losing.
+
+**That is not a claim to be the fastest, and the second number is not optional.**
+Against the honest competitor — `tokio::fs` at pool width 512 spread across
+sixty-four file handles, which also achieves deep outstanding I/O once latency is
+real — this crate **loses by 1.22x**. The advantage it does have is *resource
+cost*: it comes within 1.22x of the thread pool using one file handle, one
+thread, and no thread per outstanding operation. Neither figure means anything
+without the other, and neither is comparable to the warm-cache numbers above.
+
+That arm also corrected a framing this document had used for some time: for the
+thread pool, **file handle count was the variable, not pool width**. Adding 511
+threads to a one-handle configuration does nothing measurable; adding 63 handles
+at a fixed pool width moves the result nine to ten times. One handle is one
+queue, however many threads push on it.
 
 **And the loss is not the I/O ring's fault.** The comparison now runs five
 backends, the fifth being [`compio`](https://github.com/compio-rs/compio) — which
@@ -162,11 +196,22 @@ wins — it beats `tokio::fs` at depth 1 on both read scenarios, and is the
 fastest backend in the matrix at depth 1 on random read. Two implementations sharing no
 code and no kernel interface land inside each other's noise wherever the loss
 happens, so whatever causes it is not this crate's ring code and not the ring
-API. That document says what it does and does not narrow.
+API. That document says what it does and does not narrow. The unbuffered result
+above is consistent with this: the loss belongs to the *measurement condition* —
+a workload with no waiting to overlap — rather than to any of the three
+implementations.
 
 Run it yourself with `cargo bench -p win-ioring-bench` — about five minutes; one
 piece of application logic runs against every backend and any run that did not do
-identical work is rejected rather than reported. Every figure comes with a
+identical work is rejected rather than reported. The unbuffered arm is opt-in and
+kept out of that run, because its figures need their own noise band and are far
+more host-dependent:
+
+```text
+cargo bench -p win-ioring-bench --bench unbuffered
+```
+
+Every figure comes with a
 confidence interval, and `-- --save-baseline` and `-- --baseline` compare two
 runs. Treat the absolute figures as one host on one day — that document explains
 why, at some length, and explains which of the numbers above it declines to claim
