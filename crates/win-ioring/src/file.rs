@@ -209,6 +209,23 @@ impl File {
     /// against it will not get the behaviour a synchronous handle would have
     /// given.
     ///
+    /// Two concrete consequences for such a caller, both measured rather than
+    /// inferred:
+    ///
+    /// - A synchronous `ReadFile`/`WriteFile` with a null `OVERLAPPED` fails
+    ///   with `ERROR_INVALID_PARAMETER` (87). This is what `std::io::Read` and
+    ///   `std::io::Write` issue, so wrapping this handle back into a
+    ///   [`std::fs::File`] and reading from it will fail. It is not a silent
+    ///   wrong answer — it is a clean error — but it is an error where a
+    ///   synchronous handle succeeded.
+    /// - `std`'s positional `seek_read`/`seek_write` are unsafe to use
+    ///   concurrently against an overlapped handle: they require the operation
+    ///   to complete inline and abort the process if the kernel returns
+    ///   `STATUS_PENDING`, which a real device read does.
+    ///
+    /// Operations issued through this crate are unaffected: they always carry an
+    /// explicit offset and are completed through the ring.
+    ///
     /// # Getting a synchronous handle
     ///
     /// If you deliberately want one, open the file yourself and adopt it with

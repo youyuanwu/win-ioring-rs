@@ -103,9 +103,10 @@ pub fn prepare(which: Which, config: &Config, job: &Job<'_>) -> Result<Prepared,
                     reason: e.to_string(),
                 })
         }
-        Which::RingPlain => {
-            let mut backend =
-                ioring::IoRingPlain::new(depth, pool, capacity).map_err(|e| Unavailable {
+        Which::RingPlain | Which::RingPlainSync => {
+            let mut backend = ioring::IoRingPlain::new(depth, pool, capacity)
+                .map(|b| b.with_handle_mode(which.handle_mode()))
+                .map_err(|e| Unavailable {
                     name: "win-ioring (owned buffers)".to_owned(),
                     reason: e.to_string(),
                 })?;
@@ -117,11 +118,13 @@ pub fn prepare(which: Which, config: &Config, job: &Job<'_>) -> Result<Prepared,
                 handle,
             })
         }
-        Which::RingRegistered => {
-            let mut backend = ioring::IoRingRegistered::new(depth).map_err(|e| Unavailable {
-                name: "win-ioring (registered)".to_owned(),
-                reason: e.to_string(),
-            })?;
+        Which::RingRegistered | Which::RingRegisteredSync => {
+            let mut backend = ioring::IoRingRegistered::new(depth)
+                .map(|b| b.with_handle_mode(which.handle_mode()))
+                .map_err(|e| Unavailable {
+                    name: "win-ioring (registered)".to_owned(),
+                    reason: e.to_string(),
+                })?;
             let driver = backend.take_driver().expect("taken once");
             let handle = backend.handle();
             let registered = drive_while(

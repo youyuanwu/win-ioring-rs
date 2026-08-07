@@ -14,6 +14,7 @@ use std::path::Path;
 
 use win_ioring::runtime::SubmissionCounts;
 
+use crate::backends::ioring::HandleMode;
 use crate::concurrency::{Achieved, Depth, ShapeCheck};
 use crate::config::Config;
 use crate::fairness::{FairnessFailure, Ledger};
@@ -60,10 +61,36 @@ pub enum Which {
     /// them cannot say which of the two it is about. This one holds the
     /// completion model and drops the ring.
     Compio,
+    /// [`Which::RingPlain`], but opening **synchronous** handles.
+    ///
+    /// See [`Which::RingPlainSync`] and [`Which::RingRegisteredSync`] below for
+    /// why these are deliberately absent from [`Which::all`].
+    RingPlainSync,
+    /// [`Which::RingRegistered`], but opening **synchronous** handles.
+    RingRegisteredSync,
 }
 
 impl Which {
-    /// Every backend, in a fixed order.
+    /// Every backend in the **published matrix**, in a fixed order.
+    ///
+    /// The two `*Sync` variants are deliberately excluded. Two reasons, and the
+    /// first is structural rather than editorial:
+    ///
+    /// 1. `combinations % backends == 0` is asserted in this crate's tests, and
+    ///    the matrix has 10 combinations. Five backends divide it; six or seven
+    ///    do not, and the assertion's own message explains that relaxing it
+    ///    would silently give up the position balance that
+    ///    [`rotated_order`] exists to provide. Adding these to `all()` would
+    ///    therefore break a real fairness guarantee, not merely a count.
+    /// 2. The matrix answers "how does this crate compare to the alternatives",
+    ///    and a backend deliberately configured to be slower is not an
+    ///    alternative anyone would choose. It belongs to an experiment about
+    ///    *this crate's* behaviour, which is what the `handle-mode` arm is.
+    ///
+    /// That constraint was load-bearing rather than merely survived. Being
+    /// unable to widen the matrix forced the A/B into its own target, where the
+    /// budget affords A/Bing **both** ring backends — something the main-matrix
+    /// design wanted and could not afford.
     pub fn all() -> [Which; 5] {
         [
             Which::TokioOne,
@@ -72,6 +99,34 @@ impl Which {
             Which::RingRegistered,
             Which::Compio,
         ]
+    }
+
+    /// The handle mode this backend opens files in.
+    ///
+    /// Every non-ring backend reports [`HandleMode::Overlapped`] because that is
+    /// what it in fact produces: `compio` ORs the flag unconditionally in its
+    /// `OpenOptions`, and the thread-pool backends are discussed separately —
+    /// see the disclosure in `docs/performance.md`, because `tokio::fs` opens
+    /// through `std` and therefore does *not* get an overlapped handle. This
+    /// method describes the **ring** backends, which are the ones the
+    /// `handle-mode` arm varies; it is not a claim about `tokio::fs`.
+    pub fn handle_mode(self) -> HandleMode {
+        match self {
+            Which::RingPlainSync | Which::RingRegisteredSync => HandleMode::Synchronous,
+            _ => HandleMode::Overlapped,
+        }
+    }
+
+    /// The matrix backend this one shares everything but handle mode with.
+    ///
+    /// The pairing the A/B is computed over. Returns `self` for backends that
+    /// have no synchronous twin.
+    pub fn overlapped_twin(self) -> Which {
+        match self {
+            Which::RingPlainSync => Which::RingPlain,
+            Which::RingRegisteredSync => Which::RingRegistered,
+            other => other,
+        }
     }
 
     /// A short, stable, filesystem-safe identifier.
@@ -89,6 +144,8 @@ impl Which {
             Which::RingPlain => "ioring-owned",
             Which::RingRegistered => "ioring-registered",
             Which::Compio => "compio-iocp",
+            Which::RingPlainSync => "ioring-owned-sync",
+            Which::RingRegisteredSync => "ioring-registered-sync",
         }
     }
 
@@ -98,7 +155,13 @@ impl Which {
     /// of SC-014 is read against the ring combinations rather than against all of
     /// them.
     pub fn builds_a_driver(self) -> bool {
-        matches!(self, Which::RingPlain | Which::RingRegistered)
+        matches!(
+            self,
+            Which::RingPlain
+                | Which::RingRegistered
+                | Which::RingPlainSync
+                | Which::RingRegisteredSync
+        )
     }
 }
 
@@ -499,5 +562,159 @@ mod tests {
                 index % backends
             );
         }
+    }
+    /// Every slug is unique across **every** variant, not just `all()`.
+    ///
+    /// Slugs become directory names under `target/criterion` and are the keys a
+    /// stored baseline is matched on. Iterating `Which::all()` here would be a
+    /// gate that cannot fail for the variants this test most needs to cover:
+    /// the two `*Sync` variants are deliberately absent from `all()`, so an
+    /// `all()`-driven loop would never see them and a sync slug colliding with
+    /// a published one would overwrite a published baseline unnoticed.
+    #[test]
+    fn every_slug_is_unique_including_the_variants_outside_the_matrix() {
+        let every = every_variant();
+        assert!(
+            every.len() > Which::all().len(),
+            "this test is iterating only the matrix backends, so it cannot see \
+             the variants it exists to check"
+        );
+        for (i, a) in every.iter().enumerate() {
+            for b in &every[i + 1..] {
+                assert_ne!(
+                    a.slug(),
+                    b.slug(),
+                    "{a:?} and {b:?} share the slug {:?}, so one would \
+                     overwrite the other's stored baseline",
+                    a.slug()
+                );
+            }
+        }
+    }
+
+    /// The matrix must not contain the experimental variants.
+    ///
+    /// If one leaked into `all()`, the combination count would stop being a
+    /// whole number of cycles and the balance assertion would fire — but it
+    /// would fire reporting an arithmetic problem rather than the actual
+    /// mistake, so this says the actual thing.
+    #[test]
+    fn the_published_matrix_excludes_the_synchronous_variants() {
+        for which in Which::all() {
+            assert_eq!(
+                which.handle_mode(),
+                HandleMode::Overlapped,
+                "{which:?} is in the published matrix but opens synchronous \
+                 handles; the matrix compares this crate against alternatives, \
+                 and a deliberately-slowed configuration is not one"
+            );
+        }
+        assert!(
+            !Which::all().contains(&Which::RingPlainSync)
+                && !Which::all().contains(&Which::RingRegisteredSync),
+            "a *Sync variant reached the published matrix"
+        );
+    }
+
+    /// Handle mode is assigned per variant, in both directions.
+    ///
+    /// The negative half matters: a `handle_mode` hardcoded to `Overlapped`
+    /// satisfies every assertion about the matrix backends, and would silently
+    /// turn the A/B into a comparison of two identical arms.
+    #[test]
+    fn handle_mode_is_assigned_in_both_directions() {
+        assert_eq!(Which::RingPlain.handle_mode(), HandleMode::Overlapped);
+        assert_eq!(Which::RingRegistered.handle_mode(), HandleMode::Overlapped);
+        assert_eq!(Which::RingPlainSync.handle_mode(), HandleMode::Synchronous);
+        assert_eq!(
+            Which::RingRegisteredSync.handle_mode(),
+            HandleMode::Synchronous
+        );
+    }
+
+    /// Each synchronous variant pairs with the twin it differs from in exactly
+    /// one respect, and the pairing is not the identity.
+    #[test]
+    fn each_synchronous_variant_pairs_with_its_overlapped_twin() {
+        assert_eq!(Which::RingPlainSync.overlapped_twin(), Which::RingPlain);
+        assert_eq!(
+            Which::RingRegisteredSync.overlapped_twin(),
+            Which::RingRegistered
+        );
+        for which in [Which::RingPlainSync, Which::RingRegisteredSync] {
+            let twin = which.overlapped_twin();
+            assert_ne!(
+                twin, which,
+                "{which:?} is its own twin, so the A/B would compare a \
+                 measurement against itself and report no difference"
+            );
+            assert_eq!(
+                twin.handle_mode(),
+                HandleMode::Overlapped,
+                "{which:?}'s twin is not overlapped, so the pair does not \
+                 straddle the variable under test"
+            );
+            assert_eq!(
+                twin.builds_a_driver(),
+                which.builds_a_driver(),
+                "{which:?} and its twin disagree about building a driver, so \
+                 they differ in more than handle mode"
+            );
+        }
+    }
+
+    /// Both experimental variants build a driver.
+    ///
+    /// `builds_a_driver` gates the driver-count fairness check. A `*Sync`
+    /// variant omitted from it would build a driver that the check never
+    /// counted, which is a fairness hole rather than a cosmetic one.
+    #[test]
+    fn the_synchronous_variants_are_counted_as_driver_builders() {
+        assert!(Which::RingPlainSync.builds_a_driver());
+        assert!(Which::RingRegisteredSync.builds_a_driver());
+        assert!(!Which::TokioOne.builds_a_driver());
+    }
+
+    /// Every variant this enum has, including those outside the matrix.
+    ///
+    /// Written out rather than derived, so adding a variant without deciding
+    /// whether it belongs here is a compile error in `every_variant_is_listed`
+    /// below rather than a silent gap in the uniqueness check.
+    fn every_variant() -> Vec<Which> {
+        vec![
+            Which::TokioOne,
+            Which::TokioMany,
+            Which::RingPlain,
+            Which::RingRegistered,
+            Which::Compio,
+            Which::RingPlainSync,
+            Which::RingRegisteredSync,
+        ]
+    }
+
+    /// `every_variant` really is every variant.
+    ///
+    /// The exhaustive `match` is the assertion: adding a variant to `Which`
+    /// fails to compile here until it is listed above, which is what keeps the
+    /// uniqueness test from quietly stopping short of the new one.
+    #[test]
+    fn every_variant_is_listed() {
+        for which in every_variant() {
+            match which {
+                Which::TokioOne
+                | Which::TokioMany
+                | Which::RingPlain
+                | Which::RingRegistered
+                | Which::Compio
+                | Which::RingPlainSync
+                | Which::RingRegisteredSync => {}
+            }
+        }
+        assert_eq!(
+            every_variant().len(),
+            7,
+            "every_variant has changed size; update this count deliberately, \
+             and check the uniqueness test still covers what it should"
+        );
     }
 }
