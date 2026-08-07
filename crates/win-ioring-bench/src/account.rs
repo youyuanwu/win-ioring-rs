@@ -78,6 +78,31 @@ pub struct Budget {
 /// measured one would be a claim.
 pub const RUN_BUDGET: Duration = Duration::from_secs(360);
 
+/// The wall-clock budget for the **unbuffered** arm, which is a separate,
+/// opt-in target (`cargo bench --bench unbuffered`).
+///
+/// Deliberately not [`RUN_BUDGET`]. The two arms measure different things at
+/// different costs: the warm-cache matrix never touches the device, while every
+/// iteration here is device-bound. Sharing a budget would force one of them to
+/// be wrong — either this arm is squeezed below the point where it measures
+/// anything, or the 360 s that governs the project's primary published result
+/// gets raised to accommodate an arm that is not part of it.
+///
+/// The value is derived, not chosen for comfort. The grid is 2 scenarios × 3
+/// depths × 6 configurations = 36 benchmarks; at [`Budget::CHOSEN`] the
+/// Criterion floor is 36 × 3 s = 108 s, and at the floor-to-wall multipliers
+/// measured for the buffered arm (1.79x, 1.83x, 2.06x — see [`RUN_BUDGET`]) the
+/// projected real cost is 190–225 s.
+///
+/// 600 s leaves roughly 2.7x headroom over that projection, which is
+/// intentional rather than slack. Device-bound timings vary far more across
+/// host states — SLC cache exhaustion, thermal behaviour, background garbage
+/// collection — than warm-cache ones do, and the multipliers above were
+/// measured on the warm-cache arm, so they are an analogy here rather than a
+/// measurement. A budget that a slower drive silently blows is a budget that
+/// gets raised under pressure instead of respected.
+pub const UNBUFFERED_RUN_BUDGET: Duration = Duration::from_secs(600);
+
 impl Budget {
     /// The budget this suite actually runs at.
     ///

@@ -216,7 +216,7 @@ fails if any measured combination comes back **not timed**, which is what a time
 that stopped driving the closure would produce. Neither establishes that
 Criterion timed *that* closure; that rests on reading those ten lines.
 
-`cargo test --benches` runs the Criterion target in **test mode** — one iteration
+`cargo test --benches` runs the `comparison` Criterion target in **test mode** — one iteration
 per benchmark, against `Config::small()` and a working directory of its own — so
 `cargo test --workspace --all-targets` exercises preparation, warm-up,
 verification and teardown end to end for **thirty-five** combinations.
@@ -229,6 +229,18 @@ read was added, then twenty-eight; the path is the same one, but fifteen fewer
 combinations travel it.) The bench target detects test mode by
 Criterion's own rule rather than by testing for `--test` alone: a target that read
 it wrongly would build a 256 MiB working file inside the test suite.
+
+There are now **two** bench targets, and `--benches` does not reach both.
+`--benches` and `--all-targets` select bench targets by the manifest's `bench`
+flag, so they run `comparison` (which is `bench = true` by default) and skip
+`unbuffered` (which is `bench = false`, being opt-in). The unbuffered target is
+reached instead by its explicit `test = true`, which is what puts it in front of
+`cargo test`. That flag is load-bearing rather than decorative: `bench = false`
+on its own removes a target from *every* default command, including
+`cargo check --all-targets`, so a planted type error in it goes undetected and
+the target rots unnoticed while the build stays green. This was established by
+experiment, not inference, and the reasoning is recorded in full beside the
+stanza in `crates/win-ioring-bench/Cargo.toml`.
 
 The depths `Config::small()` resolves to are the ones with teeth. They are what
 every `cargo test` actually checks, so the closed-form depth predictions are
@@ -335,6 +347,93 @@ the pattern recurs, not because the specific tests matter.
   by content rather than by moving a file over it) and re-take any measurement
   made since. If a result changes when you add an observer that cannot affect it,
   suspect a stale artifact before you believe the result.
+
+### A passing negative test needs a twin that proves it can fail
+
+This is the general form of the list above, and it earned a name of its own
+because the unbuffered-arm work hit it **thirteen times in one feature**. Every
+instance was a gate that reported success while guarding nothing. None of them
+looked wrong.
+
+The rule: **when a test's job is to prove something is absent, broken, refused
+or prevented, a green result is ambiguous.** It means either "the guard held" or
+"the guard never ran", and those are indistinguishable from the outside. Pair it
+with a twin that establishes the test can fail at all — a mutation, a planted
+error, or a positive control asserting the precondition the guard depends on.
+
+The sub-species worth recognising, each from a real instance:
+
+- **The assertion is a tautology.** `mode & K == K` is satisfied by *any* `K`,
+  including zero; a counter incremented and then compared against itself proves
+  only that the loop ran.
+- **The test never constructs the thing it tests.** A test named for refusing
+  writes across every configuration enumerated the configurations and never
+  built a backend. It passed for the whole time it existed.
+- **The test reconstructs the logic instead of calling it.** A replacement test
+  for a flag-setting function inlined the same open rather than calling the
+  function, so mutating the function's flags to zero left the suite green. This
+  one was introduced *by the commit that fixed the previous instance*, while its
+  own docstring claimed the opposite.
+- **The precondition fires first.** A test for a free-list leak never reached the
+  free list, because a capacity check rejected the call earlier for an unrelated
+  reason. It asserted the right thing about a path it did not take.
+- **The fixture is too weak to exercise the failure.** A reproduction run against
+  a file created with `set_len` alone — never written, so never on the device —
+  showed both variants surviving. The confound was in the *verification of a
+  finding*, not in the code under test.
+- **The test is compiled but never executed.** A `#[test]` inside a
+  `harness = false` bench target is type-checked and then ignored:
+  `cargo test --all-targets` reports success with an unconditionally panicking
+  test in the file. Verified by planting both a type error (caught) and a
+  panicking test (not caught) in `benches/unbuffered.rs`. Guards belong in the
+  library, where they run. Note that `test = true` on such a target is still
+  load-bearing — it gets the target compiled and its `main` smoke-run — but it
+  does not run `#[test]` functions.
+- **A `compile_fail` doctest that no longer names anything.** After a rename it
+  fails to compile for the wrong reason and still reports `ok`.
+
+### Confounds that produce a believable number, not an obvious failure
+
+The `mtime` trap above is one species of a broader hazard, and the unbuffered
+work found another that behaves identically: **a confound whose output is a
+plausible measurement rather than a crash.** Those are the dangerous ones,
+because nothing prompts you to look.
+
+- **Buffered access poisons a file for unbuffered I/O.** A single buffered read
+  of a file collapses subsequent `FILE_FLAG_NO_BUFFERING` reads of that same
+  file from roughly 11 µs to roughly 126 µs per I/O, for the life of the
+  process. The benchmark's warm-cache arm reads its data file buffered before
+  every run, so an unbuffered arm that shared that file would have measured
+  about 115 µs/IO and concluded the ring gains nothing from bypassing the page
+  cache. That null result would have been *believed*: it agrees with the two
+  preceding features, both of which refuted their own premise. The arm therefore
+  keeps its own directory and its own data file, and `UnbufferedPath` enforces
+  the separation at the type level rather than by convention.
+
+- **The guard's own test suite reproduced the confound in-tree.** While the
+  poisoning guard was being written, two of its tests raced on a single file and
+  one of them performed a buffered open on a file another was measuring
+  unbuffered — which is precisely the failure the guard exists to prevent,
+  committed to the repository by the guard's own tests.
+
+### A standing bias hazard
+
+Not an incident. Worth keeping in front of anyone adding to `docs/performance.md`.
+
+This project has twice had a feature refute the premise that commissioned it,
+and both refutations were published as the headline. That is the right
+behaviour and it is the reason the numbers here are trustworthy. But it has a
+side effect: **the project is now primed to accept unflattering results with
+less scrutiny than flattering ones.** A result that says "the crate does not
+win" matches the established pattern, reads as intellectual honesty, and invites
+no further checking — which makes a *false* negative the cheapest error to
+publish and the least likely to be caught.
+
+The buffered-poisoning confound is exactly that shape: it would have produced a
+null result, in a project that expects null results, from a measurement error.
+Scrutinise a finding because it is surprising *or* because it is expected, not
+only because it is convenient.
+
 
 ### Proving a wakeup cannot be lost
 

@@ -420,3 +420,54 @@ closed-form prediction for the declared shape and routes a mismatch through
 - `deferred_cancels` is drained only by `cancel_abandoned`, which runs only after
   a *successful* `submit_pending`. If submission never succeeds before shutdown,
   tokens accumulate until teardown. Harmless — bounded by `MAX_SLOTS`.
+
+## Handle mode: `File::open` and `FILE_FLAG_OVERLAPPED`
+
+Found while building the unbuffered arm (see
+[performance.md](performance.md#unbuffered-reads-that-reach-the-device)). Both
+items are recorded with their cost because the cost is the reason neither was
+done at the time.
+
+- **Should `win_ioring::file::File::open` set `FILE_FLAG_OVERLAPPED`?** It does
+  not. It delegates to `std::fs::File::open`, which opens a *synchronous* handle,
+  and on a synchronous handle the kernel serialises operations at the file object
+  regardless of how many the caller has outstanding. For an asynchronous I/O
+  crate that is arguably a defect in the API rather than a benchmark artifact:
+  the interface promises overlapping and the default handle cannot deliver it.
+
+  The unbuffered arm measured what it costs. Reading through a synchronous
+  handle, requests queue behind one another at the file object no matter what
+  depth the ring is driving, which is why that arm opens its own handles with the
+  flag set via `File::from_std` rather than using `File::open`.
+
+  It was **not changed**, and the reason is cost, not doubt.
+  `File::open` is inside the timed region of every one of the 50 published
+  warm-cache cells in [performance.md](performance.md). Changing it would
+  invalidate that matrix and require re-running and republishing all of it, which
+  is out of scope for the feature that found the problem. The additive route was
+  taken instead: `File::from_std` already accepts a handle opened with whatever
+  flags the caller wants, so the capability exists and only its discoverability
+  is missing. `crates/win-ioring/src/file.rs` documents it, and
+  `crates/win-ioring-bench/tests/open_mode.rs` pins the current default so a
+  change to it fails a test rather than silently altering the published figures.
+
+- **Should the published warm-cache ring figures carry a note that they were
+  measured on synchronous handles?** Probably yes, for a reader's sake rather
+  than for accuracy. Under a warm page cache nothing ever waits — a `ReadFile`
+  returns after a memory copy — so serialising at the file object should cost
+  nothing there, and the figures are very unlikely to be wrong.
+
+  That is a **mechanism argument, not a measurement**: no warm-cache A/B on the
+  flag has been run, and the unbuffered arm cannot supply one, since it is
+  defined by `FILE_FLAG_NO_BUFFERING` and so has no warm-cache half. Its handle
+  modes are also confounded with backend identity — the ring and compio
+  configurations open with `FILE_FLAG_OVERLAPPED` and the thread-pool ones
+  without — so it is not a clean A/B on the flag even unbuffered. Running one
+  would cost a small dedicated probe; it has not been done.
+
+  But the unbuffered section states plainly that it opens its handles
+  differently, and a reader comparing the two sections will notice the
+  discrepancy. They should not have to rediscover from first principles why it
+  does not matter. Cost: a paragraph. The reason it is not already written is
+  that it belongs next to a re-run of the matrix if the item above is ever taken,
+  and writing it twice would be worse than writing it once.

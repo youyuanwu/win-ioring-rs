@@ -115,11 +115,64 @@ impl File {
     }
 
     /// Opens a file for reading.
+    ///
+    /// # This produces a *synchronous* handle
+    ///
+    /// The handle comes from [`std::fs::File::open`], which does not pass
+    /// `FILE_FLAG_OVERLAPPED`. Windows therefore creates it with
+    /// `FILE_SYNCHRONOUS_IO_NONALERT`, and **the file object serialises I/O**:
+    /// at most one operation is in flight against it at a time, no matter how
+    /// many this crate submits to the ring.
+    ///
+    /// That is a real limitation of this constructor, not a detail. Submitting
+    /// at depth 64 against such a handle yields a depth of one — a consequence
+    /// of the serialisation the kernel performs at the file object, argued from
+    /// the mechanism rather than measured here.
+    ///
+    /// The effect is invisible under a warm page cache, where a cached read
+    /// returns synchronously after a memory copy and there is nothing to
+    /// overlap. It becomes decisive as soon as reads reach the device. (The
+    /// warm-cache half of that is a mechanism argument, not a measurement: no
+    /// A/B on the flag under a warm cache has been run.)
+    ///
+    /// # Getting an overlapped handle
+    ///
+    /// Open the file yourself and adopt it with [`File::from_std`]:
+    ///
+    /// ```no_run
+    /// use std::os::windows::fs::OpenOptionsExt;
+    ///
+    /// // FILE_FLAG_OVERLAPPED
+    /// const OVERLAPPED: u32 = 0x4000_0000;
+    ///
+    /// let std_file = std::fs::OpenOptions::new()
+    ///     .read(true)
+    ///     .custom_flags(OVERLAPPED)
+    ///     .open("data.bin")?;
+    /// let file = win_ioring::file::File::from_std(std_file);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// Whether this function should set the flag itself is an open question,
+    /// which `docs/pending-work.md` records with its cost, under "Handle mode".
+    /// It is not
+    /// changed here because the twenty `win-ioring` cells of the fifty in the
+    /// published matrix (see "Full result" in `docs/performance.md`) were all
+    /// measured through handles from this function and from [`File::create`],
+    /// and that matrix is a single-run artefact that is never patched from a
+    /// second run — so re-measuring any part of it means re-running all fifty.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::open(path)?))
     }
 
     /// Creates or truncates a file for writing.
+    ///
+    /// Produces a **synchronous** handle, with the same consequences described
+    /// on [`File::open`]: the file object serialises I/O regardless of the
+    /// depth submitted. To obtain one that does not, open the file yourself
+    /// with `FILE_FLAG_OVERLAPPED` alongside the write access this function
+    /// implies — `.write(true).create(true).truncate(true)` — and adopt it with
+    /// [`File::from_std`].
     pub fn create(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         Ok(Self::from_std(std::fs::File::create(path)?))
     }
