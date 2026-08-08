@@ -426,6 +426,21 @@ impl std::error::Error for Error {
     }
 }
 
+impl From<crate::io_ring::ops::MissingField> for Error {
+    /// Widens a builder's missing-field report into the crate-wide error.
+    ///
+    /// The same condition lives in both types on purpose. The operation
+    /// builders can fail in exactly one way, so they say so
+    /// ([`MissingField`](crate::io_ring::ops::MissingField)); the driver's
+    /// registration entry points report a missing field too but sit on the data
+    /// path, where every other variant is also reachable. This conversion keeps
+    /// `?` working across that seam rather than forcing the narrow type to widen
+    /// at each call site.
+    fn from(value: crate::io_ring::ops::MissingField) -> Self {
+        Error::MissingField { field: value.field }
+    }
+}
+
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
         Error::from_hresult(value.code())
