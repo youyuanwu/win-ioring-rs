@@ -224,15 +224,7 @@ mod tests {
     }
 
     /// A name unique to this test run, so tests can run in parallel.
-    fn unique(tag: &str) -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        format!(
-            "win-ioring-test-{tag}-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        )
-    }
+    use crate::pipe::unique_name as unique;
 
     #[test]
     fn a_client_connects_to_a_waiting_instance() {

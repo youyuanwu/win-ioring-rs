@@ -21,6 +21,48 @@
 //! entry. That asymmetry is a property of the platform, not an artefact of this
 //! crate's design, and it has consequences a caller can observe.
 //!
+//! # Dropping an accept does not cancel it
+//!
+//! This is the module's central safety argument, and it is the same one
+//! `docs/buffer-ownership.md` makes for buffers: when the kernel is writing into
+//! memory, that memory cannot belong to something the caller is free to drop.
+//!
+//! An overlapped `ConnectNamedPipe` hands the kernel a pointer to an
+//! `OVERLAPPED` and returns immediately. The kernel writes the result into that
+//! structure whenever the client eventually arrives — which may be long after
+//! the caller has lost interest. If the `OVERLAPPED` lived inside the accept
+//! future, dropping that future would free memory the kernel still holds a
+//! pointer to, and the write would land in freed memory. That is a
+//! use-after-free with no diagnostic: it corrupts whatever was allocated there
+//! next, at a time unrelated to the code that caused it.
+//!
+//! So the `OVERLAPPED` lives in a heap allocation owned by the [`Server`], not
+//! by the [`Accept`] future. Two consequences follow, and both are observable:
+//!
+//! - **Dropping an accept future does not cancel the accept.** The connect stays
+//!   pending in the kernel and the server keeps the memory it is writing to. A
+//!   dropped future abandons the caller's *interest*, not the operation, and a
+//!   later [`Server::accept`] **resumes** that same operation rather than
+//!   submitting a second one. A client that arrives while no future is waiting
+//!   is therefore not lost.
+//! - **The server, not the future, is what is torn down carefully.** Cancelling
+//!   and collecting happens when the [`Server`] is dropped, which is the only
+//!   point that can establish the kernel is finished with the allocation.
+//!
+//! # Reusing an instance takes an explicit accept
+//!
+//! Stated here because the natural assumption is wrong and the failure is
+//! silent. A **freshly created** instance admits a client with no call from this
+//! crate at all. An instance returned to service by [`Server::disconnect`] does
+//! **not** — the platform refuses clients with `ERROR_PIPE_BUSY` until a further
+//! [`Server::accept`] has submitted a connect. Measured, not inferred.
+//!
+//! So a server that disconnects a client and then waits for the next one without
+//! accepting again serves exactly one client and then refuses every other, with
+//! `Ok` from every call it makes. The idiom is `disconnect` followed immediately
+//! by `accept`, and [`Server::accepts_clients`] reports which side of that gap
+//! an instance is on.
+//!
 //! # What this module does not do
 //!
 //! - **Message mode is not supported.** Instances are byte mode. A partial read
@@ -37,8 +79,10 @@
 //!   not yet accept.
 
 mod client;
+mod server;
 
 pub use client::{Client, ClientOptions};
+pub use server::{Accept, Server, ServerOptions};
 
 /// The prefix every pipe path carries on the local machine.
 const LOCAL_PREFIX: &str = r"\\.\pipe\";
@@ -57,6 +101,21 @@ pub(crate) fn qualify(name: &str) -> String {
     } else {
         format!("{LOCAL_PREFIX}{name}")
     }
+}
+
+/// A pipe name unique to this test run, so tests may run in parallel.
+///
+/// The process id is what separates concurrent `cargo test` invocations; the
+/// counter separates tests within one.
+#[cfg(test)]
+pub(crate) fn unique_name(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "win-ioring-test-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
