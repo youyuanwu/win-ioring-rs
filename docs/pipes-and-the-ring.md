@@ -172,3 +172,10 @@ would follow from denying it. Pre-created instance pools, a blocking-thread hop,
 and a synchronous accept on a dedicated handle were all considered; each hides
 the asymmetry somewhere less visible rather than removing it. The overlapped
 route at least puts the exception where a reader can find it.
+
+One consequence reaches further than pipes. Because a connected pipe *is* a
+`File` — `Server::file` hands one out and `Client` derefs into one — pipe I/O
+uses the same futures and the same completion path as file I/O, so it also uses
+the same error type. That is why the crate's errors cannot be split per API, and
+why `PipeBroken` has no producer anywhere under `pipe/`. See
+`docs/errors-and-the-funnel.md`.
