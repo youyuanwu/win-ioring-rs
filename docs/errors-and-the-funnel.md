@@ -10,10 +10,10 @@ will still hold next time unless the architecture changes.
 
 ## The question
 
-`crate::Error` has 25 variants and every fallible API in the crate returns it.
-So `IoRing::builder().build()` can return `PipeBroken`, and
-`RegisteredBuffers::check_out()` can return `NoFileOffset`. Neither can actually
-happen. A caller reading the signature cannot tell.
+Before this change, `crate::Error` had 25 variants and every fallible API in the
+crate returned it. So `IoRing::builder().build()` could return `PipeBroken`, and
+`RegisteredBuffers::check_out()` could return `NoFileOffset`. Neither can
+actually happen. A caller reading the signature cannot tell.
 
 The obvious fix is one error type per module: `io_ring::Error`, `runtime::Error`,
 `file::Error`, `pipe::Error`. The obvious fix does not work.
@@ -26,7 +26,7 @@ shared 15 include every variant a caller is most likely to match on.
 
 Three structural reasons, each checkable.
 
-### 1. The pipe error variants have no producer in `pipe/`
+### 1. Three pipe error variants have no producer in `pipe/`
 
 `PipeBusy`, `PipeBroken` and `PipeNoPeer` are constructed in exactly one place in
 the entire crate: `Error::from_hresult` in `error.rs`. Nothing under `pipe/`
@@ -58,7 +58,7 @@ under "file" because of where it is constructed gets it exactly backwards.
 
 ### 3. The driver classifies the error before it knows the operation
 
-In `Driver::reap_completions`:
+In `DriverInner::reap_completions`:
 
 ```rust
 let result = match cqe.ResultCode.ok() {
@@ -94,7 +94,8 @@ accident.
 | `ShuttingDown`, `AbandonedAtShutdown` | teardown resolves any operation |
 | `BufferTooSmall`, `UninitializedWriteRange` | `buf`'s check functions are public *and* called by `try_read`/`try_write` |
 | `MissingField` | driver registration reports it too |
-| `PipeBusy`, `PipeBroken`, `PipeNoPeer`, `PipeListening` | one classifier, reachable from all four surfaces |
+| `PipeBusy`, `PipeBroken`, `PipeNoPeer` | one classifier, reachable from all four surfaces |
+| `PipeListening` | classified from `ERROR_PIPE_LISTENING` like the three above, *and* produced directly in `pipe/server.rs` |
 | `OperationOutstanding`, `NoFileOffset` | produced in `file.rs`, reachable on a pipe through `Deref` |
 
 Ten variants do partition: `Unsupported`, `UnsupportedVersion` and

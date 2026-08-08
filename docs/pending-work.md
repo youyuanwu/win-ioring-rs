@@ -233,13 +233,14 @@ Carving a `RegistryError` for `RegisteredBuffers::check_out` and
 `RegistrationPending`, `RegistrationSuperseded`, `InvalidRegisteredIndex`,
 `BufferCheckedOut`, `BufferTooSmall`.
 
-Declined on cost. All six remain reachable on the `Handle` data path
-(`register_buffers`, `read_registered`), so the carve duplicates six conditions
-while removing none — six of the eight duplications the full proposal would have
-introduced, for two methods. And the set it would enforce is **already written
-out verbatim** in those methods' own rustdoc, which lists the refusals in order
-with the reason for each. The carve buys compiler enforcement of a promise the
-documentation already makes precisely, at +6 variant slots.
+Declined on cost. All six remain reachable elsewhere — five on the `Handle` data
+path (`register_buffers`, `read_registered`), and `BufferTooSmall` from
+`Handle::read`, whose capacity check produces it — so the carve duplicates six
+conditions while removing none: six of the eight duplications the full proposal
+would have introduced, for two methods. And the set it would enforce is
+**already written out verbatim** in those methods' own rustdoc, which lists the
+refusals in order with the reason for each. The carve buys compiler enforcement
+of a promise the documentation already makes precisely, at +6 variant slots.
 
 Both of these were declined together with a wider per-module split; see
 `docs/errors-and-the-funnel.md` for why the errors do not partition by API at
