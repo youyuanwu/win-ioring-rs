@@ -101,6 +101,30 @@ Any type implementing `IoBuf`/`IoBufMut` works; `Vec<u8>`, `Box<[u8]>` and
 because they promise the kernel a stable address and an honest initialized
 length that the compiler cannot check for you.
 
+## Named pipes
+
+The crate ships a named pipe server and client alongside `File`, in the same
+runtime-agnostic, single-threaded style: `pipe::ServerOptions` creates an
+instance, `Server::accept` resolves when a client connects, and `pipe::Client`
+opens the other end. Both lend the crate's `File`, so reads, writes and both
+registration paths work against a pipe with no pipe-specific operations.
+
+**Half of this cannot go through the ring, and the crate says so rather than
+hiding it.** The op-code set the platform exposes is closed and contains no
+`ConnectNamedPipe`, so the server-side accept runs as an overlapped Win32 call
+whose completion reaches the crate through the same thread-pool wait the driver
+uses for its own wake signal. Reads and writes are unaffected. The consequences —
+an accept the driver does not know about, a teardown that leaks deliberately
+rather than free memory the kernel may still hold, and a flush the crate cannot
+bound — are set out in [pipes and the ring](docs/pipes-and-the-ring.md).
+
+Two limits are worth knowing before you reach them. Message-mode pipes are not
+supported: `BufResult` pairs one result with one buffer, and a truncated message
+is neither. And the cursor-based `File::read` / `File::write` refuse a pipe
+outright, because a pipe ignores the file offset they supply and would otherwise
+return success with bytes from somewhere you never asked for. Use the positional
+`Handle::read` / `Handle::write`, which the pipe types use themselves.
+
 ## Cancellation and shutdown
 
 **Dropping a future is always safe and never blocks.** It detaches and, where the
@@ -118,8 +142,16 @@ does not pretend otherwise.
 operations already in flight finish. `Handle::shutdown_now` asks it to cancel
 them instead. Either way the driver drains until every operation has reported,
 and only then closes the ring and releases what it was holding. **Shutdown never
-abandons memory**: every buffer comes back, every handle is closed, every
-registration is freed.
+abandons memory**: every buffer comes back, every registration is freed, and
+every handle the driver owns is closed.
+
+That last clause is narrower than it looks, and the narrowing matters. The
+driver closes what the *driver* holds. A pipe server that cannot establish
+whether the kernel has finished with a pending accept deliberately leaks: it
+forgets its `OVERLAPPED` and holds its event handle open rather than freeing
+memory the kernel may still write to. That is the same principle — never abandon
+memory the kernel owns — reaching the opposite conclusion about a resource the
+ring never held. See [pipes and the ring](docs/pipes-and-the-ring.md).
 
 Draining is unbounded, because the alternative is worse. Closing the ring does
 not cancel in-flight operations and does not wait for them — the platform

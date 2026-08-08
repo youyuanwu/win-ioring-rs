@@ -111,10 +111,19 @@ impl AsyncEvent {
 ///
 /// `Drop` waits out any running callback with a blocking `UnregisterWaitEx`.
 /// That is sound only because it can never run *on* a callback thread: an
-/// `ArmedEvent` is reachable only from the `Driver` that owns it, and `Driver`
-/// is `!Send` (asserted by a `compile_fail` doc-test), so a waker woken on a
-/// pool thread cannot legally poll it there. The `PhantomData` below makes that
-/// argument compiler-checked rather than a review obligation.
+/// `ArmedEvent` is reachable only from the `Driver` that owns it or from a
+/// [`crate::pipe::Server`]'s accept, neither of which is reachable from a pool
+/// thread — `Driver` is `!Send` (asserted by a `compile_fail` doc-test), as is
+/// `Server`, so a waker woken on a pool thread cannot legally poll either there.
+/// The `PhantomData` below makes that argument compiler-checked rather than a
+/// review obligation.
+///
+/// The accept path is the second owner, added after this comment was written,
+/// and it is worth naming because it does *not* use the fused teardown below:
+/// it releases the registration first, on its own, and only then collects. The
+/// reason is that a blocking collect and a callback that may still fire are two
+/// consumers of one auto-reset signal, which was measured deadlocking. See
+/// [`release_registration`].
 ///
 /// Making this type public would give that guarantee away, and the teardown
 /// would then need the two-path form the per-wait future used to have —
@@ -135,6 +144,14 @@ pub(crate) struct ArmedEvent {
     raw: *const ArmedShared,
     /// Our end of the shared state.
     shared: Arc<ArmedShared>,
+    /// Whether the registration is still live. See `Registration`.
+    ///
+    /// The teardown steps are separately callable so that a caller which needs
+    /// the registration released *before* the value is dropped can do so; this
+    /// field is what keeps the release idempotent across that split. Calling
+    /// `UnregisterWaitEx` twice on one registration does not return an error —
+    /// it terminates the process with `STATUS_INVALID_PARAMETER`.
+    registration: Registration,
     /// Makes the type `!Send` and `!Sync`, which is what licenses the blocking
     /// unregister in `Drop`.
     _not_send: PhantomData<*const ()>,
@@ -171,6 +188,87 @@ struct ArmedState {
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_ARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam: forces the next unregister to fail.
+//
+// Same reasoning as `FAIL_NEXT_ARM`, and the same thread-local scoping for the
+// same reason. This one exists because `Drop`'s leak-rather-than-close branch
+// was unreachable under test: `UnregisterWaitEx` has no reproducible failure
+// mode either, so the branch that declines to close the handle had never been
+// executed by anything. A branch no test can reach is a branch no test can
+// check, which is the condition the ordering test below exists to end.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_UNREGISTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the thread-pool registration is still live.
+///
+/// Three states rather than a boolean, because `Released` and `Failed` license
+/// **opposite** actions: after a successful release the count may be reclaimed
+/// and the handle closed, while after a failed one neither may ever happen. A
+/// boolean would have to pick one of those to conflate with `Live`, and both
+/// conflations are unsound in one direction.
+///
+/// `pub(crate)` in every configuration, not only under `cfg(test)`: the pipe
+/// server's teardown releases the registration before its blocking collect and
+/// must branch on the result in shipped code, because a failed release means the
+/// pool may still be a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// Registered with the thread pool; the release step has not run.
+    Live,
+    /// `UnregisterWaitEx` succeeded. No callback is running or can start.
+    Released,
+    /// `UnregisterWaitEx` failed. A callback may still be running, so the count
+    /// must never be reclaimed and the handle must never be closed.
+    Failed,
+}
+
+/// One teardown step, recorded as it is performed.
+///
+/// The recording lives *inside* the helper that does the work, not beside the
+/// call to it, so that transposing two calls transposes the trace. Recording
+/// held separately from the operations would pin the order of the
+/// instrumentation and leave the order of the work unmeasured — which is the
+/// precise failure this trace exists to rule out.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// `UnregisterWaitEx` was called. Carries whether it reported success.
+    Unregister { succeeded: bool },
+    /// The release step was entered in a state that was not `Live`, so it did
+    /// nothing. Carries the state it observed.
+    ///
+    /// This is what makes "the guard branch is never taken on the driver's
+    /// path" a measurable claim rather than an assertion about the driver: the
+    /// driver's own teardown must produce a trace with no `ReleaseSkipped` in
+    /// it.
+    ReleaseSkipped(Registration),
+    /// The operating system's reference count was reclaimed.
+    Reclaim,
+    /// The event handle was closed.
+    Close,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEARDOWN_TRACE: std::cell::RefCell<Vec<Step>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record(step: Step) {
+    TEARDOWN_TRACE.with(|t| t.borrow_mut().push(step));
+}
+
+/// Test seam: clears the trace and returns what a closure's teardown recorded.
+#[cfg(test)]
+pub(crate) fn trace_of(f: impl FnOnce()) -> Vec<Step> {
+    TEARDOWN_TRACE.with(|t| t.borrow_mut().clear());
+    f();
+    TEARDOWN_TRACE.with(|t| t.borrow().clone())
 }
 
 impl ArmedEvent {
@@ -248,6 +346,7 @@ impl ArmedEvent {
             wait,
             raw,
             shared,
+            registration: Registration::Live,
             _not_send: PhantomData,
         })
     }
@@ -299,6 +398,122 @@ impl ArmedEvent {
         FAIL_NEXT_ARM.with(|f| f.set(true));
     }
 
+    /// Test seam: makes the next `UnregisterWaitEx` on this thread fail.
+    ///
+    /// Exposed beyond this module because the pipe server's teardown is the
+    /// second `UnregisterWaitEx` call site in the crate, and its
+    /// failed-release branch is the one FR-014's rationale singles out: a
+    /// failed release means the pool may still be a consumer, which is the
+    /// entire premise of releasing before the collect. Without the seam that
+    /// branch cannot be reached by any test, in either caller.
+    #[cfg(test)]
+    pub(crate) fn fail_next_unregister() {
+        FAIL_NEXT_UNREGISTER.with(|f| f.set(true));
+    }
+
+    /// Releases the thread-pool registration, blocking until no callback for it
+    /// is running or can start. Idempotent.
+    ///
+    /// This is step one of three, and the only one that may run before the
+    /// value is dropped. Splitting it out lets a caller holding an `ArmedEvent`
+    /// through an operation the kernel may still be writing to release the
+    /// registration at a point of its choosing, and then let `Drop` do the
+    /// remaining two steps in their established order.
+    ///
+    /// Returns the state the registration is now in, which is also what the
+    /// caller must consult before doing anything else: a `Failed` release means
+    /// the count must never be reclaimed and the handle must never be closed.
+    ///
+    /// The guard is not an optimisation. `UnregisterWaitEx` called twice on one
+    /// registration **terminates the process** with `STATUS_INVALID_PARAMETER`
+    /// rather than returning an error, so a second call is not something a
+    /// caller could detect and recover from.
+    pub(crate) fn release_registration(&mut self) -> Registration {
+        if self.registration != Registration::Live {
+            #[cfg(test)]
+            record(Step::ReleaseSkipped(self.registration));
+            return self.registration;
+        }
+
+        // `INVALID_HANDLE_VALUE` asks the operating system to wait until every
+        // callback for this registration has finished. Two things depend on it:
+        // the reference count is only ours to reclaim once no callback can still
+        // borrow it, and the event handle must not close while a wait is still
+        // pending on it — the platform calls that undefined.
+        //
+        // Blocking here is safe only because this cannot run on a callback
+        // thread; see the type's documentation. No lock is held across the call:
+        // the callback releases the mutex before waking, so it can never be
+        // holding it while this waits the callback out.
+        #[cfg(test)]
+        let unregistered = if FAIL_NEXT_UNREGISTER.with(|f| f.replace(false)) {
+            Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            ))
+        } else {
+            // SAFETY: as below.
+            unsafe { UnregisterWaitEx(self.wait, Some(INVALID_HANDLE_VALUE)) }
+        };
+
+        // SAFETY: `self.wait` came from a successful registration, and the guard
+        // above is what makes "has not been unregistered before now" true — it
+        // is the only path to this call, and it runs only from the `Live` state,
+        // which this call then leaves.
+        #[cfg(not(test))]
+        let unregistered = unsafe { UnregisterWaitEx(self.wait, Some(INVALID_HANDLE_VALUE)) };
+
+        self.registration = if unregistered.is_ok() {
+            Registration::Released
+        } else {
+            Registration::Failed
+        };
+
+        #[cfg(test)]
+        record(Step::Unregister {
+            succeeded: unregistered.is_ok(),
+        });
+
+        self.registration
+    }
+
+    /// Reclaims the reference count handed to the operating system at arming.
+    ///
+    /// Step two of three. Sound only after a *successful* release: the count is
+    /// what the callback borrows, so reclaiming it while a callback could still
+    /// start would free state that callback is about to touch.
+    ///
+    /// # Safety
+    ///
+    /// `release_registration` must have returned `Released`, and this must not
+    /// have been called before.
+    unsafe fn reclaim_count(&mut self) {
+        #[cfg(test)]
+        record(Step::Reclaim);
+        // SAFETY: the caller has established that the blocking unregister
+        // succeeded, so no callback is running or can start, and that this runs
+        // exactly once. The callback never reclaims this count itself.
+        unsafe { drop(Arc::from_raw(self.raw)) };
+    }
+
+    /// Closes the event handle.
+    ///
+    /// Step three of three, and last for a reason: closing a handle with a wait
+    /// still pending on it is undefined, so this may only follow a successful
+    /// release.
+    ///
+    /// # Safety
+    ///
+    /// `release_registration` must have returned `Released`, this must not have
+    /// been called before, and the value must not be used afterwards.
+    unsafe fn close_event(&mut self) {
+        #[cfg(test)]
+        record(Step::Close);
+        // SAFETY: the caller has established that no wait is pending on this
+        // handle and that this runs exactly once on a value about to be
+        // destroyed.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.event) };
+    }
+
     /// Test seam: a weak handle to the shared state, so a test can tell a leak
     /// from a correct reclaim by whether the allocation outlived this value.
     #[cfg(test)]
@@ -308,41 +523,33 @@ impl ArmedEvent {
 }
 
 impl Drop for ArmedEvent {
+    /// Unregister, then reclaim, then close.
+    ///
+    /// The order is the point, and it is now pinned by a test rather than by
+    /// this comment — see `teardown_runs_unregister_then_reclaim_then_close`.
+    /// Each step records itself from inside the helper that performs it, so
+    /// transposing two of these calls transposes the recorded trace.
+    ///
+    /// A failed release stops the sequence here. The wait may still be pending,
+    /// so closing the handle would be undefined and reclaiming the count could
+    /// free state a callback is about to touch. Leak both instead — the event is
+    /// `ManuallyDrop` precisely so this path can decline to close it. This
+    /// crate's standing rule is to leak or abort rather than reach undefined
+    /// behaviour, and a failed unregister has no recovery that is not one of
+    /// those.
     fn drop(&mut self) {
-        // `INVALID_HANDLE_VALUE` asks the operating system to wait until every
-        // callback for this registration has finished. Two things depend on it:
-        // the reference count below is only ours to reclaim once no callback
-        // can still borrow it, and the event handle must not close while a wait
-        // is still pending on it — the platform calls that undefined.
-        //
-        // Blocking here is safe only because this cannot run on a callback
-        // thread; see the type's documentation. No lock is held across the call:
-        // the callback releases the mutex before waking, so it can never be
-        // holding it while this waits the callback out.
-        // SAFETY: `self.wait` came from a successful registration and has not
-        // been unregistered before now.
-        let unregistered = unsafe { UnregisterWaitEx(self.wait, Some(INVALID_HANDLE_VALUE)) };
-
-        if unregistered.is_err() {
-            // The wait may still be pending, so closing the handle would be
-            // undefined and reclaiming the count could free state a callback is
-            // about to touch. Leak both instead — the event is `ManuallyDrop`
-            // precisely so this path can decline to close it. This crate's
-            // standing rule is to leak or abort rather than reach undefined
-            // behaviour, and a failed unregister has no recovery that is not one
-            // of those.
+        if self.release_registration() == Registration::Failed {
             return;
         }
 
-        // SAFETY: the blocking unregister above succeeded, so no callback is
-        // running or can start, and this count is reclaimed exactly once — the
-        // callback never touches it.
-        unsafe { drop(Arc::from_raw(self.raw)) };
-        // Only now is the handle safe to close. The order is the point:
-        // unregister, then reclaim, then close.
-        // SAFETY: reached on the only path that gets here, exactly once, and
-        // never again because `self` is being destroyed.
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.event) };
+        // SAFETY: the release above returned `Released` — either here or at an
+        // earlier explicit release, which the guard makes idempotent — so no
+        // callback is running or can start. Both run exactly once because
+        // `self` is being destroyed and nothing can call them again.
+        unsafe {
+            self.reclaim_count();
+            self.close_event();
+        }
     }
 }
 
@@ -717,5 +924,178 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    // ---- teardown ordering ------------------------------------------------
+    //
+    // The three teardown steps must run as unregister, then reclaim, then
+    // close, and `Drop`'s comment has called that "the point" since the wake-path
+    // work. Nothing verified it. Every test above passes with the reclaim and
+    // the close transposed, and passes with either elided, because none of them
+    // can observe the order in which teardown did its work — they observe only
+    // its end state, which the transposition does not change.
+    //
+    // That gap is pre-existing and independent of any caller. It became visible
+    // because the release step was split out for a caller that needs to release
+    // early, and splitting it is exactly what makes a transposition easy to
+    // introduce by accident.
+    //
+    // The tests below close it. They read a trace each step appends from inside
+    // the helper that performs it, so what is pinned is the order of the work
+    // rather than the order of some instrumentation standing beside it.
+
+    /// The whole point: the sequence, in order, on the ordinary path.
+    ///
+    /// Fails against all three transpositions and all three elisions, which is
+    /// the entire mutation space for three steps — enumerated rather than
+    /// sampled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn teardown_runs_unregister_then_reclaim_then_close() {
+        let trace = trace_of(|| {
+            let event = ArmedEvent::new().unwrap();
+            drop(event);
+        });
+
+        assert_eq!(
+            trace,
+            vec![
+                Step::Unregister { succeeded: true },
+                Step::Reclaim,
+                Step::Close
+            ],
+            "teardown must unregister, then reclaim, then close; \
+             reclaiming or closing before the unregister has proved no callback \
+             can still be running is undefined behaviour, not a style question"
+        );
+    }
+
+    /// The driver's own path must not take the guard's early return.
+    ///
+    /// `release_registration`'s guard exists for callers that release early. The
+    /// driver is not one of them, and the claim that the split changed nothing
+    /// for the driver rests on its teardown entering the release step in the
+    /// `Live` state exactly as it did before the state existed. That is an
+    /// assertion about the driver, so it needs a test that fails if the driver
+    /// ever stops behaving that way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_ordinary_drop_path_never_takes_the_release_guard() {
+        // Exercise the event first, so this is a drop of a *used* value and not
+        // merely of a freshly armed one. The wait is awaited rather than polled
+        // once: the callback runs on a pool thread, so a single poll straight
+        // after the signal races it and would make this test flaky for a reason
+        // that has nothing to do with what it asserts.
+        let event = ArmedEvent::new().unwrap();
+        event.signal().unwrap();
+        wait_once(&event).await;
+
+        // Only the teardown is traced. Nothing before it records anything, but
+        // scoping it this narrowly keeps the assertion about the drop alone.
+        let trace = trace_of(|| drop(event));
+
+        assert!(
+            !trace.iter().any(|s| matches!(s, Step::ReleaseSkipped(_))),
+            "the ordinary drop path must enter the release step in the Live \
+             state, taking the same route it took before the state existed; \
+             trace was {trace:?}"
+        );
+        assert_eq!(
+            trace.first(),
+            Some(&Step::Unregister { succeeded: true }),
+            "and it must actually perform the unregister; trace was {trace:?}"
+        );
+    }
+
+    /// A failed unregister leaks rather than reaching undefined behaviour.
+    ///
+    /// Reachable only through `FAIL_NEXT_UNREGISTER`: `UnregisterWaitEx` has no
+    /// reproducible failure mode, so before that seam existed this branch could
+    /// not be executed by any test. It deliberately leaks the registration and
+    /// the event handle for the life of the process — that is the behaviour
+    /// under test, not an oversight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_unregister_neither_reclaims_nor_closes() {
+        let watch = std::cell::RefCell::new(None);
+        let trace = trace_of(|| {
+            let event = ArmedEvent::new().unwrap();
+            *watch.borrow_mut() = Some(event.watch());
+            FAIL_NEXT_UNREGISTER.with(|f| f.set(true));
+            drop(event);
+        });
+
+        assert_eq!(
+            trace,
+            vec![Step::Unregister { succeeded: false }],
+            "a failed unregister must stop the sequence: the wait may still be \
+             pending, so closing the handle would be undefined and reclaiming \
+             the count could free state a callback is about to touch"
+        );
+        assert!(
+            watch.borrow().as_ref().unwrap().upgrade().is_some(),
+            "the count must be leaked, not reclaimed, when the unregister failed"
+        );
+    }
+
+    /// An early release followed by a drop unregisters exactly once.
+    ///
+    /// Itemised rather than left to the mutation table because the failure mode
+    /// is not an assertion failure: `UnregisterWaitEx` called twice on one
+    /// registration terminates the process with `STATUS_INVALID_PARAMETER`
+    /// instead of returning an error. Without the guard this test does not fail,
+    /// it aborts the test binary — so the guard is load-bearing for soundness
+    /// and not merely for tidiness.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_early_release_then_drop_unregisters_once_and_still_tears_down() {
+        let trace = trace_of(|| {
+            let mut event = ArmedEvent::new().unwrap();
+            assert_eq!(event.release_registration(), Registration::Released);
+            drop(event);
+        });
+
+        assert_eq!(
+            trace,
+            vec![
+                Step::Unregister { succeeded: true },
+                Step::ReleaseSkipped(Registration::Released),
+                Step::Reclaim,
+                Step::Close
+            ],
+            "the early release must unregister once, the drop's release must \
+             observe Released and do nothing, and the remaining two steps must \
+             still run in order"
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|s| matches!(s, Step::Unregister { .. }))
+                .count(),
+            1,
+            "exactly one unregister; a second would terminate the process"
+        );
+    }
+
+    /// A failed release is never retried, even across an explicit release.
+    ///
+    /// The tri-state is what makes this expressible: `Released` and `Failed`
+    /// both mean "not live", but only one of them licenses the reclaim and the
+    /// close. A boolean would have to conflate `Failed` with one of the other
+    /// two, and both conflations are unsound in one direction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_release_is_not_retried_by_drop() {
+        let trace = trace_of(|| {
+            let mut event = ArmedEvent::new().unwrap();
+            FAIL_NEXT_UNREGISTER.with(|f| f.set(true));
+            assert_eq!(event.release_registration(), Registration::Failed);
+            drop(event);
+        });
+
+        assert_eq!(
+            trace,
+            vec![
+                Step::Unregister { succeeded: false },
+                Step::ReleaseSkipped(Registration::Failed),
+            ],
+            "drop must observe the earlier failure and neither retry the \
+             unregister nor proceed to reclaim or close"
+        );
     }
 }

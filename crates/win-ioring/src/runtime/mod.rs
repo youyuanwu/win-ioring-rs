@@ -1193,7 +1193,15 @@ pub struct Driver {
     /// Signalled by the kernel when completions are available, and waited on
     /// through one thread-pool registration armed for the driver's whole life.
     ///
-    /// The driver's only waited object, and the crate's only thread boundary.
+    /// The driver's only waited object, and — until named pipes — the crate's
+    /// only thread boundary. A [`crate::pipe::Server`]'s accept is the second:
+    /// `ConnectNamedPipe` is not an operation the ring can build, so it runs as
+    /// an overlapped Win32 call whose completion reaches the crate through the
+    /// same `RegisterWaitForSingleObject` machinery, on the same thread pool.
+    /// It is a boundary this driver never sees — the accept occupies no slab
+    /// entry and the drain does not wait for it — but it is a boundary, and the
+    /// claim that there is only one has been wrong since pipes shipped.
+    ///
     /// What used to be a second event — carrying "the application queued work
     /// for you" — is now a flag and a waker inside `DriverInner`, because every
     /// type that could raise it holds `Rc`s and so lives on the driver's own
@@ -1511,7 +1519,11 @@ impl Drop for Driver {
 /// Used to fence teardown sections that call back into caller code — waking
 /// futures and delivering reports — because unwinding out of a half-finished
 /// teardown would drop the driver's fields while the ring is still open.
-struct AbortOnUnwind;
+///
+/// `pub(crate)` so the pipe server's teardown can take the same fence. Its
+/// half-finished state is the same shape: an `OVERLAPPED` the kernel is writing
+/// into, released only once a cancel-and-collect has established otherwise.
+pub(crate) struct AbortOnUnwind;
 impl Drop for AbortOnUnwind {
     fn drop(&mut self) {
         abort_with("a panic escaped teardown while the I/O ring was still open");
@@ -3625,6 +3637,34 @@ mod tests {
         Driver::new(ring).unwrap()
     }
 
+    /// Drives the driver until `fut` resolves, failing rather than hanging.
+    ///
+    /// These tests have no executor, so a future that needs the ring to make
+    /// progress needs someone to submit and reap on its behalf. The bounded loop
+    /// is deliberate: the failure mode these tests exist to catch is an
+    /// operation that never completes, and an unbounded loop would present it as
+    /// a hang rather than a failure.
+    fn pump<F: Future>(driver: &Driver, fut: F) -> F::Output {
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        for _ in 0..10_000 {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            std::thread::yield_now();
+        }
+        panic!("the operation did not complete within the pump budget");
+    }
+
     fn readme() -> File {
         File::open(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3705,6 +3745,418 @@ mod tests {
             self.client.write_all(bytes).expect("writing to the pipe");
             self.client.flush().ok();
         }
+    }
+
+    /// SC-013a: the sequential guard refuses a pipe and permits a file.
+    ///
+    /// The pair is the criterion, not either half. The refusal alone would pass
+    /// in an implementation that refused everything; the permission alone would
+    /// pass in one that refused nothing. Both halves run against the same method
+    /// so that neither can be satisfied by a different code path.
+    ///
+    /// Read and write are covered separately because they are separate call
+    /// sites: a guard added to one and forgotten on the other is precisely the
+    /// mistake this shape catches, and it is a plausible one.
+    #[test]
+    fn the_sequential_api_refuses_a_pipe_and_permits_a_file() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+        let mut server = pipe.server.clone();
+
+        // Negative half: a pipe.
+        //
+        // Polled once rather than awaited. The refusal is constructed, not
+        // awaited — it resolves on the first poll without the ring — so a single
+        // poll is sufficient *and* necessary: awaiting a future the guard failed
+        // to refuse would wait forever on a driver nothing is pumping, turning a
+        // failed assertion into a hang. Three mutation rows found exactly that.
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut read = Box::pin(server.read(&handle, vec![0_u8; 16], 16));
+        let Poll::Ready(outcome) = read.as_mut().poll(&mut cx) else {
+            panic!(
+                "a sequential read on a pipe must be refused at construction; \
+                 it was accepted and left outstanding"
+            );
+        };
+        let (result, buffer) = outcome.into_parts();
+        assert!(
+            matches!(result, Err(Error::NoFileOffset { .. })),
+            "a sequential read on a pipe must be refused, not permitted with a \
+             meaningless offset; got {result:?}"
+        );
+        assert_eq!(
+            buffer.len(),
+            16,
+            "and the refusal must return the caller's buffer, which is what \
+             makes it expressible in the BufResult shape"
+        );
+        drop(read);
+
+        let mut write = Box::pin(server.write(&handle, vec![0_u8; 16], 16));
+        let Poll::Ready(outcome) = write.as_mut().poll(&mut cx) else {
+            panic!(
+                "and a sequential write must be refused at construction too; \
+                 the two are separate call sites and a guard on one is not a \
+                 guard on the other"
+            );
+        };
+        let (result, buffer) = outcome.into_parts();
+        assert!(
+            matches!(result, Err(Error::NoFileOffset { .. })),
+            "and so must a sequential write; got {result:?}"
+        );
+        assert_eq!(buffer.len(), 16);
+        drop(write);
+
+        // Positive half: an ordinary file, through the same methods. Without
+        // this the test above passes against a guard that refuses everything.
+        let path = std::env::temp_dir().join(format!(
+            "win-ioring-guard-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"0123456789abcdef").expect("writing the fixture");
+        let mut file = File::open(&path).expect("opening the fixture");
+
+        let read = file.read(&handle, vec![0_u8; 16], 16);
+        let (result, _) = pump(&driver, read).into_parts();
+        let n = result.expect("a sequential read on a real file must be permitted");
+        assert_eq!(n, 16);
+        drop(file);
+
+        // A separate writable handle: `File::open` is read-only, so reusing it
+        // here would fail with an access error that says nothing about the guard.
+        let mut file = File::create(&path).expect("opening the fixture for writing");
+        let write = file.write(&handle, vec![0x5A_u8; 4], 4);
+        let (result, _) = pump(&driver, write).into_parts();
+        result.expect("and so must a sequential write");
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SC-013b: the guard fails open on a type it does not recognise.
+    ///
+    /// `FILE_TYPE_UNKNOWN` cannot be produced on demand from a real handle —
+    /// which is why this injects it, on the same reasoning that makes
+    /// `fail_next_arm` necessary in `sys/event.rs`.
+    ///
+    /// The direction matters. A guard that refused the unknown case would newly
+    /// break handle kinds nobody anticipated, for the sake of a contract nobody
+    /// has established is violated there. Failing open leaves them exactly where
+    /// they are today.
+    #[test]
+    fn the_guard_permits_an_unrecognised_handle_type() {
+        use windows::Win32::Storage::FileSystem::FILE_TYPE_UNKNOWN;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+        let mut server = pipe.server.clone();
+
+        crate::file::force_next_file_type(FILE_TYPE_UNKNOWN.0);
+        let mut read = Box::pin(server.read(&handle, vec![0_u8; 16], 16));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        // The refusal, when it happens, happens at construction and resolves on
+        // the first poll without the ring. A permitted read on an empty pipe
+        // stays pending, so "not immediately refused" is the whole observation.
+        match read.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => {
+                let (result, _) = r.into_parts();
+                panic!(
+                    "an unrecognised handle type must be permitted, not \
+                     refused; the guard is deliberately fail-open. Got \
+                     {result:?}"
+                );
+            }
+            Poll::Pending => {}
+        }
+    }
+
+    /// SC-013e: `FILE_TYPE_CHAR` is refused, not permitted.
+    ///
+    /// Its own criterion because the character-device leg is the one obligation
+    /// FR-019 gained without a natural gate: no pipe work requires it, nothing
+    /// in this crate opens a character device, and an ungated obligation is the
+    /// one that gets quietly dropped in a later refactor.
+    ///
+    /// Injected rather than opened. `NUL` is reachable through `File::open`, but
+    /// it returns end-of-file to every read, so a test against it could not tell
+    /// a working guard from a broken one — it would report success either way.
+    #[test]
+    fn the_guard_refuses_a_character_device() {
+        use windows::Win32::Storage::FileSystem::FILE_TYPE_CHAR;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+        let mut server = pipe.server.clone();
+
+        crate::file::force_next_file_type(FILE_TYPE_CHAR.0);
+        let mut read = Box::pin(server.read(&handle, vec![0_u8; 16], 16));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let Poll::Ready(outcome) = read.as_mut().poll(&mut cx) else {
+            panic!(
+                "a character device must be refused at construction; it was \
+                 accepted and left outstanding, which is the shape a narrowed \
+                 guard produces"
+            );
+        };
+        let (result, buffer) = outcome.into_parts();
+        assert!(
+            matches!(
+                result,
+                Err(Error::NoFileOffset {
+                    file_type
+                }) if file_type == FILE_TYPE_CHAR.0
+            ),
+            "a character device must be refused, and the error must carry the \
+             type that caused it; got {result:?}"
+        );
+        assert_eq!(buffer.len(), 16, "with the buffer returned");
+    }
+
+    /// SC-013c: the positional path is *not* guarded.
+    ///
+    /// The asymmetry is deliberate and this states it as a decision rather than
+    /// leaving it to be inferred from the guard's absence. `Handle::read` and
+    /// `Handle::write` at an explicit offset are what the pipe types themselves
+    /// use to move bytes; guarding them would break pipe I/O entirely. The
+    /// platform ignores the offset here too — the difference is that the caller
+    /// supplied it knowingly rather than having the crate invent one.
+    #[test]
+    fn the_positional_api_is_not_guarded_on_a_pipe() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        pipe.write_from_client(b"hello");
+
+        let fut = handle.read(&pipe.server, vec![0_u8; 5], 5, 4096);
+        let (result, buffer) = pump(&driver, fut).into_parts();
+        let n = result.expect("the positional path must still work on a pipe");
+        assert_eq!(n, 5);
+        assert_eq!(
+            &buffer[..5],
+            b"hello",
+            "and it reads from the head of the stream regardless of the offset \
+             the caller passed, which is the behaviour the sequential guard \
+             exists to stop the crate from relying on"
+        );
+    }
+
+    /// SC-013: the behaviours the guard exists to prevent, asserted directly.
+    ///
+    /// The guard stops callers reaching these, but the documentation still
+    /// asserts things about them, and documentation drifts from a platform that
+    /// nobody re-measures. These assertions are what keep FR-019a's rustdoc
+    /// honest: if Windows ever started honouring the offset on a pipe, this
+    /// fails and the paragraph explaining why the sequential API is refused
+    /// becomes visibly wrong rather than quietly so.
+    ///
+    /// Reached through the positional API, which is unguarded by design — so
+    /// this is testing the platform's behaviour, not a hole in the guard.
+    ///
+    /// **(a)** Two reads at different non-zero offsets return *consecutive*
+    /// head-of-stream bytes. The first read alone already refutes "the offset is
+    /// honoured"; what the pair establishes is the stronger and more useful
+    /// claim, that the stream advances by the bytes transferred rather than
+    /// jumping to `offset + len`. That is the version a caller would actually
+    /// hit, and it is the one the cursor would get wrong.
+    #[test]
+    fn a_pipe_ignores_the_offset_and_consumes_from_the_head() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        pipe.write_from_client(b"ABCDEFGH");
+
+        // Deliberately far apart, and neither is 0. An implementation that
+        // honoured either would produce different bytes than an implementation
+        // that ignores both.
+        let fut = handle.read(&pipe.server, vec![0_u8; 4], 4, 4096);
+        let (result, first) = pump(&driver, fut).into_parts();
+        assert_eq!(result.expect("the first read"), 4);
+        assert_eq!(
+            &first[..4],
+            b"ABCD",
+            "the first read must come from the head of the stream, not from \
+             offset 4096"
+        );
+
+        let fut = handle.read(&pipe.server, vec![0_u8; 4], 4, 64);
+        let (result, second) = pump(&driver, fut).into_parts();
+        assert_eq!(result.expect("the second read"), 4);
+        assert_eq!(
+            &second[..4],
+            b"EFGH",
+            "and the second must continue from where the first stopped -- not \
+             from offset 64, and not from the head again. This is the claim the \
+             cursor cannot express: the stream advanced by 4, the cursor would \
+             say 4100."
+        );
+    }
+
+    /// SC-013(b): a write at a non-zero offset appends.
+    ///
+    /// The write half of the same finding, and it needs saying separately
+    /// because the failure looks different: a read from the wrong place returns
+    /// wrong bytes, while a write to the wrong place corrupts a stream the
+    /// caller believes it is positioning within.
+    #[test]
+    fn a_pipe_write_at_a_non_zero_offset_appends() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        let fut = handle.write(&pipe.server, b"first".to_vec(), 5, 0);
+        let (result, _) = pump(&driver, fut).into_parts();
+        assert_eq!(result.expect("the first write"), 5);
+
+        // If the offset meant anything, this would leave a gap.
+        let fut = handle.write(&pipe.server, b"second".to_vec(), 6, 100_000);
+        let (result, _) = pump(&driver, fut).into_parts();
+        assert_eq!(result.expect("the second write"), 6);
+
+        let mut got = vec![0_u8; 11];
+        {
+            use std::io::Read;
+            pipe.client
+                .read_exact(&mut got)
+                .expect("reading what the server wrote");
+        }
+        assert_eq!(
+            &got, b"firstsecond",
+            "the second write must append rather than land at offset 100000; a \
+             pipe that honoured the offset could not produce this"
+        );
+    }
+
+    /// SC-013(c): a flush on an undrained pipe stays outstanding, and retires.
+    ///
+    /// Three claims, and the third is the one that keeps the other two from
+    /// being a hang dressed up as a measurement: the flush does not complete
+    /// while the peer has not read, it completes once the peer does, and its
+    /// operation retires when the future is dropped.
+    ///
+    /// This is the mechanism behind the shutdown finding recorded in
+    /// `docs/pending-work.md`: the crate's drain is unbounded because it never
+    /// abandons memory, and a flush that waits on a peer is a flush the crate
+    /// cannot bound. Measured separately at over 60 s against a 135 µs control.
+    #[test]
+    fn a_flush_on_an_undrained_pipe_waits_for_the_peer() {
+        let driver = test_driver();
+        let handle = driver.handle();
+        let mut pipe = Pipe::new();
+
+        let fut = handle.write(&pipe.server, b"unread".to_vec(), 6, 0);
+        let (result, _) = pump(&driver, fut).into_parts();
+        assert_eq!(result.expect("the write"), 6);
+
+        let mut flush = Box::pin(handle.flush(&pipe.server));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(flush.as_mut().poll(&mut cx).is_pending());
+
+        // A bounded number of passes, because the claim is "does not complete",
+        // and an unbounded loop would assert it by never asking.
+        for _ in 0..200 {
+            let wakers = {
+                let mut inner = driver.inner.borrow_mut();
+                inner.submit_pending();
+                inner.reap_completions()
+            };
+            for waker in wakers {
+                waker.wake();
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            flush.as_mut().poll(&mut cx).is_pending(),
+            "a flush must not complete while the peer has not read: this is why \
+             the crate cannot promise a bounded shutdown with a pipe flush \
+             outstanding"
+        );
+
+        // The peer drains. The same flush must now complete, which is what makes
+        // the assertion above a measurement rather than a flush that never
+        // completes under any circumstances.
+        {
+            use std::io::Read;
+            let mut got = vec![0_u8; 6];
+            pipe.client.read_exact(&mut got).expect("the peer reads");
+            assert_eq!(&got, b"unread");
+        }
+        let resolved = pump(&driver, flush);
+        resolved.expect("the flush must complete once the peer has drained");
+
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            0,
+            "and the operation retires rather than being left with the kernel"
+        );
+    }
+
+    /// A pipe accept occupies no slab entry, while a ring operation does.
+    ///
+    /// SC-008. The ring operation is not decoration: without one this asserts
+    /// zero against zero, which any test doing no I/O would satisfy — the
+    /// "structurally guaranteed assertion" shape `docs/testing.md` names. With
+    /// one outstanding the count is 1 whether or not the accept consumed an
+    /// entry, so the assertion can actually fail.
+    ///
+    /// This lives here rather than beside the pipe server because the slab is
+    /// the driver's own state and reading it is what the criterion asks for.
+    #[test]
+    fn a_pipe_accept_occupies_no_slab_entry() {
+        use crate::pipe::Server;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+
+        // One real ring operation, parked in the kernel on an empty pipe.
+        let mut read = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        {
+            let mut inner = driver.inner.borrow_mut();
+            inner.submit_pending();
+        }
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "the ring operation must actually be in the kernel, or the count \
+             below is being compared against nothing"
+        );
+
+        // And one pipe accept, which goes nowhere near the ring.
+        let name = format!(
+            r"\\.\pipe\win-ioring-slab-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let mut server = Server::create(&name).expect("a pipe instance");
+        let mut accept = Box::pin(server.accept());
+        assert!(accept.as_mut().poll(&mut cx).is_pending());
+
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "still one. The accept is an overlapped Win32 call with its own \
+             OVERLAPPED and its own event -- it has no completion to reap and no \
+             slot to occupy. Two would mean it had taken one"
+        );
+
+        drop(accept);
+        drop(server);
+        drop(read);
     }
 
     /// Establishes the premise every long-running shutdown test rests on: a read

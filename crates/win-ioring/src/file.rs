@@ -22,7 +22,9 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::FILE_FLUSH_MODE;
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLUSH_MODE, FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType,
+};
 
 /// `FILE_FLAG_OVERLAPPED`, as a plain `u32` for `OpenOptionsExt::custom_flags`.
 ///
@@ -53,6 +55,20 @@ pub struct FileState {
     /// still working, so a second operation could otherwise start against a
     /// cursor position the first is about to consume.
     sequential_outstanding: Cell<bool>,
+    /// What `GetFileType` said about this handle, cached after the first
+    /// sequential use.
+    ///
+    /// Populated lazily rather than at construction, and that is a deliberate
+    /// trade rather than an accident of implementation. Opening a file sits
+    /// inside the timed region of the warm-cache arm of the published benchmark
+    /// matrix, so a syscall in the constructor would disturb fifty cells for the
+    /// benefit of a path the benchmark never takes. Caching on first sequential
+    /// use costs the same query once, on a call that is already making a
+    /// syscall, and only for callers who use the sequential API at all.
+    ///
+    /// Caching at all is sound because a handle names one kernel object for its
+    /// whole life and that object's type cannot change underneath it.
+    file_type: Cell<Option<u32>>,
 }
 
 impl FileState {
@@ -68,6 +84,80 @@ impl FileState {
     pub(crate) fn clear_sequential(&self) {
         self.sequential_outstanding.set(false);
     }
+
+    /// Refuses the sequential API on a handle that has no file offset.
+    ///
+    /// Returns `Ok(())` when the sequential contract is meaningful for this
+    /// handle, and the typed error when it is not.
+    ///
+    /// The guard rejects two of the platform's four handle kinds and permits the
+    /// other two, and the shape of that choice matters more than the list. It is
+    /// **fail-open**: only `FILE_TYPE_PIPE` and `FILE_TYPE_CHAR` are refused, and
+    /// anything else — including `FILE_TYPE_UNKNOWN`, which is also what the
+    /// platform returns on a failed query — is permitted. A guard that failed
+    /// closed would newly break handle kinds nobody anticipated, which is a worse
+    /// trade than leaving them exactly where they are today.
+    ///
+    /// `FILE_TYPE_CHAR` is refused even though no pipe work requires it, because
+    /// the fail-open rationale does not cover it: a character device is a named
+    /// member of the very enumeration this reads, it is reachable through
+    /// [`File::open`], and the crate's offset contract is as meaningless for it
+    /// as for a pipe. That is a real cost to a downstream consumer doing
+    /// sequential I/O on a console handle, and it is paid to avoid a silent wrong
+    /// answer on the same handle kind.
+    fn check_has_file_offset(&self) -> std::result::Result<(), Error> {
+        let file_type = match self.file_type.get() {
+            Some(cached) => cached,
+            None => {
+                let queried = query_file_type(self.raw_handle());
+                self.file_type.set(Some(queried));
+                queried
+            }
+        };
+
+        if file_type == FILE_TYPE_PIPE.0 || file_type == FILE_TYPE_CHAR.0 {
+            Err(Error::NoFileOffset { file_type })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// Test seam: the handle type the next query reports, instead of the platform's.
+//
+// `FILE_TYPE_UNKNOWN` cannot be produced on demand from a real handle, and the
+// crate opens no character device of its own — `NUL` is reachable but returns
+// end-of-file to every read, so it could not distinguish a working guard from a
+// broken one. Both of those cases are requirements, so both need a way to be
+// asserted, and injection is the only one available. This follows the form
+// `FAIL_NEXT_ARM` established in `sys/event.rs` for the same reason.
+#[cfg(test)]
+thread_local! {
+    static FORCE_FILE_TYPE: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Sets the type the next handle-type query will report.
+#[cfg(test)]
+pub(crate) fn force_next_file_type(file_type: u32) {
+    FORCE_FILE_TYPE.with(|c| c.set(Some(file_type)));
+}
+
+/// Asks the platform what kind of handle this is.
+///
+/// `GetFileType` returns `FILE_TYPE_UNKNOWN` both for a handle it cannot
+/// classify and for a call that failed, and the two are told apart by
+/// `GetLastError`. This does not tell them apart, deliberately: both mean the
+/// same thing to the caller — that nothing is known — and the guard fails open
+/// on that, so distinguishing them would change no decision.
+fn query_file_type(handle: HANDLE) -> u32 {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_FILE_TYPE.with(|c| c.take()) {
+        return forced;
+    }
+    // SAFETY: `handle` comes from this state's `OwnedHandle`, which keeps it open
+    // for the duration of this call. `GetFileType` reads the handle's type and
+    // writes nothing, so it needs no further guarantee about ownership.
+    unsafe { GetFileType(handle).0 }
 }
 
 /// Clears a file's outstanding-sequential flag when the operation ends.
@@ -172,6 +262,7 @@ impl File {
                 handle: OwnedHandle::from(file),
                 cursor: Cell::new(0),
                 sequential_outstanding: Cell::new(false),
+                file_type: Cell::new(None),
             }),
         }
     }
@@ -297,6 +388,7 @@ impl File {
                 handle: unsafe { OwnedHandle::from_raw_handle(handle.0) },
                 cursor: Cell::new(0),
                 sequential_outstanding: Cell::new(false),
+                file_type: Cell::new(None),
             }),
         }
     }
@@ -384,12 +476,33 @@ impl File {
     /// The cursor advances by exactly the number of bytes transferred, and only
     /// when this future observes the completion: dropping it leaves the cursor
     /// where it was.
+    ///
+    /// # Handles with no file offset
+    ///
+    /// This fails with [`Error::NoFileOffset`] on a pipe or a character device.
+    /// Those handles have no file offset, so the cursor this method maintains
+    /// describes nothing: the platform ignores the offset and consumes from the
+    /// head of the stream. Were the operation permitted, every read after the
+    /// first *would* return `Ok` paired with bytes that did not come from where
+    /// the cursor says — success, with the wrong bytes, on a caller doing nothing
+    /// unusual. The refusal exists so that never happens.
+    ///
+    /// Use [`Handle::read`] with an explicit offset instead. The platform ignores
+    /// that offset too, but the caller supplied it knowingly rather than having
+    /// the crate supply a meaningless one on their behalf.
     pub fn read<'a, B: IoBufMut>(
         &'a mut self,
         handle: &Handle,
         buffer: B,
         len: u32,
     ) -> SequentialRead<'a, B> {
+        if let Err(error) = self.state.check_has_file_offset() {
+            return SequentialRead {
+                inner: ReadFuture::failed(error, buffer),
+                state: Rc::clone(&self.state),
+                _file: PhantomData,
+            };
+        }
         let offset = self.state.cursor.get();
         let guard = match SequentialGuard::claim(&self.state) {
             Some(guard) => guard,
@@ -410,13 +523,25 @@ impl File {
 
     /// Writes `len` bytes from `buffer` at the cursor, advancing the cursor.
     ///
-    /// The same exclusivity and cursor rules apply as for [`File::read`].
+    /// The same exclusivity and cursor rules apply as for [`File::read`], and so
+    /// does its refusal: this fails with [`Error::NoFileOffset`] on a pipe or a
+    /// character device, because the offset it would supply describes nothing
+    /// there. A permitted write would append regardless of the cursor and report
+    /// success, leaving the cursor claiming a position the stream does not have.
+    /// Use [`Handle::write`] with an explicit offset instead.
     pub fn write<'a, B: IoBuf>(
         &'a mut self,
         handle: &Handle,
         buffer: B,
         len: u32,
     ) -> SequentialWrite<'a, B> {
+        if let Err(error) = self.state.check_has_file_offset() {
+            return SequentialWrite {
+                inner: WriteFuture::failed(error, buffer),
+                state: Rc::clone(&self.state),
+                _file: PhantomData,
+            };
+        }
         let offset = self.state.cursor.get();
         let guard = match SequentialGuard::claim(&self.state) {
             Some(guard) => guard,

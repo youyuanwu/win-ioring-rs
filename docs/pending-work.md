@@ -126,6 +126,66 @@ correctness.
 Consider recording the token outside the `RefCell` for the driver to process on
 its next pass.
 
+### The ring op-code enumeration is not gated against a `windows` version bump
+
+`docs/pipes-and-the-ring.md` designs around a closed set: `windows` 0.62.2 exposes
+exactly seven `IORING_OP_*` constants and exactly six `BuildIoRing*` builders,
+each hard-coding its own op code, with no generic submit path. That is why the
+named-pipe accept runs as an overlapped Win32 call instead of a ring operation.
+
+The enumeration was done by reading the pinned crate source, and **nothing
+re-checks it.** Rust cannot assert that a dependency exposes no further items, so
+a `windows` release adding `BuildIoRingConnectNamedPipe` would silently leave the
+accept path taking the harder route for no reason, and the document asserting a
+closure that no longer holds. `ALL_OPS` in `io_ring/tests.rs` is a hand-maintained
+list of the codes this crate queries; it proves nothing about the crate it reads
+from.
+
+A partial gate is available and was judged not worth its cost: asserting the seven
+numeric values are exactly 0–6 would catch a renumbering but not an addition,
+which is the case that matters. **The practical mitigation is procedural — a
+`windows` version bump is the moment to re-run the enumeration** — and it is
+recorded here because a procedural obligation nobody has written down is one
+nobody performs.
+
+### A pipe flush outstanding at shutdown may never terminate
+
+`Handle::shutdown` and the drain that follows it are unbounded by design: closing
+the ring does not cancel in-flight operations, so the driver waits for every one
+of them rather than abandoning memory the kernel may still be writing to. That is
+the right trade for a file, where every operation completes on the storage
+stack's schedule.
+
+It is not bounded at all for a pipe. `FlushFileBuffers` on a named pipe waits for
+the *peer* to read the buffered bytes, and the peer is under no obligation to do
+so — it may be a different process, blocked, or simply uninterested. So the
+drain's bound is set by a process this crate does not control, and there is no
+bound at all if the peer never reads.
+
+Measured, with a control:
+
+| arm | verdict |
+|---|---|
+| peer never reads | the drain had not returned after 60 s |
+| peer reads, one line different | the drain returned in 135.5 µs |
+
+The control is what makes the first row a measurement: without it,
+"did not terminate" is a verdict the probe might be structurally incapable of
+contradicting.
+
+**No fix is proposed here, and one is not obviously available.** Cancelling the
+flush at shutdown would break the crate's central promise that shutdown never
+abandons memory. Bounding the drain would break the same promise. Refusing
+`flush` on a pipe would remove a legitimate operation — a flush on a pipe *does*
+complete whenever the peer is reading, which is the normal case. The honest
+position is the documented one: the rustdoc on the pipe types says the crate
+cannot promise a bounded shutdown while a pipe flush is outstanding, rather than
+implying a bound it cannot keep.
+
+The reason this is recorded rather than fixed is that the alternatives are all
+worse than the disclosure, and a reader who hits it deserves to find the
+reasoning rather than a surprise.
+
 ## API consistency
 
 ### The comparison's registered backend reports a registration it never made
@@ -383,6 +443,38 @@ closed-form prediction for the declared shape and routes a mismatch through
   that the natural result win when it gets there first, and no way to make that
   ordering deterministic has been found. The correlation mechanics either side of
   it are tested.
+- **Two wake-path tests fail intermittently under load.**
+  `a_completion_signalled_mid_pass_is_not_lost` and
+  `a_driver_polled_by_a_new_task_is_still_woken_by_a_completion`, both in
+  `runtime/mod.rs`, fail occasionally when the full suite runs in parallel and
+  pass 12 times out of 12 when run in isolation.
+
+  **This predates the named-pipe work and is recorded rather than fixed for that
+  reason**: a fix would land in the same diff as an unrelated feature and confound
+  both. It was observed on an unmodified tree at `0f8971f` before any of that
+  work began, which is what establishes it as pre-existing rather than
+  introduced. It did not fire in roughly 125 full-suite runs during that work.
+
+  The shape suggests a test-side timing assumption rather than a defect in the
+  wake path — both tests drive the driver by hand and assume a completion lands
+  within a bounded number of passes, which is exactly the assumption a loaded
+  machine breaks. That is a hypothesis, not a finding; nobody has investigated it.
+  Anyone who does should start by making the bound explicit rather than raising
+  it, since a raised bound is a flake deferred rather than a flake understood.
+
+- **The requirement-coverage audit cannot see a missing test.** The script at
+  `.paw/work/named-pipes/probes/coverage-audit.ps1` checks that every requirement
+  and criterion in a specification is *cited by a phase* of the implementation
+  plan. It does not, and cannot, check that the phase then wrote the test. SC-001
+  of the named-pipe work — a server accepting a client and exchanging bytes in
+  both directions, through a registered buffer and through a registered file
+  handle — was assigned to a phase, cited by it, reported covered, and never
+  implemented. It was found in the final gate pass by noticing the integration
+  test crate was untouched in the diffstat, not by any gate. The audit is still
+  worth running; it costs seconds and it did catch omissions. But its result
+  means "the plan forgot nothing", which is much weaker than "nothing was
+  forgotten". Closing the gap needs a link from each criterion to the tests that
+  gate it, which this repository has no convention for.
 
 ## Minor
 

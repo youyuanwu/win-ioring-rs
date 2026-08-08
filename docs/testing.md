@@ -427,6 +427,45 @@ The sub-species worth recognising, each from a real instance:
   nothing. Check that the mutation changes behaviour before concluding anything
   from a test that survives it.
 
+### A comparison whose two sides are corrupted identically
+
+The named pattern above catches gates that pass because they never ran. This is
+its harder relative: a gate that **produces a positive result it has not earned**.
+The absence of a report is at least suspicious; a green report is actively
+reassuring, so this failure mode is both more convincing and less likely to be
+questioned.
+
+The instance was a script auditing whether every requirement in a plan was
+covered by a test. It reported no gaps. It was wrong in three separate ways, and
+the sharpest was this: an earlier version passed **only because both sides of the
+comparison were corrupted identically.** The plan text and the pattern being
+matched against it were each read as UTF-8 decoded through ANSI, so an em dash
+became the same three-character mojibake on both sides. The comparison then
+succeeded — for the wrong reason, comparing garbage to matching garbage.
+
+This is worth naming because it defeats the usual mental model of string
+equality. The intuition is that corruption makes comparisons *fail*: you expect a
+mangled string not to match a clean one, and you expect to notice. But a
+comparison is symmetric, and any transformation applied to both operands is
+invisible to it. Encoding is the obvious carrier; so are trimming, case folding,
+newline normalisation, and any "clean the input" step applied to both the needle
+and the haystack. Wherever the same normalisation touches both sides, the
+comparison stops distinguishing corrupted from correct and starts distinguishing
+only *differently* corrupted from *identically* corrupted.
+
+The generalisation, which is not about encodings:
+
+- **A gate that reports a pass must be tested against an input that should
+  fail.** This is the named pattern applied to the gate rather than to the code,
+  and it is the only check that catches the identical-corruption case: a
+  deliberately-absent requirement must be reported as absent. That twin was what
+  eventually exposed all three faults here.
+- **Suspect any comparison whose operands travel the same pipeline.** Read one
+  side through a different path — a hardcoded literal, a different reader, a
+  different encoding — so a corruption cannot cancel itself out.
+- **A green result from a tool nobody has tried to make fail is not evidence.**
+  It is a tool that has demonstrated it can print the word "pass".
+
 ### A threshold something meets exactly is not a threshold
 
 Named after two instances in one feature, one of them caught in the author's own
