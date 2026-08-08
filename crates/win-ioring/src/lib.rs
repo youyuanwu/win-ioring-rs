@@ -218,6 +218,7 @@ pub mod buf;
 pub mod error;
 pub mod file;
 pub mod io_ring;
+pub mod pipe;
 
 /// Thin wrappers over the Windows primitives the crate needs.
 ///

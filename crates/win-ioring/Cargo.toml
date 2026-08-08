@@ -9,7 +9,36 @@ license.workspace = true
 [dependencies]
 futures.workspace = true
 bitflags.workspace = true
-windows.workspace = true
+# Two namespaces beyond the workspace baseline, both required by named pipe
+# support and neither optional.
+#
+# `Win32_System_Pipes` was a dev-dependency until pipes shipped, on the stated
+# grounds that the library should keep a narrower platform surface than its
+# tests. **Shipping `pipe::Server` and `pipe::Client` reverses that decision.**
+# It has to: the types are public, and a public type cannot be built from a
+# namespace the library does not have.
+#
+# The obvious alternative was a default-off feature, as `handle-mode-query`
+# below does for one diagnostic method. It was rejected, and the distinction is
+# not the compile cost but what is being gated. `handle-mode-query` gates a
+# single query whose absence leaves every other API intact; a feature gating
+# `pipe` would gate a public *type surface*, so downstream code either compiles
+# against a different crate than its neighbours or turns the feature on
+# universally and pays the cost anyway. A conditional type is also a conditional
+# entry in every doc page, error enum discussion and example that mentions it.
+# Gating a diagnostic is a reasonable trade; gating core functionality is a
+# worse one.
+#
+# `Win32_System_IO` is the second reversal, and it is the accept path's doing.
+# `ConnectNamedPipe` cannot be expressed as an IoRing operation — the op-code
+# set this crate can build is closed and contains no connect — so the server's
+# accept runs as an overlapped Win32 call and needs `OVERLAPPED`, `CancelIoEx`
+# and `GetOverlappedResult`, all of which live here. Promoting
+# `Win32_System_Pipes` does not pull it in; they are siblings.
+windows = { workspace = true, features = [
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+] }
 
 # Off by default, and deliberately so.
 #
@@ -19,12 +48,18 @@ windows.workspace = true
 # unbuffered arm needed the same answer, and the narrower API was looked for and
 # not found.
 #
-# Reaching it costs three additional `windows` namespaces. Enabling them
-# unconditionally would put them in every downstream consumer's compile, which
-# `crates/win-ioring-bench/Cargo.toml` records a decision against — the same
-# reasoning as the `Win32_System_Pipes` dev-dependency. A default-off feature
-# preserves that decision rather than reversing it: a consumer who does not ask
-# for the query compiles exactly what it compiled before this feature existed.
+# Reaching it costs two additional `windows` namespaces. It cost three until
+# named pipe support made `Win32_System_IO` unconditional above; the feature no
+# longer has to carry it. Enabling the remaining two unconditionally would put
+# them in every downstream consumer's compile, which
+# `crates/win-ioring-bench/Cargo.toml` records a decision against. A default-off
+# feature preserves that decision for *this* query: a consumer who does not ask
+# for it compiles exactly what it compiled before the feature existed.
+#
+# That reasoning no longer extends to `Win32_System_Pipes`, which used to be
+# cited here as the parallel case. It is now a real dependency, for the reasons
+# given above, and the two decisions have diverged rather than one having
+# quietly overruled the other.
 #
 # The `win-ioring` unit test `is_synchronous_distinguishes_both_handle_modes`
 # exercises the on configuration, and CI's two `--all-features` test steps run
@@ -56,15 +91,10 @@ windows.workspace = true
 handle-mode-query = [
     "windows/Wdk_Foundation",
     "windows/Wdk_Storage_FileSystem",
-    "windows/Win32_System_IO",
 ]
 
 [dev-dependencies]
 tokio.workspace = true
-# Named pipes are the only source of a genuinely long-running I/O operation
-# available here, and shutdown tests need one to avoid passing vacuously.
-# Dev-only, so the library itself keeps its narrower platform surface.
-windows = { workspace = true, features = ["Win32_System_Pipes"] }
 
 [lints]
 workspace = true
