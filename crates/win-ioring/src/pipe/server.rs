@@ -6,11 +6,24 @@
 //! look for it. What follows is the part that only matters from inside.
 //!
 //! The allocation the kernel writes into is owned by [`Server`] and reached
-//! through `AcceptSlot`. Every path that could free it while the kernel may
-//! still hold the pointer either cancels and collects first, or leaks it
-//! deliberately. Leaking is the correct outcome on those paths and is not a
-//! defect to be tidied away later: a leak costs one allocation, and the
-//! alternative is a write into memory that has been handed to something else.
+//! through `AcceptSlot`. Three kinds of path release it, and they are not
+//! interchangeable:
+//!
+//! - **The kernel never took the pointer.** A synchronous `ConnectNamedPipe`
+//!   failure other than `ERROR_IO_PENDING` means no IRP was queued, so the slot
+//!   is simply dropped. This is sound, and it is also the reasoning that was
+//!   once applied where it did not hold — see the next case.
+//! - **The kernel may have taken it.** Cancel, collect, then free. The collect
+//!   is what establishes the kernel is finished; it blocks and is not bounded.
+//! - **The kernel demonstrably never took it, on a teardown path.** Leak it.
+//!   Freeing would be defensible on the first case's reasoning, but this branch
+//!   exists because that reasoning was wrong once already, and a leak costs one
+//!   allocation while the alternative corrupts unrelated memory later.
+//!
+//! The distinction between the first and third is not a contradiction but it is
+//! the sharpest edge in this file: the same argument is trusted in one place and
+//! deliberately not trusted in the other, because one is a synchronous return
+//! this code just observed and the other is an inference about kernel state.
 
 use crate::error::Error;
 use crate::file::File;
@@ -49,6 +62,30 @@ const STATUS_PENDING_INTERNAL: usize = 0x0000_0103;
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_CANCEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam: forces the next collect to observe an unfinished operation.
+//
+// The `ERROR_IO_INCOMPLETE` path -- event signalled, kernel status not yet
+// terminal -- is narrow enough that no test constructs it naturally, which was
+// measured: a mutation making that path report a connection survived the whole
+// pipe suite. It is also the one path where the wrong answer is silent, so it
+// gets a seam rather than a comment.
+#[cfg(test)]
+thread_local! {
+    static FORCE_COLLECT_INCOMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam: records which teardown branch `Drop for Server` last took.
+//
+// The same shape as `sys::event`'s `TEARDOWN_TRACE`, and for the same reason.
+// The teardown *rule* is a pure function and can be tested directly, but nothing
+// would establish that `Drop` consults it: replacing the call with a constant
+// leaves every other gate green and restores the deadlock the rule exists to
+// prevent. This is what makes the branch taken observable.
+#[cfg(test)]
+thread_local! {
+    static LAST_TEARDOWN: std::cell::Cell<Option<Teardown>> = const { std::cell::Cell::new(None) };
 }
 
 /// Options for creating a pipe instance.
@@ -128,8 +165,15 @@ impl ServerOptions {
 
     /// Requires this to be the first instance of the name.
     ///
-    /// Creation fails if another process already serves this pipe, which is how
-    /// a server declines to be impersonated by one that got there first.
+    /// Creation fails with an access-denied error if the pipe already exists,
+    /// which is how a server declines to be impersonated by one that got there
+    /// first.
+    ///
+    /// It does **not** make the name exclusive. Measured: with this set on the
+    /// first instance, a second instance created *without* it still succeeds.
+    /// The flag protects the caller from being second; it does not stop anyone
+    /// else from being third. A server that needs to be the only instance needs
+    /// a security descriptor, which this API does not yet accept.
     pub fn first_instance_only(mut self, first: bool) -> Self {
         self.first_instance_only = first;
         self
@@ -225,9 +269,15 @@ struct AcceptSlot {
     /// Signalled by the kernel when the connect completes.
     ///
     /// A plain `ArmedEvent`, deliberately not `ManuallyDrop`: releasing the
-    /// thread-pool registration is idempotent, so a teardown path can release it
-    /// early and then let the value drop normally. Wrapping it would suppress
+    /// thread-pool registration is idempotent, so a teardown path *can* release
+    /// it early and then let the value drop normally. Wrapping it would suppress
     /// the drop glue for its shared reference count too, leaking that.
+    ///
+    /// The early release is not reachable from here yet —
+    /// `ArmedEvent::release_registration` is private to `sys::event`. Widening it
+    /// and calling it before the blocking collect is outstanding work, and until
+    /// it lands this drop runs that collect with the pool wait still armed on the
+    /// same auto-reset event.
     event: ArmedEvent,
     /// The event's raw handle value, recorded so a test can ask the operating
     /// system whether it is still open once its owner is gone.
@@ -241,8 +291,19 @@ struct AcceptSlot {
 
 impl AcceptSlot {
     /// Whether the kernel has finished with this operation.
+    ///
+    /// `Internal` is written by the kernel asynchronously, not by this thread,
+    /// so the read is volatile. A plain load is one a compiler may hoist out of
+    /// a loop that polls this — and polling this in a loop is exactly what the
+    /// waiting paths do. Nothing currently observed depends on it, which is the
+    /// argument for making it correct now rather than after something does.
     fn completed(&self) -> bool {
-        self.overlapped.Internal != STATUS_PENDING_INTERNAL
+        // SAFETY: `overlapped` is a live, aligned, initialised `OVERLAPPED` this
+        // slot owns; `Internal` is a `usize` field within it. Volatile only
+        // constrains the compiler, which is the whole requirement here: the
+        // kernel's write is ordered by the I/O completion itself.
+        let internal = unsafe { std::ptr::read_volatile(&raw const self.overlapped.Internal) };
+        internal != STATUS_PENDING_INTERNAL
     }
 }
 
@@ -492,7 +553,7 @@ impl Server {
                 // on — and it would deliver the client just as happily, so
                 // nothing but the submission count can tell the two apart.
                 return if slot.completed() {
-                    self.collect().map(|()| true)
+                    self.collect()
                 } else {
                     Ok(false)
                 };
@@ -566,9 +627,15 @@ impl Server {
     }
 
     /// Collects a completed connect and moves to `Connected`.
-    fn collect(&mut self) -> crate::Result<()> {
+    ///
+    /// `Ok(true)` means a client is now connected and observed. `Ok(false)`
+    /// means the operation is still outstanding and the caller must keep
+    /// waiting on it — it is not an error and it is not a connection.
+    fn collect(&mut self) -> crate::Result<bool> {
         let AcceptState::Accepting(slot) = &self.accept else {
-            return Ok(());
+            // Nothing outstanding. Whatever the state is, it is not one this can
+            // advance, and the caller's `Connected` check is what decides.
+            return Ok(true);
         };
 
         let mut transferred = 0_u32;
@@ -587,20 +654,37 @@ impl Server {
             )
         };
 
+        // Injected before the match so the injected case travels the same arm as
+        // the real one. Diverting to a separate early return would test the
+        // injection rather than the code.
+        #[cfg(test)]
+        let result = if FORCE_COLLECT_INCOMPLETE.with(|f| f.replace(false)) {
+            Err(windows::core::Error::from_hresult(
+                ERROR_IO_INCOMPLETE.to_hresult(),
+            ))
+        } else {
+            result
+        };
+
         match result {
             Ok(()) => {
                 self.accept = AcceptState::Connected;
-                Ok(())
+                Ok(true)
             }
             // A connect the client satisfied out from under the wait is still a
             // connect.
             Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
                 self.accept = AcceptState::Connected;
-                Ok(())
+                Ok(true)
             }
-            // Not finished after all. Left outstanding rather than reported, so
-            // the next poll waits on the same operation.
-            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => Ok(()),
+            // Not finished after all: the event was signalled but the kernel has
+            // not written a terminal status. Reported as *not collected* so the
+            // caller re-parks on the same operation. Returning `Ok(())` here
+            // would resolve the accept successfully having delivered no client —
+            // the caller would see `Ok` from `accept().await` with
+            // `is_connected()` false, which is the silent-wrong-answer class
+            // this state machine exists to prevent.
+            Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => Ok(false),
             Err(e) => Err(Error::from_hresult(e.code())),
         }
     }
@@ -711,15 +795,25 @@ impl Server {
         self.connect_submissions
     }
 
-    /// Test seam: makes the next cancel-and-collect on this thread fail.
+    /// Test seam: makes the next cancel on this thread report the operation as
+    /// not found, without issuing it.
     ///
     /// `CancelIoEx` has no reproducible failure mode, so the teardown's
     /// leak-rather-than-free branch — the most safety-critical path here — is
     /// otherwise unreachable and would ship unexecuted.
     #[cfg(test)]
-    #[allow(dead_code, reason = "the seam is built here and first used in the teardown work")]
     pub(crate) fn fail_next_cancel() {
         FAIL_NEXT_CANCEL.with(|f| f.set(true));
+    }
+
+    /// Test seam: makes the next collect on this thread observe an operation the
+    /// kernel has not finished writing a status for.
+    ///
+    /// Gates the one path in this type where a wrong answer is silent rather
+    /// than loud — an accept resolving `Ok` having delivered no client.
+    #[cfg(test)]
+    pub(crate) fn force_next_collect_incomplete() {
+        FORCE_COLLECT_INCOMPLETE.with(|f| f.set(true));
     }
 }
 
@@ -801,7 +895,27 @@ impl std::future::Future for Accept<'_> {
                     return Poll::Pending;
                 }
 
-                Poll::Ready(server.collect())
+                match server.collect() {
+                    Ok(true) => Poll::Ready(Ok(())),
+                    // Signalled, but the kernel has not written a terminal
+                    // status yet. Re-park on the same operation rather than
+                    // resolve: this future's contract is that `Ok` means a
+                    // client is connected, and there is no client here.
+                    //
+                    // The waker is re-registered because `poll_signalled`
+                    // consumed the readiness that got us here; without this the
+                    // task would sleep with nothing scheduled to wake it.
+                    Ok(false) => {
+                        if let AcceptState::Accepting(slot) = &server.accept
+                            && slot.event.poll_signalled(cx).is_ready()
+                        {
+                            cx.waker().wake_by_ref();
+                        }
+                        this.state = AcceptFuture::Waiting(server);
+                        Poll::Pending
+                    }
+                    Err(e) => Poll::Ready(Err(e)),
+                }
             }
         }
     }
@@ -815,12 +929,13 @@ impl std::future::Future for Accept<'_> {
 /// through the public API: the state that gets it wrong is currently
 /// unreachable. Deciding it in a pure function makes the rule itself testable,
 /// which is the only way this can be pinned at all.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Teardown {
-    /// The kernel has, or may have, the operation. Wait it out, then free.
+    /// The kernel has, or may have, the operation. Collect it, then free.
     ///
-    /// Waiting is bounded here because a cancel has been accepted, so the
-    /// operation is on its way to a terminal state.
+    /// The collect on this branch blocks, and **is not bounded** — see the
+    /// `Drop` body for why. What this branch asserts is only that a terminal
+    /// status will eventually be written, not that it will be written soon.
     CollectThenFree,
     /// The kernel demonstrably does not have this operation, and never wrote to
     /// it. Waiting would block forever on a status word nothing will ever
@@ -839,11 +954,12 @@ enum Teardown {
 /// `cancel_found` is whether `CancelIoEx` located the operation; `completed` is
 /// whether the kernel has written a terminal status into the `OVERLAPPED`.
 ///
-/// The only case that must not wait is "the kernel could not find it **and** it
-/// was never completed" — that pair means no I/O for this structure exists in
-/// the kernel, so nothing will ever finish it. If either holds the other way the
-/// wait terminates: a located operation reaches a terminal state after a cancel,
-/// and a completed one returns immediately.
+/// The only case that must not collect is "the kernel could not find it **and**
+/// it was never completed" — that pair means no I/O for this structure exists in
+/// the kernel, so no terminal status will ever be written and the collect would
+/// block forever. If either holds the other way a terminal status is coming: a
+/// located operation gets one after the cancel, and a completed one already has
+/// one. Neither says *when*; see the `Drop` body.
 fn teardown_action(cancel_found: bool, completed: bool) -> Teardown {
     if !cancel_found && !completed {
         Teardown::LeakWithoutWaiting
@@ -876,25 +992,56 @@ impl Drop for Server {
         // reason not to cancel is that the kernel already finished with it.
         let mut cancel_found = true;
         if !slot.completed() {
-            // SAFETY: the handle is open until this server's `File` reference is
-            // released, which happens after this body runs. The pointer is to an
-            // allocation this server still owns.
-            let cancelled =
-                unsafe { CancelIoEx(self.file.as_raw_handle(), Some(&*slot.overlapped)) };
-            // `ERROR_NOT_FOUND` is not a failure to report, but it is not
-            // nothing either: it is the one signal that distinguishes an
-            // operation the kernel is finishing from one it never had.
-            cancel_found = !matches!(&cancelled, Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult());
+            // The injection is consumed *instead of* the call, not applied to
+            // its result. Falsifying the result would not model a failing
+            // cancel: the real call still succeeds, the kernel still terminates
+            // the operation, and the slot then reads as completed -- which sends
+            // the teardown down the collecting branch anyway. Measured, by
+            // writing it the other way first and watching the leak branch stay
+            // unreachable.
+            #[cfg(test)]
+            let injected = FAIL_NEXT_CANCEL.with(|f| f.replace(false));
+            #[cfg(not(test))]
+            let injected = false;
+
+            if injected {
+                cancel_found = false;
+            } else {
+                // SAFETY: the handle is open until this server's `File` reference
+                // is released, which happens after this body runs. The pointer is
+                // to an allocation this server still owns.
+                let cancelled =
+                    unsafe { CancelIoEx(self.file.as_raw_handle(), Some(&*slot.overlapped)) };
+                // `ERROR_NOT_FOUND` is not a failure to report, but it is not
+                // nothing either: it is the one signal that distinguishes an
+                // operation the kernel is finishing from one it never had.
+                cancel_found =
+                    !matches!(&cancelled, Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult());
+            }
         }
 
-        match teardown_action(cancel_found, slot.completed()) {
+        let action = teardown_action(cancel_found, slot.completed());
+        #[cfg(test)]
+        LAST_TEARDOWN.with(|t| t.set(Some(action)));
+
+        match action {
             Teardown::CollectThenFree => {
                 let mut transferred = 0_u32;
                 // SAFETY: the same structure, still owned here and not yet
                 // freed. `bWait` is true here and only here, and only on this
-                // branch: the operation has been cancelled or has already
-                // completed, so this waits out a kernel that is finishing rather
-                // than one that will never start.
+                // branch: the operation has either been located by the cancel or
+                // has already completed, so a terminal status will be written
+                // rather than never arriving.
+                //
+                // This wait is **not bounded**, and neither is this drop. The
+                // measured costs are microseconds, but `CancelIoEx` is a request
+                // and not a revocation — the same property ring cancellation
+                // has — and `docs/buffer-ownership.md:90-91` gives a second
+                // reason independent of promptness: an operation against a dead
+                // endpoint may not complete for a long time. What is promised
+                // here is the crate's standing one, that shutdown never abandons
+                // memory the kernel may still write to. How long that takes is
+                // the platform's to decide.
                 let _ = unsafe {
                     GetOverlappedResult(
                         self.file.as_raw_handle(),
@@ -1437,14 +1584,139 @@ mod tests {
             assert!(poll_once(&mut fut).is_pending());
         }
         assert!(server.accept_outstanding());
+        let watch = server.accept_event_watch().expect("an event exists");
+        assert!(watch.upgrade().is_some());
 
         drop(server);
 
-        // Reached only if the drop above returned. The name is free again,
-        // which is a fact about the dropped server rather than about this
-        // process still running.
-        let replacement = Server::create(&name).expect("the name should be free again");
-        assert!(replacement.accepts_clients());
+        // Reached only if the drop above returned, which is the survival half.
+        // The discriminating half is below: the accept's shared state is gone,
+        // which is a fact about what the drop *did*. Re-creating the name would
+        // not be — `max_instances` defaults to unlimited, so a second instance
+        // is creatable whether or not the first was dropped.
+        assert!(
+            watch.upgrade().is_none(),
+            "the drop must release the accept's event, not merely return"
+        );
+        assert_eq!(
+            LAST_TEARDOWN.with(|t| t.get()),
+            Some(Teardown::CollectThenFree),
+            "and it must reach that decision through the teardown rule, on the \
+             branch that collects -- the kernel had this operation"
+        );
+    }
+
+    /// A signalled-but-unfinished connect must not resolve the accept.
+    ///
+    /// The narrowest path in this type and the only one where the wrong answer
+    /// is silent: `Ok` from `accept().await` with no client behind it. A
+    /// mutation reporting this state as a connection **survived the entire pipe
+    /// suite** before this test existed, which is why it has a seam rather than
+    /// a comment saying the path is hard to reach.
+    ///
+    /// The second poll is the other half. Without it, an implementation that
+    /// parked forever on this state would pass — and that is a hang, which is
+    /// the failure mode this file works hardest to avoid.
+    #[test]
+    fn a_collect_that_finds_the_operation_unfinished_does_not_resolve_the_accept() {
+        let name = unique("incomplete");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let _client = Client::connect(&name).expect("the client should connect");
+        wait_until(
+            || !server.accept_outstanding(),
+            "the kernel to record the connect as complete",
+        );
+
+        Server::force_next_collect_incomplete();
+        {
+            let mut fut = Box::pin(server.accept());
+            let polled = poll_once(&mut fut);
+            assert!(
+                polled.is_pending(),
+                "a collect that finds no terminal status has not collected a \
+                 client, and must not report one. Got {polled:?}"
+            );
+        }
+        assert!(
+            !server.is_connected(),
+            "and the server must not claim a peer it has not collected"
+        );
+
+        // The injection is one-shot, so this collect sees the real status.
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(
+                matches!(poll_once(&mut fut), Poll::Ready(Ok(()))),
+                "the next poll must collect the connection that was there all \
+                 along -- parking forever here would be a hang, not a refusal"
+            );
+        }
+        assert!(server.is_connected());
+        assert_eq!(
+            server.connect_submissions(),
+            1,
+            "and none of this reissued the connect"
+        );
+    }
+
+    /// The teardown rule is not merely correct, it is the one `Drop` uses.
+    ///
+    /// Written because the exhaustive test above it gates a **pure function**,
+    /// and nothing gated the call. Replacing the call with a constant left every
+    /// other gate in this file green while restoring the deadlock the rule
+    /// exists to prevent, which is the "covered token, unplanned distinction"
+    /// failure exactly.
+    ///
+    /// The injection is what makes the leak branch reachable: `CancelIoEx` has
+    /// no reproducible failure mode, and the state that would take this branch
+    /// naturally cannot be built through the public API.
+    #[test]
+    fn the_leak_branch_is_reachable_and_drop_takes_it() {
+        let name = unique("leak-branch");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let watch = server.accept_event_watch().expect("an event exists");
+
+        Server::fail_next_cancel();
+        drop(server);
+
+        assert_eq!(
+            LAST_TEARDOWN.with(|t| t.get()),
+            Some(Teardown::LeakWithoutWaiting),
+            "a cancel that failed to locate the operation must take the leak \
+             branch -- if this reports the collecting branch the injection is \
+             inert and every test built on it proves nothing"
+        );
+        assert!(
+            watch.upgrade().is_some(),
+            "and leaking means leaking: the event's shared state is deliberately \
+             not reclaimed, because the kernel may still hold the OVERLAPPED"
+        );
+
+        // The injection is one-shot, so it cannot leak into another test on this
+        // thread. Asserted rather than assumed: a seam that stays armed would
+        // silently divert the next drop.
+        let name2 = unique("leak-branch-after");
+        let mut after = Server::create(&name2).unwrap();
+        {
+            let mut fut = Box::pin(after.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        drop(after);
+        assert_eq!(
+            LAST_TEARDOWN.with(|t| t.get()),
+            Some(Teardown::CollectThenFree),
+            "the injection must be consumed by the drop that used it"
+        );
     }
 
     /// An accept on a server that already has an observed client resolves
@@ -1481,9 +1753,15 @@ mod tests {
 
     /// The access-direction options reach the platform.
     ///
+    /// The positive half must observe the *direction*, not merely that creation
+    /// succeeded: `accepts_clients()` on a fresh server is a struct-field
+    /// comparison and is true for any options at all. So the check is that an
+    /// inbound-only instance refuses a client opening for read and write, which
+    /// is what `Client::connect` does — a mapping that quietly promoted the
+    /// request to duplex would let that client in.
+    ///
     /// The twin is the failing half: an options set with neither direction is
-    /// refused, which establishes that the mapping is read at all rather than
-    /// being ignored in favour of a duplex default.
+    /// refused by the platform.
     #[test]
     fn access_direction_reaches_the_platform_and_neither_direction_is_refused() {
         let inbound = unique("inbound");
@@ -1492,6 +1770,22 @@ mod tests {
             .create(&inbound)
             .expect("an inbound-only instance should be creatable");
         assert!(server.accepts_clients());
+        let refused_client = Client::connect(&inbound);
+        assert!(
+            refused_client.is_err(),
+            "a duplex client must not be admitted by an inbound-only instance -- \
+             if it is, the direction never reached the platform and creation \
+             succeeding proves nothing. Got {refused_client:?}"
+        );
+
+        // The control: the same client against a duplex instance connects, so
+        // the refusal above is the access direction and not something about the
+        // client or the name.
+        let duplex = unique("inbound-control");
+        let _control = ServerOptions::new()
+            .create(&duplex)
+            .expect("a duplex instance should be creatable");
+        Client::connect(&duplex).expect("the same client must reach a duplex instance");
 
         let neither = unique("neither");
         let refused = ServerOptions::new()
@@ -1503,6 +1797,66 @@ mod tests {
             "a pipe with no access direction names nothing the platform can \
              create, and it must not be quietly promoted to duplex"
         );
+    }
+
+    /// `first_instance_only` refuses to be a second instance, and does not
+    /// prevent one.
+    ///
+    /// Gated because its rustdoc makes a security claim, and an option carrying
+    /// one while being ignored is worse than not offering it. Both halves are
+    /// measured rather than assumed: the flag on a create whose name already
+    /// exists fails with access-denied, and a create *without* the flag against
+    /// a name whose first instance had it **succeeds**. The second half is the
+    /// limitation the rustdoc must state — the flag protects the caller from
+    /// being second, it does not make the name exclusive.
+    #[test]
+    fn first_instance_only_refuses_to_be_second_but_does_not_prevent_a_second() {
+        let name = unique("first-only");
+        let _first = ServerOptions::new()
+            .first_instance_only(true)
+            .create(&name)
+            .expect("the first instance should be creatable");
+
+        let again = ServerOptions::new().first_instance_only(true).create(&name);
+        assert!(
+            again.is_err(),
+            "a create demanding to be first must fail once the name exists, or \
+             the flag never reached the platform. Got {again:?}"
+        );
+
+        ServerOptions::new().create(&name).expect(
+            "and a create *without* the flag still succeeds -- the flag does not \
+             make the name exclusive, and the rustdoc says so because this does",
+        );
+    }
+
+    /// The instance cap is enforced by the platform, not merely stored.
+    ///
+    /// `two_created_instances_serve_two_clients` passes identically whether or
+    /// not `max_instances` reaches the platform, because it never exceeds the
+    /// cap. This one exceeds it.
+    #[test]
+    fn the_instance_cap_refuses_one_instance_too_many() {
+        let name = unique("cap");
+        let _a = ServerOptions::new()
+            .max_instances(1)
+            .create(&name)
+            .expect("the first instance is within the cap");
+        let over = ServerOptions::new().max_instances(1).create(&name);
+        assert!(
+            over.is_err(),
+            "a second instance under a cap of one must be refused, or the cap \
+             is a field this crate stores and the platform never sees. Got {over:?}"
+        );
+
+        // The control: raising the cap admits the instance that was just
+        // refused, so the refusal is the cap's doing.
+        let roomy = unique("cap-control");
+        let _c = ServerOptions::new().max_instances(2).create(&roomy).unwrap();
+        ServerOptions::new()
+            .max_instances(2)
+            .create(&roomy)
+            .expect("a second instance under a cap of two must be admitted");
     }
 
     /// Two created instances serve two clients at once.
