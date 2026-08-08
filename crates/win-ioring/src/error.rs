@@ -27,134 +27,239 @@ use windows::Win32::Storage::FileSystem::IORING_VERSION;
 /// The result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A platform error condition, named once so that every error type agrees.
+/// The classification table and the views over it.
 ///
-/// This is the crate's **single classification table**. [`classify`] is the only
-/// function in the crate that maps an `HRESULT` to a condition, and every public
-/// error type is a *view* over this enum rather than a second table.
+/// [Condition] and [classify] are private to this module and are not
+/// re-exported. That is the point: a second match on a condition is not
+/// forbidden elsewhere in the crate, it is **unrepresentable**, because no other
+/// module can name the type. The only way out is [iew], which classifies and
+/// dispatches in one step.
 ///
-/// # Why one table
-///
-/// `pipe::Client`'s open path and the ring completion funnel both observe
-/// `ERROR_PIPE_BUSY`, and both must produce the same condition. Two independent
-/// match arms are exactly how that stops being true after someone edits one of
-/// them, which is the hazard `pipe/client.rs` warns about in the crate's own
-/// voice. A view cannot diverge from the table it reads, so the hazard is
-/// removed structurally rather than discouraged in a comment.
-///
-/// Each view is hand-written and carries `#[deny(clippy::wildcard_enum_match_arm,
-/// clippy::match_wildcard_for_single_variants)]`, so adding a variant here fails
-/// to compile every view that has not been updated. Both lints are required and
-/// the views are not generated; `view_convention` records why, and neither fact
-/// is incidental.
-///
-/// # Scope
-///
-/// This enum covers *platform-derived* conditions only — those a caller learns
-/// about by receiving an `HRESULT`. Conditions the crate detects itself, such as
-/// a shutting-down runtime or a builder field that was never set, are produced
-/// directly at the call site that knows about them and never pass through here.
-///
-/// It is deliberately `pub(crate)`. It appears in no public signature and is not
-/// re-exported, so it contributes **no** public variant slots to the crate's API
-/// surface; see `condition_is_not_part_of_the_public_api` for the check that
-/// keeps that true.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Condition {
-    /// The ring's submission queue has no room for another entry.
-    QueueFull,
-    /// All instances of the named pipe are busy.
-    PipeBusy,
-    /// The pipe's peer closed its end.
-    PipeBroken,
-    /// The pipe has no peer connected.
-    PipeNoPeer,
-    /// The pipe is listening and has not yet been connected to.
-    PipeListening,
-    /// A platform error this crate does not name.
+/// This replaces a source-scanning test that tried to recognise every match on a
+/// condition and decide whether it was armed. That test was defeated nine times
+/// across three review rounds, always by a syntactic form it had not
+/// anticipated. Privacy does not have to anticipate anything.
+mod classification {
+    /// A platform error condition, named once so that every error type agrees.
     ///
-    /// The `HRESULT` is carried so that a view handed only a `Condition` can
-    /// still construct a platform error without a second condition-to-code
-    /// table of its own.
+    /// This is the crate's **single classification table**. [`classify`] is the only
+    /// function in the crate that maps an `HRESULT` to a condition, and every public
+    /// error type is a *view* over this enum rather than a second table.
     ///
-    /// It is **not** what lets a pipe's error survive a trip through a type that
-    /// has no name for it. `classify` is deterministic, so `Other(hr)`
-    /// reclassifies to `Other(hr)` forever and no named condition can be
-    /// recovered from this payload. That recovery runs through the *error
-    /// type's* `Other`, which carries the `HRESULT` the classifier was given —
-    /// see `view_convention`.
-    Other(windows::core::HRESULT),
-}
+    /// # Why one table
+    ///
+    /// `pipe::Client`'s open path and the ring completion funnel both observe
+    /// `ERROR_PIPE_BUSY`, and both must produce the same condition. Two independent
+    /// match arms are exactly how that stops being true after someone edits one of
+    /// them, which is the hazard `pipe/client.rs` warns about in the crate's own
+    /// voice. A view cannot diverge from the table it reads, so the hazard is
+    /// removed structurally rather than discouraged in a comment.
+    ///
+    /// Each view is a trait implementation with one method per variant and no
+    /// default bodies ([`ConditionView`]), so adding a variant here fails to compile
+    /// every view that has not been updated — with `E0046`, under plain
+    /// `cargo build`, and not by way of any lint or test.
+    /// [`view_convention`] records why the views are traits rather than matches, and
+    /// that is not incidental: the match-and-lint design it replaced was defeated
+    /// nine times.
+    ///
+    /// # Scope
+    ///
+    /// This enum covers *platform-derived* conditions only — those a caller learns
+    /// about by receiving an `HRESULT`. Conditions the crate detects itself, such as
+    /// a shutting-down runtime or a builder field that was never set, are produced
+    /// directly at the call site that knows about them and never pass through here.
+    ///
+    /// It is deliberately `pub(crate)`. It appears in no public signature and is not
+    /// re-exported, so it contributes **no** public variant slots to the crate's API
+    /// surface; see `condition_is_not_part_of_the_public_api` for the check that
+    /// keeps that true.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Condition {
+        /// The ring's submission queue has no room for another entry.
+        QueueFull,
+        /// All instances of the named pipe are busy.
+        PipeBusy,
+        /// The pipe's peer closed its end.
+        PipeBroken,
+        /// The pipe has no peer connected.
+        PipeNoPeer,
+        /// The pipe is listening and has not yet been connected to.
+        PipeListening,
+        /// A platform error this crate does not name.
+        ///
+        /// The `HRESULT` is carried so that a view handed only a `Condition` can
+        /// still construct a platform error without a second condition-to-code
+        /// table of its own.
+        ///
+        /// It is **not** what lets a pipe's error survive a trip through a type that
+        /// has no name for it. `classify` is deterministic, so `Other(hr)`
+        /// reclassifies to `Other(hr)` forever and no named condition can be
+        /// recovered from this payload. That recovery runs through the *error
+        /// type's* `Other`, which carries the `HRESULT` the classifier was given —
+        /// see `view_convention`.
+        Other(windows::core::HRESULT),
+    }
 
-/// Maps a platform `HRESULT` to the condition it denotes.
-///
-/// This is the only function in the crate that matches on an `HRESULT` to
-/// produce an error condition. `error_classification_has_one_home` enforces
-/// that by inspecting the crate's own source text, and carries the allowlist of
-/// the sites which compare codes for other reasons.
-///
-/// Codes are matched **exactly**, never by facility or range. This classifier
-/// sees every ring completion in the crate, so a range match would reclassify
-/// errors from files and sockets that happen to fall inside it — a much larger
-/// blast radius than the pipe surface that motivated the pipe codes.
-///
-/// `ERROR_PIPE_CONNECTED` is deliberately absent. It reports that a client
-/// arrived before the accept was issued, which is a **success** for the accept
-/// and is converted at that call site; classifying it here would turn the most
-/// easily lost connection in the API into an error at the one place with no
-/// context to recognise it.
-pub(crate) fn classify(hr: windows::core::HRESULT) -> Condition {
-    use windows::Win32::Foundation::{
-        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
-        IORING_E_SUBMISSION_QUEUE_FULL,
-    };
-    if hr == IORING_E_SUBMISSION_QUEUE_FULL {
-        Condition::QueueFull
-    } else if hr == ERROR_PIPE_BUSY.to_hresult() {
-        Condition::PipeBusy
-    } else if hr == ERROR_BROKEN_PIPE.to_hresult() {
-        Condition::PipeBroken
-    } else if hr == ERROR_NO_DATA.to_hresult() {
-        Condition::PipeNoPeer
-    } else if hr == ERROR_PIPE_LISTENING.to_hresult() {
-        Condition::PipeListening
-    } else {
-        Condition::Other(hr)
+    /// Maps a platform `HRESULT` to the condition it denotes.
+    ///
+    /// This is the only function in the crate that matches on an `HRESULT` to
+    /// produce an error condition. `error_classification_has_one_home` enforces
+    /// that by inspecting the crate's own source text, and carries the allowlist of
+    /// the sites which compare codes for other reasons.
+    ///
+    /// Codes are matched **exactly**, never by facility or range. This classifier
+    /// sees every ring completion in the crate, so a range match would reclassify
+    /// errors from files and sockets that happen to fall inside it — a much larger
+    /// blast radius than the pipe surface that motivated the pipe codes.
+    ///
+    /// `ERROR_PIPE_CONNECTED` is deliberately absent. It reports that a client
+    /// arrived before the accept was issued, which is a **success** for the accept
+    /// and is converted at that call site; classifying it here would turn the most
+    /// easily lost connection in the API into an error at the one place with no
+    /// context to recognise it.
+    fn classify(hr: windows::core::HRESULT) -> Condition {
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            IORING_E_SUBMISSION_QUEUE_FULL,
+        };
+        if hr == IORING_E_SUBMISSION_QUEUE_FULL {
+            Condition::QueueFull
+        } else if hr == ERROR_PIPE_BUSY.to_hresult() {
+            Condition::PipeBusy
+        } else if hr == ERROR_BROKEN_PIPE.to_hresult() {
+            Condition::PipeBroken
+        } else if hr == ERROR_NO_DATA.to_hresult() {
+            Condition::PipeNoPeer
+        } else if hr == ERROR_PIPE_LISTENING.to_hresult() {
+            Condition::PipeListening
+        } else {
+            Condition::Other(hr)
+        }
+    }
+
+    /// How views over [`Condition`] are written, and why they are traits.
+    ///
+    /// A view is a trait with **one method per condition and no default bodies**,
+    /// dispatched by [`view`], which holds the crate's only `match` on
+    /// [`Condition`]. Adding a condition is caught in two steps, both hard `rustc`
+    /// errors that no attribute can silence:
+    ///
+    /// 1. `E0004` — the dispatch `match` is no longer exhaustive. There is no way
+    ///    to satisfy it without deciding what the new condition means.
+    /// 2. `E0046` — once the trait gains the corresponding method, every view that
+    ///    has not implemented it fails to compile.
+    ///
+    /// Neither step depends on Clippy running, on a lint being armed, or on a test.
+    /// A view contains no `match`, so a wildcard is not *forbidden* in a view — it
+    /// is unrepresentable.
+    ///
+    /// # Why not a hand-written match with a lint
+    ///
+    /// That was the previous design, and it was defeated **nine times across three
+    /// review rounds** by code that compiled, was idiomatic in this crate, and left
+    /// both Clippy and the policing test silent. The defeats were not nine bugs;
+    /// they were nine samples from one unbounded class — *get a `match` past a text
+    /// scanner*:
+    ///
+    /// - `let mapped = match condition { … }` rather than a line beginning `match `;
+    /// - `#![allow(…)]` as the first line of the function body, which overrides an
+    ///   outer `#[deny]` and which a scanner looking for `#[` does not see;
+    /// - a second classification table keyed on `std::io::ErrorKind`, naming no
+    ///   platform identifier at all — and diverging for real, since std maps
+    ///   `ERROR_NO_DATA` to `BrokenPipe` where [`classify`] maps it to `PipeNoPeer`.
+    ///
+    /// Two facts about Clippy made that design weaker than it looked, and both were
+    /// found by mutating a view and watching for a complaint that never came.
+    /// Neither wildcard lint fires inside a `macro_rules!` expansion, so generating
+    /// the views — the obvious way to guarantee the attribute was present —
+    /// guaranteed only that it was present, not that it did anything. And
+    /// `wildcard_enum_match_arm` alone does not fire when the wildcard covers
+    /// exactly *one* remaining variant; that belongs to
+    /// `match_wildcard_for_single_variants`, a different lint in a different group,
+    /// and the single-variant case is the realistic mistake — a view naming every
+    /// condition but the one its author forgot.
+    ///
+    /// Both lints are still denied, on the dispatch, where a wildcard is still
+    /// expressible. They are no longer the guarantee; they are a second line.
+    ///
+    /// # The two residual hazards
+    ///
+    /// Both are bounded, both live at a named site, and both are pinned by
+    /// `error_classification_policy.rs` with a mutation twin.
+    ///
+    /// **A default body** on a trait method restores exactly the silent demotion
+    /// this design removes: the method stops being required by `E0046`, and a stale
+    /// view compiles.
+    ///
+    /// **A dispatch arm routing a new condition to an existing method** — writing
+    /// `Condition::New => V::other(hr)` — satisfies `E0004` without ever adding a
+    /// method, so `E0046` never fires and every view silently demotes the new
+    /// condition. This was found by mutation, against this design, after it was
+    /// adopted; Clippy reports nothing, because the arm names its variant and no
+    /// wildcard is involved. The guard is name-correspondence: arm *i* must call
+    /// the method whose name is the snake_case of the variant it matches, which is
+    /// total over the arms and fails on exactly this edit.
+    mod view_convention {}
+
+    /// A view over [`Condition`], as one method per condition.
+    ///
+    /// Implementing this is how an error type says which conditions it names. There
+    /// are **no default bodies**: a type that has not accounted for every condition
+    /// does not compile, with `E0046`, under plain `cargo build`. See
+    /// [`view_convention`] for why this is a trait and not a `match`.
+    ///
+    /// Every method receives the originating `HRESULT` alongside its condition, so a
+    /// view that cannot name a condition can still carry the code forward rather
+    /// than fabricating a stand-in. [`view`] classifies and dispatches in one step,
+    /// which is what guarantees the code and the condition it is paired with always
+    /// describe the same failure.
+    pub(crate) trait ConditionView: Sized {
+        /// The submission or completion queue had no room.
+        fn queue_full(hr: windows::core::HRESULT) -> Self;
+        /// All pipe instances are busy.
+        fn pipe_busy(hr: windows::core::HRESULT) -> Self;
+        /// The pipe was broken by the peer.
+        fn pipe_broken(hr: windows::core::HRESULT) -> Self;
+        /// The pipe has no peer connected.
+        fn pipe_no_peer(hr: windows::core::HRESULT) -> Self;
+        /// The pipe is listening and not yet connected.
+        fn pipe_listening(hr: windows::core::HRESULT) -> Self;
+        /// A code the table does not classify, or a condition this view does not
+        /// name. The `HRESULT` is passed through unchanged so it can be
+        /// re-classified at a boundary that does name it.
+        ///
+        /// Named for its variant rather than for its meaning — `other`, not
+        /// `unnamed` — so that every dispatch arm's method name is exactly the
+        /// snake_case of the variant it matches, with no exceptions. The
+        /// correspondence guard in `error_classification_policy.rs` needs no
+        /// allowlist as a result, and an allowlist is a place for a future
+        /// mis-routing to hide.
+        fn other(hr: windows::core::HRESULT) -> Self;
+    }
+
+    /// Classifies `hr` and dispatches it to `V`'s view.
+    ///
+    /// This function holds the crate's only `match` on [`Condition`]. Because it
+    /// classifies and dispatches together, no caller can pair a condition with an
+    /// `HRESULT` that did not produce it.
+    #[deny(
+        clippy::wildcard_enum_match_arm,
+        clippy::match_wildcard_for_single_variants
+    )]
+    pub(crate) fn view<V: ConditionView>(hr: windows::core::HRESULT) -> V {
+        match classify(hr) {
+            Condition::QueueFull => V::queue_full(hr),
+            Condition::PipeBusy => V::pipe_busy(hr),
+            Condition::PipeBroken => V::pipe_broken(hr),
+            Condition::PipeNoPeer => V::pipe_no_peer(hr),
+            Condition::PipeListening => V::pipe_listening(hr),
+            Condition::Other(_) => V::other(hr),
+        }
     }
 }
 
-/// How views over [`Condition`] are written, and why they are not generated.
-///
-/// Views are **hand-written**, and this is a deliberate reversal of the obvious
-/// design. Two mechanisms that look sufficient are not, and both were found by
-/// mutating a view and watching for a complaint that never came.
-///
-/// **A macro cannot carry the lint.** A macro that emitted each view would
-/// guarantee the attribute was present, and this crate had one.
-/// `clippy::wildcard_enum_match_arm` does not fire inside a macro expansion —
-/// Clippy skips lints whose span comes from expansion — so the attribute was
-/// present in the source and inert in effect. A generated view could absorb
-/// every condition behind a `_` arm and Clippy would report nothing. The
-/// identical match, written by hand, is rejected.
-///
-/// **One lint is not enough.** `clippy::wildcard_enum_match_arm` does not fire
-/// when the wildcard covers exactly *one* remaining variant; that case belongs
-/// to `clippy::match_wildcard_for_single_variants`, a different lint in a
-/// different group. The single-variant case is the likely one here: a view that
-/// names every condition but the one its author forgot is exactly the mistake
-/// these types exist to prevent, and it is the case the obvious lint misses.
-/// Both are denied.
-///
-/// Each view is therefore written out, carries both attributes itself, and is
-/// checked by `error_classification_policy.rs`:
-///
-/// - every view must arm both lints;
-/// - no view may use a wildcard arm at all.
-///
-/// Between them, `rustc`'s own exhaustiveness rule does the rest: with no
-/// wildcard, adding a [`Condition`] variant fails to compile every view that has
-/// not named it.
-mod view_convention {}
+pub(crate) use classification::{ConditionView, view};
 
 /// An error produced by this crate.
 #[derive(Debug, Clone)]
@@ -390,30 +495,7 @@ impl Error {
     /// error verbatim. Those variants are produced at the call sites that know
     /// the context, such as [`IoRingBuilder::build`](crate::io_ring::IoRingBuilder::build).
     pub(crate) fn from_hresult(hr: windows::core::HRESULT) -> Self {
-        Self::from_condition(classify(hr))
-    }
-
-    /// The crate-wide error's view over [`Condition`].
-    ///
-    /// This is the first of the exhaustive views described on [`Condition`]. It
-    /// names every condition the table can report, so its `Other` arm is
-    /// reached only by codes the table itself did not classify.
-    ///
-    /// Both attributes are written here rather than generated, and there are two
-    /// of them for a reason; see [`view_convention`](crate::error::view_convention).
-    #[deny(
-        clippy::wildcard_enum_match_arm,
-        clippy::match_wildcard_for_single_variants
-    )]
-    pub(crate) fn from_condition(condition: Condition) -> Self {
-        match condition {
-            Condition::QueueFull => Error::QueueFull,
-            Condition::PipeBusy => Error::PipeBusy,
-            Condition::PipeBroken => Error::PipeBroken,
-            Condition::PipeNoPeer => Error::PipeNoPeer,
-            Condition::PipeListening => Error::PipeListening,
-            Condition::Other(hr) => Error::Os(windows::core::Error::from(hr)),
-        }
+        view(hr)
     }
 
     /// Classifies a platform error produced while creating a ring.
@@ -438,6 +520,37 @@ impl Error {
             requested: requested.0,
             max_supported: max.0,
         }
+    }
+}
+
+/// The crate-wide error's view over [`Condition`].
+///
+/// This is the first of the views described on [`view_convention`]. It names
+/// every condition the table can report, so `other` is reached only by codes
+/// the table itself did not classify.
+impl ConditionView for Error {
+    fn queue_full(_hr: windows::core::HRESULT) -> Self {
+        Error::QueueFull
+    }
+
+    fn pipe_busy(_hr: windows::core::HRESULT) -> Self {
+        Error::PipeBusy
+    }
+
+    fn pipe_broken(_hr: windows::core::HRESULT) -> Self {
+        Error::PipeBroken
+    }
+
+    fn pipe_no_peer(_hr: windows::core::HRESULT) -> Self {
+        Error::PipeNoPeer
+    }
+
+    fn pipe_listening(_hr: windows::core::HRESULT) -> Self {
+        Error::PipeListening
+    }
+
+    fn other(hr: windows::core::HRESULT) -> Self {
+        Error::Os(windows::core::Error::from(hr))
     }
 }
 

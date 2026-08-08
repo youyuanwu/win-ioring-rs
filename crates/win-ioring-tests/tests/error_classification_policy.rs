@@ -65,12 +65,6 @@ const TABLE_CONSTANTS: &[&str] = &[
     "IORING_E_SUBMISSION_QUEUE_FULL",
 ];
 
-/// The two lints every view must arm.
-const REQUIRED_LINTS: &[&str] = &[
-    "clippy::wildcard_enum_match_arm",
-    "clippy::match_wildcard_for_single_variants",
-];
-
 /// A production site that mentions a platform error code without classifying
 /// one.
 struct Allowed {
@@ -311,146 +305,6 @@ fn policed_lines(text: &str) -> Vec<(usize, &str)> {
     out
 }
 
-/// The number of views over `Condition` the crate is expected to contain.
-///
-/// Asserted exactly, not as a lower bound. See
-/// `every_match_on_a_condition_is_an_armed_view` for why.
-const EXPECTED_VIEWS: usize = 1;
-
-/// The `Condition` variant names, used to recognise a view by its arms.
-const CONDITION_VARIANTS: [&str; 6] = [
-    "QueueFull",
-    "PipeBusy",
-    "PipeBroken",
-    "PipeNoPeer",
-    "PipeListening",
-    "Other",
-];
-
-/// Whether line `index` is a match arm over a `Condition` variant.
-///
-/// The qualifier is not required to be the literal text `Condition::`. It may be
-/// `Self::` inside `impl Condition`, an alias established by `use ... as`, or
-/// absent entirely under a glob import. What it may *not* be is some other
-/// enum's path: `Error::PipeBusy` names a variant of the crate-wide error type,
-/// which is not a view and must not be dragged into this check.
-fn is_condition_arm(lines: &[&str], index: usize) -> bool {
-    let trimmed = lines[index].trim();
-    if !trimmed.contains("=>") {
-        return false;
-    }
-    let pattern = trimmed.split("=>").next().unwrap_or("");
-
-    // `Other` alone is too common a variant name to key on; a view is recognised
-    // by one of the five distinctive conditions, and `Other` only counts once
-    // the enclosing function is already known to be a view.
-    let distinctive = &CONDITION_VARIANTS[..5];
-
-    for variant in distinctive {
-        let Some(at) = pattern.find(variant) else {
-            continue;
-        };
-        // Reject a longer identifier that merely contains the variant name.
-        let after = pattern[at + variant.len()..].chars().next();
-        if after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        let before = pattern[..at].trim_end();
-        if !before.ends_with("::") {
-            // Unqualified: a glob import, or a bare pattern.
-            return true;
-        }
-        let path = before.trim_end_matches("::");
-        let last = path.rsplit("::").next().unwrap_or(path).trim();
-        if last == "Condition" {
-            return true;
-        }
-        if last == "Self" {
-            // `Self::PipeBusy` is a view only inside `impl Condition`.
-            return enclosing_item(lines, index)
-                .is_some_and(|item| lines[item].contains("impl Condition"));
-        }
-        if condition_aliases(lines).contains(&last) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Local aliases for `Condition` established by `use ... as ...` in this file.
-fn condition_aliases<'a>(lines: &[&'a str]) -> Vec<&'a str> {
-    lines
-        .iter()
-        .filter(|line| line.trim_start().starts_with("use "))
-        .filter_map(|line| {
-            let at = line.find("Condition as ")?;
-            let rest = &line[at + "Condition as ".len()..];
-            let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .unwrap_or(rest.len());
-            Some(&rest[..end])
-        })
-        .collect()
-}
-
-/// The inner attributes (`#![...]`) at the top of an item's body.
-fn inner_attributes_of(lines: &[&str], item: usize) -> String {
-    let Some((start, end)) = body_range(lines, item) else {
-        return String::new();
-    };
-    lines[start..end]
-        .iter()
-        .map(|line| line.trim())
-        .take_while(|trimmed| {
-            trimmed.starts_with("#![")
-                || trimmed.starts_with("//")
-                || trimmed.is_empty()
-                || trimmed.ends_with('{')
-        })
-        .filter(|trimmed| trimmed.starts_with("#!["))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// The `match` blocks within `start..end` whose arms name a `Condition`.
-///
-/// Returned as line ranges so the wildcard check can be confined to them. A
-/// view's body may contain other matches — over an `i32`, a `str`, or any
-/// `#[non_exhaustive]` foreign enum — which cannot be written exhaustively and
-/// whose wildcards say nothing about the view's coverage of `Condition`.
-fn condition_match_blocks(lines: &[&str], start: usize, end: usize) -> Vec<(usize, usize)> {
-    let mut blocks: Vec<(usize, usize)> = Vec::new();
-
-    for index in start..end {
-        if !is_condition_arm(lines, index) {
-            continue;
-        }
-        if blocks.iter().any(|&(s, e)| index >= s && index < e) {
-            continue;
-        }
-        // Walk up to the `match` that owns this arm: the nearest line above at
-        // a smaller indent that opens a match block.
-        let arm_indent = indent(lines[index]);
-        let Some(head) = (start..index)
-            .rev()
-            .find(|&candidate| {
-                let trimmed = lines[candidate].trim();
-                !trimmed.starts_with("//")
-                    && trimmed.starts_with("match ")
-                    && indent(lines[candidate]) < arm_indent
-            })
-            .or(Some(start))
-        else {
-            continue;
-        };
-        if let Some((block_start, block_end)) = body_range(lines, head) {
-            blocks.push((block_start, block_end.min(end)));
-        }
-    }
-
-    blocks
-}
-
 /// Whether a line renames a platform error *code* through an import.
 ///
 /// Type names (`HRESULT`, `WIN32_ERROR`) are excluded: aliasing a type launders
@@ -484,6 +338,14 @@ fn decides_from_an_error_code(line: &str) -> bool {
                     || word == "HRESULT"
                     || word == "WIN32_ERROR"
                     || (word.starts_with("E_") && word.len() > 2)
+                    // std::io::ErrorKind is a classification of platform error
+                    // codes wearing different clothes, and it names no platform
+                    // identifier at all — which is exactly how a reviewer got a
+                    // second table past the identifier check above. It also
+                    // genuinely diverges: std maps ERROR_NO_DATA to BrokenPipe,
+                    // where classify maps it to PipeNoPeer. Two callers asking
+                    // the same question would get two answers.
+                    || word == "ErrorKind"
             })
             || line.contains("0x8007")
             || line.contains("0x8000")
@@ -499,175 +361,6 @@ fn decides_from_an_error_code(line: &str) -> bool {
     let declares_const = trimmed.starts_with("const ") || trimmed.starts_with("static ");
 
     compares || match_arm || declares_const
-}
-
-/// The extent of the function body beginning at or after `signature`.
-///
-/// Returns the half-open range of line indices covering the body, or `None` if
-/// no opening brace follows. Seeding the depth from the signature line was a
-/// defect: a signature wrapped across lines by rustfmt has no brace on it, the
-/// depth started at zero, and the scan concluded the body had already ended.
-/// That shape is not contrived — rustfmt produces it whenever the signature
-/// exceeds the width limit.
-fn body_range(lines: &[&str], signature: usize) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut opened = false;
-    for (offset, line) in lines.iter().enumerate().skip(signature) {
-        depth += line.matches('{').count();
-        if depth > 0 {
-            opened = true;
-        }
-        depth = depth.saturating_sub(line.matches('}').count());
-        if opened && depth == 0 {
-            return Some((signature, offset + 1));
-        }
-    }
-    None
-}
-
-/// The function signature enclosing `target`, if any.
-///
-/// Doc comments are skipped: `trimmed.contains(" fn ")` is true of prose such as
-/// "the fn that classifies", and resolving a view's owner to a doc line would
-/// yield a nonsense body range and a false "does not deny".
-fn enclosing_fn(lines: &[&str], target: usize) -> Option<usize> {
-    let target_indent = indent(lines[target]);
-    (0..target).rev().find(|&candidate| {
-        let line = lines[candidate];
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") {
-            return false;
-        }
-        let is_fn = trimmed.starts_with("fn ")
-            || trimmed.starts_with("pub fn ")
-            || trimmed.starts_with("pub(crate) fn ")
-            || trimmed.contains(" fn ");
-        is_fn && indent(line) < target_indent
-    })
-}
-
-/// The `impl` or `mod` header enclosing `target`, if any.
-///
-/// Used for two things: deciding whether `Self::PipeBusy` names a `Condition`,
-/// and finding a `#[deny(...)]` written on the enclosing item rather than on the
-/// function. The second is a *more* robust placement than the one this file
-/// originally demanded, and rejecting it taught the next author to hollow out
-/// the guard rather than obey it.
-fn enclosing_item(lines: &[&str], target: usize) -> Option<usize> {
-    let target_indent = indent(lines[target]);
-    (0..target).rev().find(|&candidate| {
-        let line = lines[candidate];
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") {
-            return false;
-        }
-        let is_item = trimmed.starts_with("impl ")
-            || trimmed.starts_with("impl<")
-            || trimmed.starts_with("mod ")
-            || trimmed.starts_with("pub mod ")
-            || trimmed.starts_with("pub(crate) mod ");
-        is_item && indent(line) < target_indent
-    })
-}
-
-/// The attribute text immediately above `signature`, joined into one string.
-///
-/// The walk stops at the first line that is neither an attribute nor a doc
-/// comment. It used to treat the two interchangeably and only ask whether a
-/// `deny` string appeared *somewhere* above, which let an `#[allow]` placed
-/// below the `#[deny]` satisfy the check while overriding it.
-///
-/// Attributes are joined rather than examined line by line because an attribute
-/// may span lines — `rustfmt` wraps `#[deny(a, b)]` automatically once it
-/// exceeds the width limit, and a per-line parser rejected the result. A check
-/// that fails on the formatting the project's own formatter produces will be
-/// worked around rather than obeyed.
-///
-/// Doc comments are dropped, so prose that happens to quote an attribute cannot
-/// be mistaken for one. This file's own documentation quotes both lints.
-///
-/// The walk refuses to *enter* continuation state from a comment, and only
-/// treats a line as an attribute's closing tail if it looks like one. A previous
-/// version decremented `depth` on `[` alone, so a single stray `]` inside a doc
-/// comment — a typo in a code span, say — sent the walk climbing forever,
-/// harvesting arbitrary prose as attribute text. Documentation quoting
-/// `#[deny(...)]` then satisfied a check on a function that denied nothing. That
-/// is not hypothetical: it was demonstrated against this file, and combined with
-/// a binding catch-all it disarmed a view completely while clippy stayed silent.
-fn attributes_above(lines: &[&str], signature: usize) -> String {
-    let mut collected: Vec<&str> = Vec::new();
-    let mut depth = 0usize;
-
-    for line in lines[..signature].iter().rev() {
-        let trimmed = line.trim();
-        let closes = line.matches(']').count();
-        let opens = line.matches('[').count();
-        let is_comment = trimmed.starts_with("//");
-        // Walking upwards, a wrapped attribute is met at its *last* line, which
-        // is `)]` and starts with neither `#[` nor `//`. Recognising it by shape
-        // is what lets the walk reach the `#[deny(` above it, without treating
-        // every line that happens to contain a `]` as an attribute tail.
-        let continues = depth > 0 && !is_comment;
-        let is_attribute_tail = !continues
-            && !is_comment
-            && closes > opens
-            && trimmed.trim_end_matches(']').trim_end_matches(',').trim() == ")";
-        let is_attribute_start = trimmed.starts_with("#[");
-
-        if !continues && !is_attribute_tail && !is_attribute_start && !is_comment {
-            break;
-        }
-        if continues || is_attribute_tail || is_attribute_start {
-            collected.push(trimmed);
-        } else {
-            // A comment reached at depth zero: skip it, and never let it put the
-            // walk into continuation state.
-            depth = 0;
-            continue;
-        }
-        depth = (depth + closes).saturating_sub(opens);
-    }
-
-    collected.reverse();
-    collected.join(" ")
-}
-
-/// Whether `lint` appears inside an attribute of the given kind in `text`.
-///
-/// Parses the lint names out of `deny(...)` or `allow(...)` with parenthesis
-/// matching rather than comparing whole lines, so the combined form
-/// `#[deny(a, b)]` counts for both lints and a wrapped one counts too.
-/// Rejecting a spelling that is correct and equally effective would teach a
-/// reader to work around this test rather than obey it.
-fn attribute_names_lint(text: &str, kind: &str, lint: &str) -> bool {
-    let bare = lint.trim_start_matches("clippy::");
-    let mut rest = text;
-    while let Some(start) = rest.find(kind) {
-        let after = &rest[start + kind.len()..];
-        let mut depth = 1usize;
-        let mut end = after.len();
-        for (offset, ch) in after.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = offset;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let named = after[..end]
-            .split(',')
-            .any(|name| name.trim() == lint || name.trim() == bare);
-        if named {
-            return true;
-        }
-        rest = &after[end.min(after.len())..];
-    }
-    false
 }
 
 /// FR-1: the constants that make up the table appear only in `classify`.
@@ -790,136 +483,6 @@ fn every_allowlisted_site_still_exists_exactly_as_often_as_recorded() {
     }
 }
 
-/// FR-10, FR-11, SC-4, SC-6: every `match` on a `Condition` is an armed,
-/// wildcard-free view.
-///
-/// Views are found by what they *do*, not by what they are called. Keying on
-/// the name `from_condition` left `impl From<Condition> for X` — the first
-/// thing a Rust author reaches for — invisible to this check while both lints
-/// stayed allow-by-default and silent.
-///
-/// Detection is by *variant name*, not by the path written in front of it. An
-/// inherent method on `Condition` spells its arms `Self::PipeBusy`, which is
-/// what anyone writing `impl Condition` would produce, and a detector keyed on
-/// the literal text `Condition::` never saw it. Glob imports and `use Condition
-/// as C` are covered for the same reason.
-///
-/// The count is asserted, not merely required to be positive. Every defeat of
-/// this guard so far worked by making a view *invisible* to it rather than by
-/// making a visible view look correct, and an invisible view is indistinguishable
-/// from no view at all unless the expected number is written down. This is the
-/// same discipline the allowlist already applies with its `sites` counts, for
-/// the same reason: text matching cannot tell absence from oversight.
-#[test]
-fn every_match_on_a_condition_is_an_armed_view() {
-    let mut views = 0usize;
-    let mut problems = Vec::new();
-
-    for (rel, path) in source_files() {
-        let text = std::fs::read_to_string(&path).expect("source file is readable");
-        let lines: Vec<&str> = text.lines().collect();
-
-        // Every line that matches on a Condition variant, mapped to the
-        // function that contains it.
-        let mut owners: Vec<usize> = Vec::new();
-        for index in 0..lines.len() {
-            if !is_condition_arm(&lines, index) {
-                continue;
-            }
-            if let Some(owner) = enclosing_fn(&lines, index) {
-                if !owners.contains(&owner) {
-                    owners.push(owner);
-                }
-            } else {
-                problems.push(format!(
-                    "{rel}:{}: matches on a Condition outside any function",
-                    index + 1
-                ));
-            }
-        }
-
-        for owner in owners {
-            views += 1;
-            // A `#[deny]` may sit on the function or on the `impl`/`mod` that
-            // contains it. The second is the more robust placement — it covers
-            // every view added to the block later — and rejecting it would
-            // teach the next author to work around this test.
-            let mut attributes = attributes_above(&lines, owner);
-            if let Some(item) = enclosing_item(&lines, owner) {
-                attributes.push(' ');
-                attributes.push_str(&attributes_above(&lines, item));
-                attributes.push(' ');
-                attributes.push_str(&inner_attributes_of(&lines, item));
-            }
-            let (start, end) = body_range(&lines, owner).unwrap_or_else(|| {
-                panic!("{rel}:{}: view has no body", owner + 1);
-            });
-            let body = &lines[start..end];
-
-            for lint in REQUIRED_LINTS {
-                if !attribute_names_lint(&attributes, "deny(", lint) {
-                    problems.push(format!("{rel}:{}: does not deny {lint}", owner + 1));
-                }
-                // An allow anywhere in the preamble or the body overrides the
-                // deny, so a view can be armed in the source and unarmed in
-                // effect.
-                let allowed_above = attribute_names_lint(&attributes, "allow(", lint);
-                let allowed_within = body.iter().any(|line| {
-                    let trimmed = line.trim();
-                    trimmed.starts_with("#[") && attribute_names_lint(trimmed, "allow(", lint)
-                });
-                if allowed_above || allowed_within {
-                    problems.push(format!(
-                        "{rel}:{}: allows {lint}, which overrides the deny",
-                        owner + 1
-                    ));
-                }
-            }
-
-            // The wildcard scan is bounded to the `match` blocks that actually
-            // arm on a Condition, and within those, to arms of that match
-            // itself. Scanning the whole function rejected a view whose body
-            // also matched on an `i32` — which *cannot* be written exhaustively
-            // — and reported it as a wildcard over Condition, which was simply
-            // untrue. Nested matches sit at a deeper brace depth and are not
-            // this match's arms.
-            for (block_start, block_end) in condition_match_blocks(&lines, start, end) {
-                let mut depth = 0isize;
-                for (offset, line) in lines[block_start + 1..block_end].iter().enumerate() {
-                    let trimmed = line.trim();
-                    if depth == 0 && (trimmed.starts_with("_ =>") || trimmed.starts_with("_ if")) {
-                        problems.push(format!(
-                            "{rel}:{}: wildcard arm in a view over Condition",
-                            block_start + offset + 2
-                        ));
-                    }
-                    depth += line.matches('{').count() as isize;
-                    depth -= line.matches('}').count() as isize;
-                    depth = depth.max(0);
-                }
-            }
-        }
-    }
-
-    assert_eq!(
-        views, EXPECTED_VIEWS,
-        "expected {EXPECTED_VIEWS} view(s) over the classification table, found \
-         {views}. If you added a view, arm it and raise EXPECTED_VIEWS. If you \
-         removed one, lower it. If you changed neither, this test has stopped \
-         recognising a view that still exists — which is exactly how a view \
-         gets to skip the checks below without anyone noticing."
-    );
-    assert!(
-        problems.is_empty(),
-        "views over the classification table are not properly armed:\n{}\n\n\
-         The point of per-API error types is that each names what it can \
-         actually produce. A wildcard lets a type claim conditions nobody \
-         checked it against, and turns adding a Condition variant into a silent \
-         change rather than a compile error.",
-        problems.join("\n")
-    );
-}
-
 /// The derivation behind the design's headline cost: `Condition` adds no public
 /// variant slots.
 ///
@@ -933,13 +496,25 @@ fn condition_is_not_part_of_the_public_api() {
     let error_rs =
         std::fs::read_to_string(PathBuf::from(SRC).join("error.rs")).expect("error.rs is readable");
     assert!(
-        error_rs.contains("pub(crate) enum Condition {"),
-        "Condition is no longer crate-private; the public variant count in the \
-         design's costing assumed it contributed nothing"
+        error_rs.contains("\nmod classification {"),
+        "the classification module is no longer private. Its privacy is what \
+         makes a second match on a condition unrepresentable rather than merely \
+         discouraged: no other module can name the type."
     );
     assert!(
-        error_rs.contains("pub(crate) fn classify("),
-        "classify is no longer crate-private"
+        error_rs.contains("\n    enum Condition {"),
+        "Condition is no longer private to the classification module; the public \
+         variant count in the design's costing assumed it contributed nothing, \
+         and a nameable Condition can be matched a second time"
+    );
+    assert!(
+        error_rs.contains("\n    fn classify("),
+        "classify is no longer private to the classification module"
+    );
+    assert!(
+        !error_rs.contains("pub use classification"),
+        "the classification module's contents are re-exported, which undoes the \
+         privacy the guard above depends on"
     );
 
     for (rel, path) in all_files() {
@@ -962,4 +537,339 @@ fn condition_is_not_part_of_the_public_api() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The mechanism guard: E0046 and its two residual hazards.
+//
+// Adding a variant to a source enum is caught by the compiler in two steps —
+// E0004 on the dispatch, then E0046 on every view that has not implemented the
+// new method. Both are hard `rustc` errors and neither can be silenced by an
+// attribute, so nothing here needs to re-check them; `compile_fail` twins in
+// `error_view_exhaustiveness.rs` pin that they fire.
+//
+// What the compiler cannot see are the two edits that stop it firing at all.
+// This is where those are pinned.
+// ---------------------------------------------------------------------------
+
+/// How many view traits the crate is known to have.
+///
+/// Discovered traits are counted against this rather than being looked up by
+/// name, so a fifth trait cannot arrive un-covered: it either fails this
+/// assertion or is deliberately recorded here. A hand-written list of trait
+/// names would have the opposite property — the guard would keep passing while
+/// covering less than the mechanism it exists to protect.
+const VIEW_TRAITS: usize = 1;
+
+/// How many dispatch functions the crate is known to have — one per view trait.
+const DISPATCH_FUNCTIONS: usize = 1;
+
+/// `QueueFull` -> `queue_full`.
+fn snake_case(variant: &str) -> String {
+    let mut out = String::new();
+    for (position, character) in variant.char_indices() {
+        if character.is_uppercase() {
+            if position != 0 {
+                out.push('_');
+            }
+            out.extend(character.to_lowercase());
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// The lines of the body of the item declared at `start`, by brace depth.
+fn item_body<'a>(lines: &[&'a str], start: usize) -> Vec<&'a str> {
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for line in &lines[start..] {
+        let opened = line.matches('{').count();
+        let closed = line.matches('}').count();
+        if depth > 0 {
+            out.push(*line);
+        }
+        depth = depth + opened - closed.min(depth + opened);
+        if depth == 0 && (opened > 0 || !out.is_empty()) {
+            break;
+        }
+    }
+    out.pop();
+    out
+}
+
+/// No method of any view trait may have a default body.
+///
+/// A default body is the first of two ways to disarm `E0046`. It makes the
+/// method optional, so a view that has never heard of a condition compiles and
+/// silently answers for it. Nothing else in the mechanism notices: the trait
+/// still exists, the dispatch is still exhaustive, and every lint is still
+/// armed.
+#[test]
+fn no_view_trait_method_has_a_default_body() {
+    let mut traits_found = 0usize;
+    let mut offenders = Vec::new();
+
+    for (rel, path) in source_files() {
+        let text = std::fs::read_to_string(&path).expect("source file is readable");
+        let lines: Vec<&str> = text.lines().collect();
+
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub(crate) trait ") else {
+                continue;
+            };
+            let name = rest
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if !name.ends_with("View") {
+                continue;
+            }
+            traits_found += 1;
+
+            for (offset, method) in item_body(&lines, index).iter().enumerate() {
+                let method = method.trim();
+                if !method.starts_with("fn ") {
+                    continue;
+                }
+                // A signature may wrap across lines, so read forward to
+                // whichever of `;` or `{` terminates it. Judging the first line
+                // alone would report every wrapped signature as a default body,
+                // and the fix for that false positive would be to relax the
+                // check — which is how a guard stops guarding.
+                let body = item_body(&lines, index);
+                let mut declaration = String::new();
+                for line in &body[offset..] {
+                    declaration.push_str(line.trim());
+                    if line.trim_end().ends_with(';') || line.contains('{') {
+                        break;
+                    }
+                    declaration.push(' ');
+                }
+                if !declaration.ends_with(';') {
+                    offenders.push(format!("{rel}: trait {name}: {declaration}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a view trait method has a default body, which makes it optional and \
+         lets a stale view compile — the exact silent demotion E0046 exists to \
+         prevent:\n  {}",
+        offenders.join("\n  ")
+    );
+
+    assert_eq!(
+        traits_found, VIEW_TRAITS,
+        "expected {VIEW_TRAITS} view trait(s), found {traits_found}. If you \
+         added one, raise VIEW_TRAITS; if you removed one, lower it. If you \
+         changed neither, this guard has stopped recognising a trait that still \
+         exists, and is no longer covering the whole mechanism."
+    );
+}
+
+/// Every dispatch arm must call the method named for the variant it matches,
+/// and every trait method must be called by exactly one arm.
+///
+/// This is the second way to disarm `E0046`, and it was found by mutating this
+/// design after adopting it. Writing
+///
+/// ```ignore
+/// Condition::NewlyAdded => V::other(hr),
+/// ```
+///
+/// satisfies E0004 without adding a trait method, so E0046 never fires and
+/// every view in the crate silently demotes the new condition. Clippy reports
+/// nothing, because the arm names its variant and no wildcard is involved.
+///
+/// The bijection is what catches it: `other` would then be called twice. Name
+/// correspondence alone would also catch it, but the bijection additionally
+/// catches a method that no arm reaches, which is the same fault seen from the
+/// other end.
+#[test]
+fn every_dispatch_arm_calls_the_method_named_for_its_variant() {
+    let mut dispatches = 0usize;
+
+    for (rel, path) in source_files() {
+        let text = std::fs::read_to_string(&path).expect("source file is readable");
+        let lines: Vec<&str> = text.lines().collect();
+
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.contains("fn ") || !trimmed.contains("View>") {
+                continue;
+            }
+            let Some(bound) = trimmed.split_once("<V: ") else {
+                continue;
+            };
+            let trait_name = bound.1.split('>').next().unwrap_or("");
+            if !trait_name.ends_with("View") {
+                continue;
+            }
+            dispatches += 1;
+
+            let mut called = Vec::new();
+            for arm in item_body(&lines, index) {
+                let arm = arm.trim();
+                let Some((pattern, action)) = arm.split_once("=>") else {
+                    continue;
+                };
+                let Some((_, variant)) = pattern.trim().rsplit_once("::") else {
+                    continue;
+                };
+                let variant = variant
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                let method = action
+                    .trim()
+                    .strip_prefix("V::")
+                    .and_then(|rest| rest.split('(').next())
+                    .unwrap_or("");
+
+                assert_eq!(
+                    method,
+                    snake_case(variant),
+                    "in {rel}, the dispatch for {trait_name} routes {variant} to \
+                     `{method}`, which is not the method named for it. Routing a \
+                     variant to another variant's method satisfies E0004 without \
+                     adding a trait method, so E0046 never fires and every view \
+                     silently demotes it."
+                );
+                called.push(method.to_string());
+            }
+
+            let mut unique = called.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                called.len(),
+                unique.len(),
+                "in {rel}, the dispatch for {trait_name} calls a method from more \
+                 than one arm, so two conditions are indistinguishable to every \
+                 view"
+            );
+
+            let declaration = lines
+                .iter()
+                .position(|l| {
+                    l.trim_start()
+                        .starts_with(&format!("pub(crate) trait {trait_name}"))
+                })
+                .expect("the dispatch's trait is declared in the same file");
+            let methods = item_body(&lines, declaration)
+                .iter()
+                .filter(|l| l.trim().starts_with("fn "))
+                .count();
+            assert_eq!(
+                called.len(),
+                methods,
+                "in {rel}, {trait_name} has {methods} method(s) but its dispatch \
+                 reaches {} of them; a method no arm calls is a condition no \
+                 view will ever be asked about",
+                called.len()
+            );
+        }
+    }
+
+    assert_eq!(
+        dispatches, DISPATCH_FUNCTIONS,
+        "expected {DISPATCH_FUNCTIONS} dispatch function(s), found {dispatches}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E0046 itself.
+//
+// The two tests above pin the crate-specific preconditions — no default bodies,
+// and a dispatch that reaches each method exactly once. With those held, the
+// remaining claim is a property of `rustc`: a trait method with no default body
+// is required, and an impl that omits it does not compile.
+//
+// That claim cannot be pinned against the real trait. `ConditionView` is private
+// to `error::classification`, so no doctest and no external test crate can name
+// it, and making it public to test it would hand the crate a public trait with
+// one method per condition — which is precisely the public cost the design
+// exists to avoid. Testing it in a replica is the honest alternative, and the
+// scope of what that covers is stated here rather than implied.
+// ---------------------------------------------------------------------------
+
+/// The shape of a view trait, reduced to what `E0046` acts on.
+const REPLICA: &str = r#"
+trait ConditionView: Sized {
+    fn pipe_broken(hr: u32) -> Self;
+    fn other(hr: u32) -> Self;
+    // ADDED: a new condition has just been named.
+    fn pipe_listening(hr: u32) -> Self;
+}
+
+enum FileError { Broken(u32), Other(u32), Listening(u32) }
+
+impl ConditionView for FileError {
+    fn pipe_broken(hr: u32) -> Self { FileError::Broken(hr) }
+    fn other(hr: u32) -> Self { FileError::Other(hr) }
+"#;
+
+/// The view has **not** been updated for the new method.
+const STALE: &str = "}\n";
+
+/// The view **has** been updated. Identical in every other respect.
+const UPDATED: &str = "    fn pipe_listening(hr: u32) -> Self { FileError::Listening(hr) }\n}\n";
+
+/// Adding a method to a view trait fails to compile every view that has not
+/// implemented it, and the failure is `E0046`.
+///
+/// The two halves share `REPLICA` verbatim and differ only in whether the impl
+/// provides the new method. That is what makes the failing half non-vacuous: if
+/// the shared setup ever stopped compiling for an unrelated reason — a rename,
+/// a syntax error, an edition change — the *passing* half would fail too, and
+/// this test would report that rather than quietly reporting success. A
+/// `compile_fail` doctest without such a sibling reports `ok` when it fails for
+/// the wrong reason, and this crate has shipped one that did exactly that.
+///
+/// The error code is asserted for the same reason: "it did not compile" is not
+/// evidence that the mechanism fired.
+#[test]
+fn omitting_a_view_trait_method_is_e0046() {
+    let dir = std::env::temp_dir().join(format!("win-ioring-e0046-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
+
+    let compile = |name: &str, tail: &str| {
+        let source = dir.join(format!("{name}.rs"));
+        std::fs::write(&source, format!("{REPLICA}{tail}")).expect("snippet is writable");
+        std::process::Command::new("rustc")
+            .args(["--crate-type", "lib", "--edition", "2021", "--out-dir"])
+            .arg(&dir)
+            .arg(&source)
+            .output()
+            .expect("rustc runs")
+    };
+
+    let updated = compile("updated", UPDATED);
+    assert!(
+        updated.status.success(),
+        "the sibling that implements the new method must compile, or the failing \
+         half below proves nothing:\n{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+
+    let stale = compile("stale", STALE);
+    assert!(
+        !stale.status.success(),
+        "a view that has not implemented the new method compiled, so E0046 is \
+         not protecting the mechanism"
+    );
+    let stderr = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        stderr.contains("E0046"),
+        "the stale view failed to compile, but not with E0046 — so this test is \
+         passing for the wrong reason, which is the failure mode it exists to \
+         rule out:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
