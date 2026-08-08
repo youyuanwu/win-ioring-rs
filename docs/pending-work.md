@@ -462,6 +462,20 @@ closed-form prediction for the declared shape and routes a mismatch through
   Anyone who does should start by making the bound explicit rather than raising
   it, since a raised bound is a flake deferred rather than a flake understood.
 
+- **The requirement-coverage audit cannot see a missing test.** The script at
+  `.paw/work/named-pipes/probes/coverage-audit.ps1` checks that every requirement
+  and criterion in a specification is *cited by a phase* of the implementation
+  plan. It does not, and cannot, check that the phase then wrote the test. SC-001
+  of the named-pipe work — a server accepting a client and exchanging bytes in
+  both directions, through a registered buffer and through a registered file
+  handle — was assigned to a phase, cited by it, reported covered, and never
+  implemented. It was found in the final gate pass by noticing the integration
+  test crate was untouched in the diffstat, not by any gate. The audit is still
+  worth running; it costs seconds and it did catch omissions. But its result
+  means "the plan forgot nothing", which is much weaker than "nothing was
+  forgotten". Closing the gap needs a link from each criterion to the tests that
+  gate it, which this repository has no convention for.
+
 ## Minor
 
 - **`cargo bench -p win-ioring-bench -- --list` builds the full working set.**
