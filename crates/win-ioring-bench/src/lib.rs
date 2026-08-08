@@ -54,6 +54,7 @@ pub mod backends;
 pub mod concurrency;
 pub mod config;
 pub mod fairness;
+pub mod handle_mode;
 pub mod harness;
 pub mod scenario;
 pub mod session;

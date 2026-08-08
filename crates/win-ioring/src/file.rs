@@ -24,6 +24,12 @@ use std::task::{Context, Poll};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::FILE_FLUSH_MODE;
 
+/// `FILE_FLAG_OVERLAPPED`, as a plain `u32` for `OpenOptionsExt::custom_flags`.
+///
+/// Named from the `windows` constant rather than written as a literal, so a
+/// change in the crate's value cannot silently desynchronise this from it.
+const FILE_FLAG_OVERLAPPED: u32 = windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0;
+
 use crate::buf::{BufResult, IoBuf, IoBufMut};
 use crate::error::Error;
 use crate::io_ring::ops::SqeFlags;
@@ -100,10 +106,66 @@ pub struct File {
 }
 
 impl File {
+    /// Reads back whether this handle serialises I/O at the file object.
+    ///
+    /// Available only with the `handle-mode-query` feature, which is off by
+    /// default because reaching `NtQueryInformationFile` costs three additional
+    /// `windows` namespaces in every downstream consumer's compile. See the
+    /// feature's comment in this crate's `Cargo.toml`.
+    ///
+    /// Handles from [`File::open`] and [`File::create`] are always overlapped,
+    /// so this is only informative for handles adopted through
+    /// [`File::from_std`] or [`File::from_raw_handle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error if the mode could not be read. **A failure
+    /// is not "the handle is overlapped".** The distinction matters: a caller
+    /// checking whether it is about to serialise its I/O must be able to tell
+    /// "no" from "could not tell", so this deliberately does not return a bare
+    /// `bool`.
+    #[cfg(feature = "handle-mode-query")]
+    pub fn is_synchronous(&self) -> std::io::Result<bool> {
+        use windows::Wdk::Storage::FileSystem::{FileModeInformation, NtQueryInformationFile};
+        use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+        /// `FILE_SYNCHRONOUS_IO_NONALERT` — set when the file object serialises
+        /// operations and maintains a kernel file pointer.
+        const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+        let mut mode: u32 = 0;
+        let mut iosb = IO_STATUS_BLOCK::default();
+        // SAFETY: `mode` outlives the call and its size is passed correctly;
+        // the handle is owned by `self` and open for the duration.
+        let status = unsafe {
+            NtQueryInformationFile(
+                windows::Win32::Foundation::HANDLE(self.state.handle.as_raw_handle()),
+                &mut iosb,
+                std::ptr::from_mut(&mut mode).cast(),
+                u32::try_from(size_of::<u32>()).expect("4 fits in u32"),
+                FileModeInformation,
+            )
+        };
+        if status.is_err() {
+            return Err(std::io::Error::other(format!(
+                "NtQueryInformationFile(FileModeInformation) failed: {status:?}"
+            )));
+        }
+        Ok(mode & FILE_SYNCHRONOUS_IO_NONALERT != 0)
+    }
+
     /// Adopts an already-open standard library file.
     ///
     /// Ownership transfers: the handle is closed when the last reference to it
     /// goes away, which includes any operation still in flight.
+    ///
+    /// # This accepts a synchronous handle
+    ///
+    /// Unlike [`File::open`], this cannot guarantee the handle is overlapped —
+    /// adopting a caller-provided handle is the whole point. A synchronous
+    /// handle serialises at the file object regardless of the depth submitted.
+    /// With the `handle-mode-query` feature, `File::is_synchronous` reports
+    /// which kind this is.
     pub fn from_std(file: std::fs::File) -> Self {
         Self {
             state: Rc::new(FileState {
@@ -116,68 +178,112 @@ impl File {
 
     /// Opens a file for reading.
     ///
-    /// # This produces a *synchronous* handle
+    /// # This produces an *overlapped* handle
     ///
-    /// The handle comes from [`std::fs::File::open`], which does not pass
-    /// `FILE_FLAG_OVERLAPPED`. Windows therefore creates it with
-    /// `FILE_SYNCHRONOUS_IO_NONALERT`, and **the file object serialises I/O**:
+    /// The handle is opened with `FILE_FLAG_OVERLAPPED`. This is not a default
+    /// that a caller can talk this function out of: there is no parameter and
+    /// no opt-out, following the same reasoning as `compio`, whose
+    /// `OpenOptions` OR-s the flag in unconditionally and keeps `from_std`
+    /// private so no public route to a non-overlapped file exists.
+    ///
+    /// # What the flag buys
+    ///
+    /// Without it, Windows creates the handle with
+    /// `FILE_SYNCHRONOUS_IO_NONALERT` and **the file object serialises I/O**:
     /// at most one operation is in flight against it at a time, no matter how
-    /// many this crate submits to the ring.
-    ///
-    /// That is a real limitation of this constructor, not a detail. Submitting
-    /// at depth 64 against such a handle yields a depth of one — a consequence
-    /// of the serialisation the kernel performs at the file object, argued from
-    /// the mechanism rather than measured here.
+    /// many this crate submits to the ring. Submitting at depth 64 against such
+    /// a handle yields a depth of one.
     ///
     /// The effect is invisible under a warm page cache, where a cached read
     /// returns synchronously after a memory copy and there is nothing to
-    /// overlap. It becomes decisive as soon as reads reach the device. (The
-    /// warm-cache half of that is a mechanism argument, not a measurement: no
-    /// A/B on the flag under a warm cache has been run.)
+    /// overlap. **That is now a measurement rather than an argument**: a
+    /// pre-registered A/B running both handle modes in the same benchmark run,
+    /// over two independent five-run sets, found no effect of the predicted
+    /// size in any of the eight cells it was frozen over (`docs/performance.md`,
+    /// "Handle mode"). What is excluded is an effect of the predicted
+    /// magnitude, not any effect at all.
     ///
-    /// # Getting an overlapped handle
+    /// It becomes decisive as soon as reads reach the device — the
+    /// unbuffered arm measures the same mechanism at 8.75x to 10.27x, by
+    /// handle count rather than handle mode (see `docs/performance.md`).
     ///
-    /// Open the file yourself and adopt it with [`File::from_std`]:
+    /// # This handle has no kernel file pointer
+    ///
+    /// Overlapped handles do not maintain one. This crate does not need it —
+    /// it tracks its own cursor and passes an explicit offset on every
+    /// operation — but [`File::as_raw_handle`] is public, so a caller who takes
+    /// the raw handle elsewhere and issues a *pointer-relative* `ReadFile`
+    /// against it will not get the behaviour a synchronous handle would have
+    /// given.
+    ///
+    /// Two concrete consequences for such a caller, both measured rather than
+    /// inferred:
+    ///
+    /// - A synchronous `ReadFile`/`WriteFile` with a null `OVERLAPPED` fails
+    ///   with `ERROR_INVALID_PARAMETER` (87). This is what `std::io::Read` and
+    ///   `std::io::Write` issue, so wrapping this handle back into a
+    ///   [`std::fs::File`] and reading from it will fail. It is not a silent
+    ///   wrong answer — it is a clean error — but it is an error where a
+    ///   synchronous handle succeeded.
+    /// - `std`'s positional `seek_read`/`seek_write` are unsafe to use
+    ///   concurrently against an overlapped handle: they require the operation
+    ///   to complete inline and abort the process if the kernel returns
+    ///   `STATUS_PENDING`, which a real device read does.
+    ///
+    /// Operations issued through this crate are unaffected: they always carry an
+    /// explicit offset and are completed through the ring.
+    ///
+    /// # Getting a synchronous handle
+    ///
+    /// If you deliberately want one, open the file yourself and adopt it with
+    /// [`File::from_std`]:
     ///
     /// ```no_run
-    /// use std::os::windows::fs::OpenOptionsExt;
-    ///
-    /// // FILE_FLAG_OVERLAPPED
-    /// const OVERLAPPED: u32 = 0x4000_0000;
-    ///
-    /// let std_file = std::fs::OpenOptions::new()
-    ///     .read(true)
-    ///     .custom_flags(OVERLAPPED)
-    ///     .open("data.bin")?;
+    /// // `std::fs::File::open` does not pass FILE_FLAG_OVERLAPPED, so the
+    /// // handle it returns is synchronous.
+    /// let std_file = std::fs::File::open("data.bin")?;
     /// let file = win_ioring::file::File::from_std(std_file);
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    ///
-    /// Whether this function should set the flag itself is an open question,
-    /// which `docs/pending-work.md` records with its cost, under "Handle mode".
-    /// It is not
-    /// changed here because the twenty `win-ioring` cells of the fifty in the
-    /// published matrix (see "Full result" in `docs/performance.md`) were all
-    /// measured through handles from this function and from [`File::create`],
-    /// and that matrix is a single-run artefact that is never patched from a
-    /// second run — so re-measuring any part of it means re-running all fifty.
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        Ok(Self::from_std(std::fs::File::open(path)?))
+        use std::os::windows::fs::OpenOptionsExt;
+
+        Ok(Self::from_std(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(path)?,
+        ))
     }
 
     /// Creates or truncates a file for writing.
     ///
-    /// Produces a **synchronous** handle, with the same consequences described
-    /// on [`File::open`]: the file object serialises I/O regardless of the
-    /// depth submitted. To obtain one that does not, open the file yourself
-    /// with `FILE_FLAG_OVERLAPPED` alongside the write access this function
-    /// implies — `.write(true).create(true).truncate(true)` — and adopt it with
-    /// [`File::from_std`].
+    /// Produces an **overlapped** handle, with the same guarantee and the same
+    /// consequences described on [`File::open`].
     pub fn create(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        Ok(Self::from_std(std::fs::File::create(path)?))
+        use std::os::windows::fs::OpenOptionsExt;
+
+        Ok(Self::from_std(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(path)?,
+        ))
     }
 
     /// Adopts a raw OS handle.
+    ///
+    /// # This accepts a synchronous handle
+    ///
+    /// As with [`File::from_std`], and for the same reason: adopting a
+    /// caller-provided handle means accepting whatever mode it was opened in.
+    /// If `handle` lacks `FILE_FLAG_OVERLAPPED` the file object serialises, so
+    /// operations submitted at depth 64 complete one at a time however many the
+    /// ring accepts. Open with `FILE_FLAG_OVERLAPPED` to avoid this, or use
+    /// [`File::open`], which sets it. With the `handle-mode-query` feature,
+    /// `File::is_synchronous` reports which kind this is.
     ///
     /// # Safety
     ///
@@ -422,6 +528,37 @@ mod tests {
         ));
         let file = std::fs::File::create(&path).unwrap();
         (path, file)
+    }
+
+    /// `is_synchronous` must answer correctly in **both** directions.
+    ///
+    /// A one-directional test here would be the gate that cannot fail: a body
+    /// hardcoded to `Ok(false)` satisfies any number of assertions that
+    /// `File::open` is not synchronous. The adopted handle is the twin that
+    /// makes the negative attributable, and it is deliberately opened through
+    /// plain `std::fs::File::open` so the two differ in exactly one respect.
+    #[cfg(feature = "handle-mode-query")]
+    #[test]
+    fn is_synchronous_distinguishes_both_handle_modes() {
+        let (path, _std_file) = temp_file("issync");
+
+        let overlapped = File::open(&path).unwrap();
+        assert!(
+            !overlapped.is_synchronous().unwrap(),
+            "File::open produced a synchronous handle, or is_synchronous \
+             misreports overlapped handles"
+        );
+
+        let adopted = File::from_std(std::fs::File::open(&path).unwrap());
+        assert!(
+            adopted.is_synchronous().unwrap(),
+            "a handle adopted from plain std::fs::File::open did not report as \
+             synchronous, so is_synchronous cannot distinguish the two modes \
+             and the assertion above proves nothing"
+        );
+
+        drop((overlapped, adopted));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

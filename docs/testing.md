@@ -391,6 +391,98 @@ The sub-species worth recognising, each from a real instance:
   does not run `#[test]` functions.
 - **A `compile_fail` doctest that no longer names anything.** After a rename it
   fails to compile for the wrong reason and still reports `ok`.
+- **The decision is in a place nothing observes.** The `handle-mode` arm's
+  central premise — that file opens sit *outside* the region it times — lived as
+  an `Opens::Hoisted` literal inside a `harness = false` bench target. Reversing
+  it to `Opens::PerIteration` left every library test, every integration test and
+  the target's own smoke run green, while folding per-open cost into the
+  measured delta at the arm's negative control. The literal was covered by a
+  test asserting that `Opens::Hoisted` *behaves* correctly, which proved the
+  variant worked and said nothing about which variant was selected. Moving the
+  decision into the library was necessary but not sufficient: an
+  `assert_eq!(OPENS, Opens::Hoisted)` would only have restated the constant. The
+  guard that works counts opens and checks the *property* — non-zero, and
+  invariant under a fourfold change in iteration count.
+- **The counter that a parallel harness makes unsound.** The fix for the item
+  above initially used a process-global counter, copying an existing in-tree
+  one. Tests run in parallel threads in a single process, so an unrelated test
+  moved the counter between two readings. The positive assertion became a flake;
+  the *negative* one — "this path performs zero of these" — became an assertion
+  that fails for a reason unrelated to its claim, which is the shape that gets
+  "repaired" into a lower bound and thereby deleted. Scope a counter to whatever
+  actually performs the work: here the operation runs inline on the calling
+  thread, so thread-local was the accurate scope and it permitted an exact zero.
+- **A branch no real input can reach.** A `#[should_panic]` twin was written for
+  a "could not determine the handle's mode" branch using an anonymous pipe as
+  the vehicle. Pipes answer that query. Probing found that *every* obtainable
+  handle answers it — file, pipe and socket alike — and only a value that is not
+  a handle fails, which cannot be constructed without violating
+  `File::from_raw_handle`'s contract in order to test a function whose own
+  contract already requires a live handle. Splitting the judgement out from the
+  query made the branch reachable directly. When a branch has no legitimate
+  input, say so and test it at the level where it does; a twin that reaches it
+  by breaking two contracts is not evidence about the branch.
+- **A mutation that cannot mutate.** `Rng::new` does `seed | 1`, so mutating a
+  seed constant by `SEED ^ 1` is a no-op and the "surviving mutation" says
+  nothing. Check that the mutation changes behaviour before concluding anything
+  from a test that survives it.
+
+### A threshold something meets exactly is not a threshold
+
+Named after two instances in one feature, one of them caught in the author's own
+proposal and one in a document the reviewer had already approved.
+
+A budget option was rejected for passing its own affordability check with **zero
+margin** — a floor of exactly the permitted maximum. The replacement proposal
+was then written with the same defect and caught only on re-derivation. The rule
+adopted was that any such proposal must state its margin as a number; the chosen
+budget carries 104 s of margin on a 216 s requirement, and says so.
+
+The generalisation is the useful part, and it is not about budgets. **A
+constraint that a proposal satisfies with no room is indistinguishable from a
+constraint that was fitted to the proposal.** It provides no evidence, because
+it could not have rejected anything. The same reasoning applies to a tolerance
+chosen to admit a measurement, an outlier bound chosen to exclude a known
+excursion, and a deadline met to the day.
+
+The second instance is the more instructive one, because it did not look like a
+number at all.
+
+### An ordering that makes a blind analysis impossible
+
+The `handle-mode` plan scheduled: (4) measure the within-run noise band,
+(6) freeze the interpretation criterion *before* any numbers exist, (7) run the
+experiment. Phase 6 stated its own justification — *"a threshold chosen after
+seeing the data is not a threshold; this phase exists so that no such choice is
+possible."*
+
+The ordering could not deliver it. **The band is measured by repeating the whole
+benchmark target, and that target contains both arms of the experiment.**
+Measuring the instrument's spread necessarily measured the effect. There was no
+order in which the freeze could have been blind, so the criterion was in fact
+chosen with the estimates already visible.
+
+What makes this worth a section is who missed it. The author wrote the ordering;
+the reviewer read and approved it. In the same week, the author had rejected one
+option for the zero-margin defect above and then nearly shipped a second with
+it, and the reviewer had written that *"a threshold that a proposal meets
+exactly is not a threshold, and that generalises beyond budgets."* Both parties
+were attentive to this exact species, in these words, and both walked past an
+instance of it sitting in the plan's phase ordering.
+
+The lesson is not "check the ordering". It is that **attentiveness to a named
+pattern does not transfer to an instance wearing different clothes** — here a
+scheduling constraint rather than a numeric margin. If a document says a later
+step will be performed without knowledge an earlier step produces, check that
+the earlier step does not produce it.
+
+The recovery is the standard one and is worth knowing: relabel the first set a
+**pilot**, publish it as such, freeze the analysis in full — cells, criterion,
+predicted effect sizes, outlier rule, run count — and collect a **confirmatory**
+set against it. Freezing the threshold alone is not enough; every degree of
+freedom that could otherwise be exercised after the fact has to be spent in
+advance, and the outlier rule is the one that matters most once an excursion has
+already been seen.
 
 ### Confounds that produce a believable number, not an obvious failure
 
@@ -416,6 +508,33 @@ because nothing prompts you to look.
   unbuffered — which is precisely the failure the guard exists to prevent,
   committed to the repository by the guard's own tests.
 
+- **A confound that also disarms the control that would have caught it.** The
+  worst shape found so far. The `handle-mode` arm compares two handle modes and
+  uses depth 1 as a negative control, where the prediction is no effect. Had the
+  arm inherited the main matrix's boundary and opened files *inside* the timed
+  region, per-open cost would have entered the measured delta — and an open is
+  one of the places `FILE_FLAG_OVERLAPPED` itself costs something. So a
+  difference would have appeared at depth 1, where the arm's own guard reads a
+  difference as **run-level drift** rather than as a defect. The confound would
+  not merely have added noise; it would have converted the one arm capable of
+  saying "no effect here" into an arm showing an effect for the wrong reason,
+  with the safeguard silently disarmed and the result publishing cleanly.
+
+  Two consequences worth carrying forward. First, when adding an arm, ask not
+  only "does this confound the measurement" but "does this confound the thing
+  that would have caught it". Second, when a new arm's timing boundary differs
+  from an existing one's, record **why** it differs and not merely that it does —
+  the next person to add an arm faces the same choice with the same two
+  plausible answers.
+
+- **A second measurement inside the timed loop, wearing a doc comment that
+  denied it.** In the same arm, `std::fs::metadata` was being called per timed
+  iteration to size the file. On Windows that opens the path — so the arm whose
+  whole premise was "opens are outside the timed region" was performing one per
+  iteration, under a comment asserting the opposite. Dilution biases such an arm
+  toward a null, which is the direction this project is documented as
+  under-scrutinising.
+
 ### A standing bias hazard
 
 Not an incident. Worth keeping in front of anyone adding to `docs/performance.md`.
@@ -433,6 +552,94 @@ The buffered-poisoning confound is exactly that shape: it would have produced a
 null result, in a project that expects null results, from a measurement error.
 Scrutinise a finding because it is surprising *or* because it is expected, not
 only because it is convenient.
+
+
+### Two rules where there should be one
+
+The handle-mode work found `docs/performance.md` applying **two different
+resolution rules** in the same revision. Backend-against-backend comparisons had
+to clear the −18%/+24% noise band *and* have disjoint intervals. Within-backend
+comparisons — one backend's rolling shape against its own batched shape, or its
+cost at depth 64 against depth 1 — were being settled by disjointness alone.
+
+Neither rule is unreasonable in isolation. The damage is that **the split was
+invisible and it did not fall neutrally.** In one revision:
+
+- this crate's shape comparison was published as **resolved** at −9.6%, on
+  disjoint intervals, under the looser rule;
+- compio's depth comparison was published as **unresolved** at −9.0%, on equally
+  disjoint intervals, under the stricter rule, four sections later.
+
+Same run, same kind of comparison, nearly the same magnitude, opposite verdicts —
+and the loose rule landed on the result that flattered this crate. Nobody chose
+that; it emerged from two locally-sensible rules meeting in one document.
+
+Worse, the loose rule certified a compio shape difference whose intervals were
+disjoint by **0.004 µs**. A rule that turns four-thousandths of a microsecond
+into a finding is not a resolution rule.
+
+The fix was to state one rule, apply it to every ratio the document resolves, and
+re-derive every affected claim under it. Four previously-published "resolved"
+shape results became unresolved. That is the correct outcome: the −18%/+24% band
+is wide enough to swallow every shape effect in that table, and the document now
+says so rather than reporting single-digit-percent differences as findings.
+
+**The generalisation.** When a document applies a criterion, check that it
+applies *the same* criterion everywhere, and check which direction the exceptions
+favour. A criterion with an undocumented exception is a degree of freedom, and
+degrees of freedom drift toward the flattering answer without anyone intending
+it. This is the same species as a threshold met exactly, and the same species as
+an analysis ordering that cannot be blind: the defect is not a wrong number, it
+is a choice left open that should have been closed.
+
+**A corollary, learned the hard way in the same session.** Re-deriving these
+verdicts with a *symmetric* ±18% band instead of the document's asymmetric
+−18%/+24% band "found" two extra resolved cells and nearly produced a correction
+to a set of figures that were right. When checking a published figure, re-read
+the rule from the document rather than reconstructing it from memory — an
+approximate rule generates confident, wrong corrections.
+
+
+### Publishing the friendlier of two measurements of the same thing
+
+The sharpest instance of the bias hazard above, because nothing about it looked
+like a choice.
+
+The handle-mode work collected the per-cell noise spread **twice** — a pilot set
+and a frozen confirmatory set, five runs each. Asked whether the published
+−18%/+24% noise band still applied, `docs/performance.md` answered "yes, and it
+now has independent support", quoting a median of 13.3%, a mean of 17.1% and a
+p90 of 24.5%.
+
+Every one of those figures was the **pilot's**, unlabelled. The confirmatory set —
+the frozen, pre-registered, *primary* one — was in the tree, computed by the same
+script, and gives a p90 of **41.3%** with eleven of thirty-six cells past the
+band's upper edge, against the pilot's four. The sentence "lands close enough to
+−18%/+24% that adjusting the band would be fitting it to noise" is true of one
+set and false of the other, and the document had picked one without saying so.
+
+**Nobody chose the flattering set.** The pilot was analysed first, its numbers
+went into the draft, and when the confirmatory set arrived it was used for the
+result it was collected for — the A/B verdict — and not back-propagated into the
+band section. That is how this failure mode actually happens: not by suppression,
+but by a number being written down once and never revisited when better data
+lands beside it.
+
+**Two rules that would have caught it.**
+
+1. **When you have N measurements of a quantity, publish N or publish a stated
+   summary of N. Never publish one of them unlabelled.** The fix here was a
+   three-row table — pilot, confirmatory, pooled — which took less space than the
+   paragraph defending the single row.
+2. **When a second dataset arrives, grep the document for every claim the first
+   one supported.** The A/B verdict was correctly recomputed on the frozen set.
+   The band claim, four hundred lines away and in a different section, was not.
+   A dataset does not know which sections cite it.
+
+The correction also changed the conclusion, which is the point: the band is kept,
+but it is now published as "a reasonable central estimate, demonstrably optimistic
+in the tail" rather than as independently confirmed. That is a weaker claim and a
+true one.
 
 
 ### Proving a wakeup cannot be lost

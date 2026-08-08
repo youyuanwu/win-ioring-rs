@@ -28,11 +28,30 @@ jobs:
     - name: Run cargo check
       run: cargo check --workspace --all-targets
 
+    # The workspace steps above and below build `win-ioring` with its default
+    # features, because nothing in the workspace enables `handle-mode-query`.
+    # That is deliberate — the default configuration is what downstream
+    # consumers compile, so it is the one the broad steps should cover — but it
+    # leaves the feature-enabled configuration checked only by the two
+    # `--all-features` test steps, which do not run clippy or rustdoc. These
+    # three targeted steps close that gap. Without them, `cfg`-gated code could
+    # acquire a clippy lint or a broken intra-doc link and CI would stay green.
+    #
+    # Both directions of this were verified empirically rather than assumed, by
+    # temporarily placing a `compile_error!` behind the feature's `cfg`:
+    # `-p win-ioring` compiled clean (feature off) and
+    # `-p win-ioring --features handle-mode-query` failed (feature on).
+    - name: Run cargo check (handle-mode-query)
+      run: cargo check -p win-ioring --all-targets --features handle-mode-query
+
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
     
     - name: Run cargo clippy
       run: cargo clippy --workspace --all-targets -- -D warnings
+
+    - name: Run cargo clippy (handle-mode-query)
+      run: cargo clippy -p win-ioring --all-targets --features handle-mode-query -- -D warnings
 
     - name: Run cargo test
       run: cargo test --workspace --all-targets --all-features
@@ -45,5 +64,15 @@ jobs:
 
     - name: Build documentation
       run: cargo doc --workspace --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+    # See the note on the check step: rustdoc runs over the default
+    # configuration above, so the feature-gated `is_synchronous` docs would
+    # otherwise never face `-D warnings`. An intra-doc link that resolves only
+    # when the feature is on is a real hazard here and was reproduced
+    # deliberately during this work.
+    - name: Build documentation (handle-mode-query)
+      run: cargo doc -p win-ioring --no-deps --features handle-mode-query
       env:
         RUSTDOCFLAGS: -D warnings

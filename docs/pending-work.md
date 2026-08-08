@@ -310,7 +310,7 @@ question rather than by changing the answer. At depth 64 it batches 64.0 entries
 per submission — the same 256 entries over 4 submissions as the rolling
 sequential read, digit for digit — while reaching a mean depth of 32.5 against
 the rolling 56.1, so it is demonstrably a different shape that produces identical
-batching. Its timings sit inside the rolling band: 1.15x-1.28x against
+batching. Its timings sit inside the rolling band: 1.14x-1.28x against
 `tokio::fs`, where rolling sequential read at the same depth is 0.92x-1.61x.
 
 **What this leaves open.** The published figures still run the wrong way — this
@@ -318,8 +318,10 @@ crate wins at depth 1 and loses by a widening margin as depth rises — and the
 explanation this document previously offered for that, "paying close to one
 submission per operation", is now known to be false. The crate's central claimed
 advantage was already fully in effect in every figure ever published here, and it
-loses anyway. Nothing currently establishes why. Candidates worth measuring, none
-of them supported by evidence yet: single-threaded completion processing becoming
+loses anyway. Nothing currently establishes why. **One candidate has since been
+measured and eliminated** — handle mode; see the closed item below. Candidates
+worth measuring, none of them supported by evidence yet: single-threaded
+completion processing becoming
 the bottleneck where a 512-thread pool gains real parallelism; per-completion
 dequeue cost; the cache effects raised in the wake-path entries above. Picking
 one of these to write down without measuring it would repeat the mistake this
@@ -421,53 +423,99 @@ closed-form prediction for the declared shape and routes a mismatch through
   a *successful* `submit_pending`. If submission never succeeds before shutdown,
   tokens accumulate until teardown. Harmless — bounded by `MAX_SLOTS`.
 
-## Handle mode: `File::open` and `FILE_FLAG_OVERLAPPED`
+## Handle mode: `File::open` and `FILE_FLAG_OVERLAPPED` — **CLOSED**
 
-Found while building the unbuffered arm (see
-[performance.md](performance.md#unbuffered-reads-that-reach-the-device)). Both
-items are recorded with their cost because the cost is the reason neither was
-done at the time.
+Both items below are **done**. `File::open` and `File::create` now set
+`FILE_FLAG_OVERLAPPED`, the warm-cache matrix has been re-run and republished on
+overlapped handles, and the mechanism argument that stood in for a measurement
+has been replaced by one. See
+[performance.md](performance.md#handle-mode-the-one-candidate-that-was-eliminated).
 
-- **Should `win_ioring::file::File::open` set `FILE_FLAG_OVERLAPPED`?** It does
-  not. It delegates to `std::fs::File::open`, which opens a *synchronous* handle,
-  and on a synchronous handle the kernel serialises operations at the file object
-  regardless of how many the caller has outstanding. For an asynchronous I/O
-  crate that is arguably a defect in the API rather than a benchmark artifact:
-  the interface promises overlapping and the default handle cannot deliver it.
+**What was learned, and it was not what was predicted.**
 
-  The unbuffered arm measured what it costs. Reading through a synchronous
-  handle, requests queue behind one another at the file object no matter what
-  depth the ring is driving, which is why that arm opens its own handles with the
-  flag set via `File::from_std` rather than using `File::open`.
+The change was made expecting it to narrow the crate's unexplained warm-cache
+loss against `tokio::fs` at pool width 1 — recorded, **at the time the prediction
+was registered**, as 1.24x sequential and 1.40x random at depth 64, cause unknown.
+(The re-run published in `performance.md` now reads that sequential cell at 1.30x
+with owned buffers; the prediction was made against the figures then in print, and
+those are the ones quoted here.) The prediction was registered before any number
+existed, quantified as a 0.24 and 0.40 reduction in those ratios, and **it was
+wrong**.
 
-  It was **not changed**, and the reason is cost, not doubt.
-  `File::open` is inside the timed region of every one of the 50 published
-  warm-cache cells in [performance.md](performance.md). Changing it would
-  invalidate that matrix and require re-running and republishing all of it, which
-  is out of scope for the feature that found the problem. The additive route was
-  taken instead: `File::from_std` already accepts a handle opened with whatever
-  flags the caller wants, so the capability exists and only its discoverability
-  is missing. `crates/win-ioring/src/file.rs` documents it, and
-  `crates/win-ioring-bench/tests/open_mode.rs` pins the current default so a
-  change to it fails a test rather than silently altering the published figures.
+A paired A/B, with both handle modes present in the same run as separate backend
+configurations, measured across two independent five-run sets — the second
+collected after the entire analysis was frozen — found **no effect of the
+predicted size in any of the eight cells**, and none of the four depth-1 negative
+controls flagged. The gap to `tokio::fs` reproduces in the arm on overlapped
+handles, at a similar size to the figures that motivated the prediction, though
+the arm's numbers are not directly comparable to matrix cells.
 
-- **Should the published warm-cache ring figures carry a note that they were
-  measured on synchronous handles?** Probably yes, for a reader's sake rather
-  than for accuracy. Under a warm page cache nothing ever waits — a `ReadFile`
-  returns after a memory copy — so serialising at the file object should cost
-  nothing there, and the figures are very unlikely to be wrong.
+Three things that buys, none of them a consolation:
 
-  That is a **mechanism argument, not a measurement**: no warm-cache A/B on the
-  flag has been run, and the unbuffered arm cannot supply one, since it is
-  defined by `FILE_FLAG_NO_BUFFERING` and so has no warm-cache half. Its handle
-  modes are also confounded with backend identity — the ring and compio
-  configurations open with `FILE_FLAG_OVERLAPPED` and the thread-pool ones
-  without — so it is not a clean A/B on the flag even unbuffered. Running one
-  would cost a small dedicated probe; it has not been done.
+- The **mechanism argument this document and `performance.md` had been making is
+  confirmed by measurement.** Warm-cache figures measured on synchronous handles
+  were fair, and are retroactively confirmed as fair rather than merely argued to
+  be.
+- **A candidate cause is eliminated from a list of three**, and it was the most
+  concrete one. The count of *tested* candidates went from zero to one.
+- The second item below — "should the figures carry a note?" — is resolved by
+  being **overtaken**: there is no longer a discrepancy between the sections to
+  explain, because the matrix and the unbuffered arm now both use overlapped
+  handles, and the reason the arm always had to is stated in both places.
 
-  But the unbuffered section states plainly that it opens its handles
-  differently, and a reader comparing the two sections will notice the
-  discrepancy. They should not have to rediscover from first principles why it
-  does not matter. Cost: a paragraph. The reason it is not already written is
-  that it belongs next to a re-run of the matrix if the item above is ever taken,
-  and writing it twice would be worse than writing it once.
+**What it does not buy.** The instrument resolves about 10% on the paired
+difference of ratios at
+the median, so what is excluded is an effect of the *predicted magnitude*, not
+any effect at all. An effect of around 10% or less would not have been reliably
+visible and is not ruled out. The open question at
+[performance.md](performance.md#what-that-leaves-unexplained) remains open, with
+three candidates left.
+
+**What was kept.** The A/B arm is permanent, as `cargo bench -p win-ioring-bench
+--bench handle-mode`. The published matrix carries overlapped handles only. The
+reasoning for that split: under the sizing that made the experiment affordable
+the marginal cost of keeping the arm is near zero, and a permanent arm means the
+next person who wonders about handle mode reads a number instead of re-running
+this.
+
+## `tokio::fs` opens synchronous handles, and the matrix does not correct for it
+
+Found while closing the item above, and **deliberately not fixed in the same
+work**, because changing the baseline in the run that measures handle mode would
+confound the variable the experiment was built around.
+
+Every `tokio::fs` figure in the published matrix — including the pool-1 column
+that is the 1.00x baseline for every `relative` in it — comes from a handle
+opened without `FILE_FLAG_OVERLAPPED`, because `tokio::fs::File` wraps
+`std::fs::File`. The `win-ioring` and `compio` cells are all overlapped. This is
+disclosed in `performance.md` in the section where the comparison appears, and it
+is confirmed at run time rather than argued: the handle-mode arm reads the mode
+back off the kernel for every backend including `tokio::fs`, and fails the run if
+a handle is not what its configuration declared.
+
+**The asymmetry is not symmetric in what it costs, and its likely size differs by
+configuration.** At pool width 1 a synchronous handle should cost `tokio::fs`
+very little — a single blocking thread issues one operation at a time regardless
+of what the file object permits, so there is nothing for the kernel's
+serialisation to take away. At pool 512 across a single handle it should cost a
+great deal, because 512 threads then contend for a lock the overlapped backends
+never take. That second case is not hypothetical: the unbuffered arm already
+measured the shape of it as its 1-handle against 64-handle result.
+
+So the column most exposed is **pool 512**, and the column least exposed is
+**pool 1** — which is the baseline, and therefore the one the published relatives
+depend on. That is the fortunate direction, but it is a reasoned expectation and
+not a measurement.
+
+**Cost to resolve.** A variant `tokio::fs` backend opening through
+`OpenOptions::custom_flags(FILE_FLAG_OVERLAPPED)`, run as an A/B against the
+existing one. `tokio::fs` would not *use* the overlapped-ness — it issues
+blocking positional reads on pool threads — so this measures the cost of the file
+object's serialisation alone, which is exactly the quantity wanted. The obstacle
+is that `std`'s `seek_read`/`seek_write` abort the process if the kernel returns
+`STATUS_PENDING`, which is safe under a warm cache and not safe unbuffered, so
+the variant would have to be restricted to the warm-cache arm and documented as
+such. Budget: the arm already runs six configurations against 320 s; adding two
+`tokio::fs` variants at the same scenarios and depths is roughly another 110 s,
+which does not fit and would need the same sizing exercise the handle-mode work
+did. Estimated a day, most of it measurement and write-up rather than code.

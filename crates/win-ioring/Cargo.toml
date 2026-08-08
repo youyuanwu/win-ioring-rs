@@ -11,6 +11,54 @@ futures.workspace = true
 bitflags.workspace = true
 windows.workspace = true
 
+# Off by default, and deliberately so.
+#
+# `File::is_synchronous` needs `NtQueryInformationFile`/`FileModeInformation`,
+# which is the only way to read back whether a handle really is overlapped:
+# `GetFileInformationByHandleEx` cannot report it. That was established when the
+# unbuffered arm needed the same answer, and the narrower API was looked for and
+# not found.
+#
+# Reaching it costs three additional `windows` namespaces. Enabling them
+# unconditionally would put them in every downstream consumer's compile, which
+# `crates/win-ioring-bench/Cargo.toml` records a decision against — the same
+# reasoning as the `Win32_System_Pipes` dev-dependency. A default-off feature
+# preserves that decision rather than reversing it: a consumer who does not ask
+# for the query compiles exactly what it compiled before this feature existed.
+#
+# The `win-ioring` unit test `is_synchronous_distinguishes_both_handle_modes`
+# exercises the on configuration, and CI's two `--all-features` test steps run
+# it, so the feature is not left to bit-rot.
+#
+# `win-ioring-bench` deliberately does NOT enable it, though it was the obvious
+# candidate. The bench crate already declares these three namespaces directly
+# and has its own `file_mode` read-back, so enabling the feature there would buy
+# no coverage — and it would cost real coverage. Nothing else in the workspace
+# enables the feature, which is what makes `cargo check/clippy/doc --workspace`
+# build the *default* configuration. That is the configuration downstream
+# consumers compile, so it is the one the broad CI steps should cover. Had the
+# bench enabled it, feature unification would have flipped every workspace step
+# onto the on configuration and left the default unbuilt by anything.
+#
+# CI therefore covers the on configuration with three targeted `-p win-ioring
+# --features handle-mode-query` steps instead. Both directions of that split
+# were verified empirically with a `compile_error!` behind the feature's `cfg`,
+# not assumed. See `.github/workflows/CI.yml`.
+#
+# Rejected alternative: tracking handle *provenance* instead of querying —
+# `File::open`/`create` know they set the flag, adopted handles are unknown —
+# which would need no new platform surface at all. It fails on the only case
+# that matters: it returns "unknown" for exactly the adopted handles the query
+# exists to interrogate, and answers confidently only where the constructor
+# already guarantees the answer. An API that resolves only the question the
+# caller did not need to ask is worse than no API.
+[features]
+handle-mode-query = [
+    "windows/Wdk_Foundation",
+    "windows/Wdk_Storage_FileSystem",
+    "windows/Win32_System_IO",
+]
+
 [dev-dependencies]
 tokio.workspace = true
 # Named pipes are the only source of a genuinely long-running I/O operation
