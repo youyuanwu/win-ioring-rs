@@ -151,6 +151,32 @@ pub enum Error {
     /// still in flight.
     OperationOutstanding,
 
+    /// The sequential API was used on a handle that has no file offset.
+    ///
+    /// [`File::read`](crate::file::File::read) and
+    /// [`File::write`](crate::file::File::write) supply the file offset
+    /// themselves, from a cursor they advance. That contract is meaningless on a
+    /// pipe or a character device: the platform ignores the offset and consumes
+    /// from the head of the stream, so every operation after the first *would*
+    /// return success paired with bytes that did not come from where the cursor
+    /// says. This error is what prevents that, and it is the reason the crate
+    /// refuses rather than describing the hazard in a doc comment.
+    ///
+    /// The positional API is unaffected:
+    /// [`Handle::read`](crate::runtime::Handle::read) and
+    /// [`Handle::write`](crate::runtime::Handle::write) take an explicit offset
+    /// and continue to work on these handles. The platform ignores that offset
+    /// too, but the caller supplied it knowingly, and the crate's own pipe types
+    /// depend on that path to move bytes.
+    ///
+    /// The refusal is *fail-open*: a handle whose type the platform reports as
+    /// unknown is permitted, on the grounds that a kind nobody anticipated should
+    /// be left exactly where it is today rather than newly broken.
+    NoFileOffset {
+        /// The platform's handle-type code, as reported by `GetFileType`.
+        file_type: u32,
+    },
+
     /// The ring has been closed and can no longer be used.
     ///
     /// The platform does not reliably reject a closed ring handle — passing one
@@ -367,6 +393,12 @@ impl fmt::Display for Error {
                     "a sequential operation is already outstanding on this file"
                 )
             }
+            Error::NoFileOffset { file_type } => write!(
+                f,
+                "the sequential API needs a file offset, and this handle has \
+                 none (GetFileType reported {file_type}); use the positional \
+                 read/write instead"
+            ),
             Error::RingClosed => write!(f, "the ring has been closed"),
             Error::MissingField { field } => {
                 write!(f, "required field `{field}` was not set")
@@ -580,6 +612,7 @@ mod tests {
             Error::AbandonedAtShutdown,
             Error::ShutdownStalled { outstanding: 3 },
             Error::OperationOutstanding,
+            Error::NoFileOffset { file_type: 3 },
             Error::RingClosed,
             Error::MissingField { field: "handle" },
             Error::Os(windows::core::Error::from(
@@ -619,6 +652,7 @@ mod tests {
             | Error::AbandonedAtShutdown
             | Error::ShutdownStalled { .. }
             | Error::OperationOutstanding
+            | Error::NoFileOffset { .. }
             | Error::RingClosed
             | Error::MissingField { .. }
             | Error::Os(_)
