@@ -166,6 +166,43 @@ pub enum Error {
 
     /// An error reported by the operating system.
     Os(windows::core::Error),
+
+    /// No pipe instance was available to connect to.
+    ///
+    /// Every instance the server created is already serving a client. The
+    /// condition is transient by nature: a client that retries after a peer
+    /// disconnects may succeed against the same server.
+    PipeBusy,
+
+    /// The peer closed its end of the pipe.
+    ///
+    /// Distinct from a zero-byte read. A pipe reports the peer's departure as
+    /// an error rather than as end-of-file, so treating this as "no more data"
+    /// would silently conflate a completed exchange with a truncated one.
+    PipeBroken,
+
+    /// The pipe is connected in the caller's own view but has no peer.
+    ///
+    /// Reported when a server writes to an instance the client has disconnected
+    /// from, or reads from one that was never connected. Separate from
+    /// [`Error::PipeBroken`] because the platform separates them, and folding
+    /// them together would lose the distinction between "the peer left" and
+    /// "there has not been one".
+    PipeNoPeer,
+
+    /// The pipe instance is still waiting for a client.
+    ///
+    /// A read or a write issued against a listening instance fails with this
+    /// rather than blocking. It means an accept has not completed, not that the
+    /// pipe is broken, so the remedy is to accept first rather than to reopen.
+    PipeListening,
+
+    /// An accept is already outstanding on this server.
+    ///
+    /// One instance can host one pending accept. This is refused rather than
+    /// queued because the alternative — two futures both waiting on the same
+    /// `OVERLAPPED` — has no sound completion story.
+    AcceptOutstanding,
 }
 
 impl Error {
@@ -186,10 +223,34 @@ impl Error {
     /// fabricating zeroed context would be worse than reporting the platform
     /// error verbatim. Those variants are produced at the call sites that know
     /// the context, such as [`IoRingBuilder::build`](crate::io_ring::IoRingBuilder::build).
+    ///
+    /// The pipe codes qualify on the same test: each names one condition, and
+    /// none of them needs context the code does not carry. They are matched by
+    /// **exact** code rather than by facility or range. This funnel sees every
+    /// ring completion in the crate (`runtime::Driver`), so a range match would
+    /// reclassify errors from files and sockets that happen to fall inside it —
+    /// a much larger blast radius than the pipe surface that motivated them.
+    ///
+    /// `ERROR_PIPE_CONNECTED` is deliberately absent. It reports that a client
+    /// arrived before the accept was issued, which is a **success** for the
+    /// accept and is converted at that call site; classifying it here would
+    /// turn the most easily lost connection in the API into an error at the one
+    /// place with no context to recognise it.
     pub(crate) fn from_hresult(hr: windows::core::HRESULT) -> Self {
-        use windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL;
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            IORING_E_SUBMISSION_QUEUE_FULL,
+        };
         if hr == IORING_E_SUBMISSION_QUEUE_FULL {
             Error::QueueFull
+        } else if hr == ERROR_PIPE_BUSY.to_hresult() {
+            Error::PipeBusy
+        } else if hr == ERROR_BROKEN_PIPE.to_hresult() {
+            Error::PipeBroken
+        } else if hr == ERROR_NO_DATA.to_hresult() {
+            Error::PipeNoPeer
+        } else if hr == ERROR_PIPE_LISTENING.to_hresult() {
+            Error::PipeListening
         } else {
             Error::Os(windows::core::Error::from(hr))
         }
@@ -311,6 +372,18 @@ impl fmt::Display for Error {
                 write!(f, "required field `{field}` was not set")
             }
             Error::Os(e) => write!(f, "{e}"),
+            Error::PipeBusy => write!(
+                f,
+                "every pipe instance is already serving a client"
+            ),
+            Error::PipeBroken => write!(f, "the peer closed its end of the pipe"),
+            Error::PipeNoPeer => write!(f, "the pipe has no peer connected"),
+            Error::PipeListening => {
+                write!(f, "the pipe instance is still waiting for a client")
+            }
+            Error::AcceptOutstanding => {
+                write!(f, "an accept is already outstanding on this server")
+            }
         }
     }
 }
@@ -340,6 +413,101 @@ mod tests {
         let err = Error::from(os.clone());
         assert!(matches!(err, Error::Os(_)));
         assert_eq!(err.as_os_error().map(|e| e.code()), Some(os.code()));
+    }
+
+    /// Each pipe condition FR-010 names must be reachable as its own variant.
+    ///
+    /// Callers distinguish these by pattern. Two conditions sharing a variant
+    /// would be indistinguishable without parsing a rendered string, and the
+    /// pairs below are the ones most likely to be conflated by a well-meaning
+    /// simplification: busy is transient and worth retrying while listening is
+    /// not, and broken means the peer left while no-peer means there has not
+    /// been one.
+    #[test]
+    fn each_pipe_condition_maps_to_its_own_variant() {
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+        };
+
+        let cases = [
+            (ERROR_PIPE_BUSY, Error::PipeBusy),
+            (ERROR_BROKEN_PIPE, Error::PipeBroken),
+            (ERROR_NO_DATA, Error::PipeNoPeer),
+            (ERROR_PIPE_LISTENING, Error::PipeListening),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for (code, expected) in cases {
+            let got = Error::from_hresult(code.to_hresult());
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&expected),
+                "{code:?} classified as {got:?}, expected {expected:?}"
+            );
+            let rendered = got.to_string();
+            assert!(
+                !seen.contains(&rendered),
+                "two pipe conditions render identically: {rendered:?}"
+            );
+            seen.push(rendered);
+        }
+    }
+
+    /// The classifier matches exact codes, and must leave everything else to
+    /// `Error::Os`.
+    ///
+    /// `from_hresult` is the single funnel every ring completion passes
+    /// through, so widening it from exact codes to a facility or a range would
+    /// silently reclassify file and socket errors that have nothing to do with
+    /// pipes. The two codes below are not hypothetical: they are what the
+    /// existing `Error::Os(_)` assertions in `runtime_tests.rs` actually
+    /// observe — end-of-file on a read past the end, and the refusal of a
+    /// write-through on cached I/O — measured rather than assumed, because
+    /// "the new variants cannot collide with anything" is exactly the
+    /// comfortable claim that deserves evidence.
+    #[test]
+    fn codes_outside_the_pipe_set_are_still_reported_verbatim() {
+        use windows::Win32::Foundation::{ERROR_HANDLE_EOF, WIN32_ERROR};
+
+        // 509 is what the cached-I/O write-through refusal reports.
+        for code in [ERROR_HANDLE_EOF, WIN32_ERROR(509)] {
+            let got = Error::from_hresult(code.to_hresult());
+            assert!(
+                matches!(got, Error::Os(_)),
+                "{code:?} must stay an Os error, got {got:?}"
+            );
+        }
+
+        // Adjacent to the pipe codes on both sides, to catch a range match that
+        // happened to bracket them.
+        for code in [230_u32, 233, 534, 537] {
+            let got = Error::from_hresult(WIN32_ERROR(code).to_hresult());
+            assert!(
+                matches!(got, Error::Os(_)),
+                "code {code} is not a pipe condition this crate maps, got {got:?}"
+            );
+        }
+    }
+
+    /// `ERROR_PIPE_CONNECTED` is a success for an accept, so the classifier
+    /// must not claim it.
+    ///
+    /// If this funnel turned it into a typed error, the accept path could not
+    /// tell it apart from a real failure without unwrapping the variant again —
+    /// and a client that connected between create and accept would be dropped.
+    /// That is the single easiest connection in this API to lose, and the
+    /// easiest bug to write a test that never exercises.
+    #[test]
+    fn a_client_that_connected_early_is_not_classified_as_a_failure() {
+        use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+
+        let got = Error::from_hresult(ERROR_PIPE_CONNECTED.to_hresult());
+        assert!(
+            matches!(got, Error::Os(_)),
+            "ERROR_PIPE_CONNECTED must not be reclassified here; the accept \
+             call site converts it to success, and a typed error would hide it. \
+             Got {got:?}"
+        );
     }
 
     #[test]
@@ -417,6 +585,11 @@ mod tests {
             Error::Os(windows::core::Error::from(
                 windows::Win32::Foundation::E_FAIL,
             )),
+            Error::PipeBusy,
+            Error::PipeBroken,
+            Error::PipeNoPeer,
+            Error::PipeListening,
+            Error::AcceptOutstanding,
         ];
         for v in variants {
             assert!(!v.to_string().is_empty(), "empty Display for {v:?}");
@@ -448,7 +621,12 @@ mod tests {
             | Error::OperationOutstanding
             | Error::RingClosed
             | Error::MissingField { .. }
-            | Error::Os(_) => {}
+            | Error::Os(_)
+            | Error::PipeBusy
+            | Error::PipeBroken
+            | Error::PipeNoPeer
+            | Error::PipeListening
+            | Error::AcceptOutstanding => {}
         }
     }
 }
