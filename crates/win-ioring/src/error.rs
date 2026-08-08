@@ -42,10 +42,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// voice. A view cannot diverge from the table it reads, so the hazard is
 /// removed structurally rather than discouraged in a comment.
 ///
-/// Each view is generated with `#[deny(clippy::wildcard_enum_match_arm)]`, so
-/// adding a variant here fails to compile every view that has not been updated.
-/// That is the mechanism which makes "each type lists only what it can produce"
-/// checkable rather than aspirational.
+/// Each view is hand-written and carries `#[deny(clippy::wildcard_enum_match_arm,
+/// clippy::match_wildcard_for_single_variants)]`, so adding a variant here fails
+/// to compile every view that has not been updated. Both lints are required and
+/// the views are not generated; `view_convention` records why, and neither fact
+/// is incidental.
 ///
 /// # Scope
 ///
@@ -72,10 +73,16 @@ pub(crate) enum Condition {
     PipeListening,
     /// A platform error this crate does not name.
     ///
-    /// The `HRESULT` is carried verbatim so that a view which *does* name the
-    /// condition can recover it by classifying the code again. That round trip
-    /// is what lets a pipe's error survive a trip through a type that has no
-    /// name for it.
+    /// The `HRESULT` is carried so that a view handed only a `Condition` can
+    /// still construct a platform error without a second condition-to-code
+    /// table of its own.
+    ///
+    /// It is **not** what lets a pipe's error survive a trip through a type that
+    /// has no name for it. `classify` is deterministic, so `Other(hr)`
+    /// reclassifies to `Other(hr)` forever and no named condition can be
+    /// recovered from this payload. That recovery runs through the *error
+    /// type's* `Other`, which carries the `HRESULT` the classifier was given —
+    /// see `view_convention`.
     Other(windows::core::HRESULT),
 }
 
