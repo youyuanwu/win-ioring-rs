@@ -1,9 +1,15 @@
 //! Error types for the crate.
 //!
-//! Every fallible operation in this crate reports failures through [`Error`], a
-//! closed enum whose variants callers can match on directly rather than
-//! inspecting `HRESULT` values. The underlying platform error is preserved in
-//! [`Error::Os`] whenever one is available.
+//! Almost every fallible operation in this crate reports failures through
+//! [`Error`], a closed enum whose variants callers can match on directly rather
+//! than inspecting `HRESULT` values. The underlying platform error is preserved
+//! in [`Error::Os`] whenever one is available.
+//!
+//! The exception is the operation builders in [`crate::io_ring::ops`], whose
+//! `build` methods return [`MissingField`](crate::io_ring::ops::MissingField)
+//! because their failure set is closed without consulting the platform. That is
+//! the only surface in the crate narrow enough to carve;
+//! `docs/errors-and-the-funnel.md` records why the rest do not partition by API.
 //!
 //! # Platform availability
 //!

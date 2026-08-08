@@ -35,8 +35,9 @@ use windows::Win32::{
 /// Converts into [`crate::Error::MissingField`] with [`From`], so a caller
 /// working in [`crate::Result`] can still use `?`. The same condition exists in
 /// both types deliberately: driver-level registration
-/// (`Driver::register_buffers`, `register_files`) reports a missing field too,
-/// and it is not built by these builders.
+/// ([`Handle::register_buffers`](crate::runtime::Handle::register_buffers),
+/// [`Handle::register_files`](crate::runtime::Handle::register_files)) reports a
+/// missing field too, and it is not built by these builders.
 ///
 /// # Why this is `#[non_exhaustive]`
 ///
@@ -60,8 +61,8 @@ impl std::fmt::Display for MissingField {
 
 impl std::error::Error for MissingField {}
 
-// A public error type callers may box, send between threads, or wrap in
-// `std::io::Error::other` — all of which need `Send + Sync`. Pinned rather than
+// A public error type, which callers may send between threads or wrap in
+// `std::io::Error::other` — both of which need `Send + Sync`. Pinned rather than
 // left to inference so that adding a non-`Send` field is a compile error here
 // rather than a breaking change discovered downstream.
 const _: () = {

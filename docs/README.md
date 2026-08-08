@@ -9,6 +9,8 @@ Reference material for people working *on* this crate. For usage, start with the
 | [buffer-ownership.md](buffer-ownership.md) | Why the buffer traits take ownership, what tokio-uring and compio do, and whether a borrowed slice is possible at all |
 | [platform-notes.md](platform-notes.md) | How Windows IoRing actually behaves, established by probing rather than by reading |
 | [testing.md](testing.md) | The verification approach, and which properties are proved by test versus by construction |
+| [pipes-and-the-ring.md](pipes-and-the-ring.md) | Why named pipes fit the ring model imperfectly, and why the accept path is the exception it is |
+| [errors-and-the-funnel.md](errors-and-the-funnel.md) | Why the crate has one error type for almost everything, why the errors do not partition by API, and what a split would cost |
 | [performance.md](performance.md) | How this crate compares to `tokio::fs` and to `compio` on identical work, measured by Criterion with confidence intervals and baseline comparison, and what the measurement does and does not tell you |
 | [pending-work.md](pending-work.md) | Known limitations, deferred work, and open observations |
 
