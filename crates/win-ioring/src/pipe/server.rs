@@ -389,23 +389,74 @@ enum AcceptState {
 /// *next* instance as soon as an accept resolves and before handing the current
 /// one on, so the name is never left without something listening:
 ///
-/// ```no_run
-/// # async fn demo() -> win_ioring::Result<()> {
-/// use win_ioring::pipe::ServerOptions;
-///
-/// let mut server = ServerOptions::new().create("demo")?;
-/// loop {
-///     server.accept().await?;
-///     // Create the replacement *before* giving this one away. Between the
-///     // accept resolving and the next instance existing, a client that
-///     // arrives finds every instance taken and is refused as busy.
-///     let next = ServerOptions::new().create("demo")?;
-///     let connected = std::mem::replace(&mut server, next);
-///     serve(connected);
-/// }
-/// # }
-/// # fn serve(_: win_ioring::pipe::Server) {}
 /// ```
+/// # fn main() -> win_ioring::Result<()> {
+/// use win_ioring::pipe::{ClientOptions, ServerOptions};
+///
+/// let name = format!("win-ioring-doc-serve-{}", std::process::id());
+/// let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+///
+/// // Two clients arrive from another thread, so the server below is genuinely
+/// // waiting for them rather than finding them already connected. A client
+/// // that connects first would resolve `accept` synchronously and this example
+/// // would demonstrate nothing about waiting.
+/// let clients = std::thread::spawn({
+///     let name = name.clone();
+///     move || {
+///         // `Client` is `!Send`, like everything else in this crate, so these
+///         // stay on the thread that opened them and are released here.
+///         let mut held = Vec::new();
+///         for _ in 0..2 {
+///             // Narrowing the gap is not closing it: between an accept
+///             // resolving and the replacement instance existing, a client
+///             // finds every instance taken. Real clients retry.
+///             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+///             loop {
+///                 if let Ok(client) = ClientOptions::new().open(&name) {
+///                     // Held, not dropped. A client that closes before the
+///                     // server accepts leaves nothing to connect to, and the
+///                     // accept reports `Error::PipeNoPeer` rather than a
+///                     // connection.
+///                     held.push(client);
+///                     break;
+///                 }
+///                 assert!(std::time::Instant::now() < deadline, "no instance ever listened");
+///                 std::thread::yield_now();
+///             }
+///         }
+///         let _ = done_rx.recv();
+///         drop(held);
+///     }
+/// });
+///
+/// let mut server = ServerOptions::new().max_instances(4).create(&name)?;
+/// let served = tokio::runtime::Builder::new_current_thread()
+///     .build()
+///     .unwrap()
+///     .block_on(async {
+///         let mut served = 0;
+///         for _ in 0..2 {
+///             server.accept().await?;
+///             // Create the replacement *before* giving this one away.
+///             let next = ServerOptions::new().max_instances(4).create(&name)?;
+///             let connected = std::mem::replace(&mut server, next);
+///             served += 1;
+///             drop(connected);
+///         }
+///         Ok::<_, win_ioring::Error>(served)
+///     })?;
+///
+/// // Release the clients now the server has finished with them.
+/// drop(done_tx);
+/// clients.join().unwrap();
+/// assert_eq!(served, 2);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Note that the accept above resolves with no ring and no driver anywhere in
+/// the example. That is not an omission: the connect is not a ring operation,
+/// so nothing has to be pumping the ring for it to complete.
 pub struct Server {
     file: File,
     accept: AcceptState,
@@ -1300,7 +1351,7 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipe::{Client, unique_name as unique};
+    use crate::pipe::{Client, ClientOptions, unique_name as unique};
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -1347,6 +1398,147 @@ mod tests {
             .custom_flags(FILE_FLAG_OVERLAPPED.0)
             .open(crate::pipe::qualify(name))
             .expect("the peer should have connected")
+    }
+
+    /// A future the test opens by hand, standing in for a handler that awaits.
+    ///
+    /// SC-010 needs the server *parked inside the handoff* for an interval the
+    /// test controls. A sleep would make the interval a timing assumption, and
+    /// this criterion has twice shipped in a form whose hazard a race could not
+    /// reach. A gate the test opens makes the duration a fact about the test.
+    ///
+    /// `poll_count` is what lets the test tell "parked in the handler" from
+    /// "still waiting on the accept" without inspecting the server's internals.
+    #[derive(Clone)]
+    struct Gate(std::rc::Rc<(std::cell::Cell<bool>, std::cell::Cell<u32>)>);
+
+    impl Gate {
+        fn shut() -> Self {
+            Gate(std::rc::Rc::new((
+                std::cell::Cell::new(false),
+                std::cell::Cell::new(0),
+            )))
+        }
+        fn open(&self) {
+            self.0.0.set(true);
+        }
+        fn polls(&self) -> u32 {
+            self.0.1.get()
+        }
+    }
+
+    impl Future for Gate {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.0.1.set(self.0.1.get() + 1);
+            if self.0.0.get() {
+                Poll::Ready(())
+            } else {
+                // The test re-polls in a loop, so waking immediately is what
+                // keeps `poll_once`'s no-op waker from stalling the task.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// SC-010: the documented idiom leaves no unserved window across a handoff.
+    ///
+    /// **Executor structure**, which SC-010 requires stating rather than
+    /// assuming: a single-threaded loop that this test steps by hand with
+    /// [`poll_once`]. There is no scheduler involved, so "the window's duration
+    /// is the test's to set" is a fact about this code and not a claim about
+    /// anyone's runtime. Clients connect from the test body, which is the same
+    /// thread — `ClientOptions::open` is synchronous, so no helper thread is
+    /// needed and none of the ordering below is raced.
+    ///
+    /// **Correspondence with the published example.** The `served` loop below is
+    /// `Server`'s rustdoc example with exactly one insertion: the awaited gate
+    /// standing in for the handler's suspension point. Read the two side by
+    /// side. A change to the documented idiom that is not mirrored here breaks
+    /// this criterion; it is not a documentation-only edit.
+    ///
+    /// What is actually gated is the assertion that **client 2 connects while
+    /// the server is parked**. That is what "no unserved window" means, and it
+    /// is a thing "both clients were served" cannot see. With the replacement
+    /// instance created after the handler returns instead of before, the name
+    /// has no listening instance for the whole parked interval and that
+    /// connect fails.
+    #[test]
+    fn two_clients_are_served_through_the_documented_idiom_with_no_unserved_window() {
+        let name = unique("sc010-handoff");
+        let gate = Gate::shut();
+        let served = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+
+        // `nMaxInstances > 1`: at the parked moment two instances exist, and a
+        // limit of one would refuse the second create rather than the client,
+        // moving the failure somewhere this test is not looking.
+        let mut server = ServerOptions::new()
+            .max_instances(4)
+            .create(&name)
+            .expect("first instance");
+
+        let mut task = Box::pin({
+            let (gate, served, name) = (gate.clone(), served.clone(), name.clone());
+            async move {
+                for _ in 0..2 {
+                    server.accept().await.expect("accept");
+                    let next = ServerOptions::new()
+                        .max_instances(4)
+                        .create(&name)
+                        .expect("replacement instance");
+                    let connected = std::mem::replace(&mut server, next);
+                    gate.clone().await;
+                    drop(connected);
+                    served.set(served.get() + 1);
+                }
+            }
+        });
+
+        // Park the accept before client 1 exists, so this test exercises the
+        // waiting path rather than the synchronous one. A client that connects
+        // first would make the accept resolve without ever waiting.
+        //
+        // The pending result alone does not establish that: the task parks at
+        // the gate under either ordering, so `is_pending` is true either way.
+        // What discriminates is that the task has not *reached* the gate, which
+        // it would have done in the same poll had the accept resolved
+        // synchronously. Phase 7's mutation harness caught the weaker form
+        // surviving.
+        assert!(
+            poll_once(&mut task).is_pending(),
+            "the first accept should be outstanding before any client arrives"
+        );
+        assert_eq!(
+            gate.polls(),
+            0,
+            "the accept must still be outstanding: reaching the handoff on the \
+             first poll means it resolved synchronously and no waiting was tested"
+        );
+
+        let _c1 = ClientOptions::new().open(&name).expect("client 1 connects");
+
+        wait_until(
+            || {
+                let _ = poll_once(&mut task);
+                gate.polls() >= 1
+            },
+            "the server to park inside the handoff",
+        );
+
+        // The gated assertion. The server is parked mid-handoff and has not
+        // been polled past the gate; a second instance must already be
+        // listening.
+        let _c2 = ClientOptions::new()
+            .open(&name)
+            .expect("client 2 must connect while the handoff is parked");
+
+        gate.open();
+        wait_until(
+            || poll_once(&mut task).is_ready(),
+            "the server loop to serve both clients",
+        );
+        assert_eq!(served.get(), 2, "both clients served");
     }
 
     /// SC-002: a client that arrived first is accepted **without waiting**.

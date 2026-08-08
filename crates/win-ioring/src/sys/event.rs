@@ -111,10 +111,19 @@ impl AsyncEvent {
 ///
 /// `Drop` waits out any running callback with a blocking `UnregisterWaitEx`.
 /// That is sound only because it can never run *on* a callback thread: an
-/// `ArmedEvent` is reachable only from the `Driver` that owns it, and `Driver`
-/// is `!Send` (asserted by a `compile_fail` doc-test), so a waker woken on a
-/// pool thread cannot legally poll it there. The `PhantomData` below makes that
-/// argument compiler-checked rather than a review obligation.
+/// `ArmedEvent` is reachable only from the `Driver` that owns it or from a
+/// [`crate::pipe::Server`]'s accept, neither of which is reachable from a pool
+/// thread — `Driver` is `!Send` (asserted by a `compile_fail` doc-test), as is
+/// `Server`, so a waker woken on a pool thread cannot legally poll either there.
+/// The `PhantomData` below makes that argument compiler-checked rather than a
+/// review obligation.
+///
+/// The accept path is the second owner, added after this comment was written,
+/// and it is worth naming because it does *not* use the fused teardown below:
+/// it releases the registration first, on its own, and only then collects. The
+/// reason is that a blocking collect and a callback that may still fire are two
+/// consumers of one auto-reset signal, which was measured deadlocking. See
+/// [`release_registration`].
 ///
 /// Making this type public would give that guarantee away, and the teardown
 /// would then need the two-path form the per-wait future used to have —

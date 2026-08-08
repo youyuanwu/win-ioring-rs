@@ -1193,7 +1193,15 @@ pub struct Driver {
     /// Signalled by the kernel when completions are available, and waited on
     /// through one thread-pool registration armed for the driver's whole life.
     ///
-    /// The driver's only waited object, and the crate's only thread boundary.
+    /// The driver's only waited object, and — until named pipes — the crate's
+    /// only thread boundary. A [`crate::pipe::Server`]'s accept is the second:
+    /// `ConnectNamedPipe` is not an operation the ring can build, so it runs as
+    /// an overlapped Win32 call whose completion reaches the crate through the
+    /// same `RegisterWaitForSingleObject` machinery, on the same thread pool.
+    /// It is a boundary this driver never sees — the accept occupies no slab
+    /// entry and the drain does not wait for it — but it is a boundary, and the
+    /// claim that there is only one has been wrong since pipes shipped.
+    ///
     /// What used to be a second event — carrying "the application queued work
     /// for you" — is now a flag and a waker inside `DriverInner`, because every
     /// type that could raise it holds `Rc`s and so lives on the driver's own
