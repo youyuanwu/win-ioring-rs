@@ -201,7 +201,11 @@ thread_local! {
 /// and the handle closed, while after a failed one neither may ever happen. A
 /// boolean would have to pick one of those to conflate with `Live`, and both
 /// conflations are unsound in one direction.
-#[cfg(test)]
+///
+/// `pub(crate)` in every configuration, not only under `cfg(test)`: the pipe
+/// server's teardown releases the registration before its blocking collect and
+/// must branch on the result in shipped code, because a failed release means the
+/// pool may still be a consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Registration {
     /// Registered with the thread pool; the release step has not run.
@@ -210,14 +214,6 @@ pub(crate) enum Registration {
     Released,
     /// `UnregisterWaitEx` failed. A callback may still be running, so the count
     /// must never be reclaimed and the handle must never be closed.
-    Failed,
-}
-
-#[cfg(not(test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Registration {
-    Live,
-    Released,
     Failed,
 }
 
@@ -393,6 +389,19 @@ impl ArmedEvent {
         FAIL_NEXT_ARM.with(|f| f.set(true));
     }
 
+    /// Test seam: makes the next `UnregisterWaitEx` on this thread fail.
+    ///
+    /// Exposed beyond this module because the pipe server's teardown is the
+    /// second `UnregisterWaitEx` call site in the crate, and its
+    /// failed-release branch is the one FR-014's rationale singles out: a
+    /// failed release means the pool may still be a consumer, which is the
+    /// entire premise of releasing before the collect. Without the seam that
+    /// branch cannot be reached by any test, in either caller.
+    #[cfg(test)]
+    pub(crate) fn fail_next_unregister() {
+        FAIL_NEXT_UNREGISTER.with(|f| f.set(true));
+    }
+
     /// Releases the thread-pool registration, blocking until no callback for it
     /// is running or can start. Idempotent.
     ///
@@ -410,7 +419,7 @@ impl ArmedEvent {
     /// registration **terminates the process** with `STATUS_INVALID_PARAMETER`
     /// rather than returning an error, so a second call is not something a
     /// caller could detect and recover from.
-    fn release_registration(&mut self) -> Registration {
+    pub(crate) fn release_registration(&mut self) -> Registration {
         if self.registration != Registration::Live {
             #[cfg(test)]
             record(Step::ReleaseSkipped(self.registration));

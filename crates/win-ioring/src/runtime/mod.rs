@@ -1511,7 +1511,11 @@ impl Drop for Driver {
 /// Used to fence teardown sections that call back into caller code — waking
 /// futures and delivering reports — because unwinding out of a half-finished
 /// teardown would drop the driver's fields while the ring is still open.
-struct AbortOnUnwind;
+///
+/// `pub(crate)` so the pipe server's teardown can take the same fence. Its
+/// half-finished state is the same shape: an `OVERLAPPED` the kernel is writing
+/// into, released only once a cancel-and-collect has established otherwise.
+pub(crate) struct AbortOnUnwind;
 impl Drop for AbortOnUnwind {
     fn drop(&mut self) {
         abort_with("a panic escaped teardown while the I/O ring was still open");
@@ -3705,6 +3709,63 @@ mod tests {
             self.client.write_all(bytes).expect("writing to the pipe");
             self.client.flush().ok();
         }
+    }
+
+    /// A pipe accept occupies no slab entry, while a ring operation does.
+    ///
+    /// SC-008. The ring operation is not decoration: without one this asserts
+    /// zero against zero, which any test doing no I/O would satisfy — the
+    /// "structurally guaranteed assertion" shape `docs/testing.md` names. With
+    /// one outstanding the count is 1 whether or not the accept consumed an
+    /// entry, so the assertion can actually fail.
+    ///
+    /// This lives here rather than beside the pipe server because the slab is
+    /// the driver's own state and reading it is what the criterion asks for.
+    #[test]
+    fn a_pipe_accept_occupies_no_slab_entry() {
+        use crate::pipe::Server;
+
+        let driver = test_driver();
+        let handle = driver.handle();
+        let pipe = Pipe::new();
+
+        // One real ring operation, parked in the kernel on an empty pipe.
+        let mut read = Box::pin(handle.read(&pipe.server, vec![0_u8; 16], 16, 0));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        {
+            let mut inner = driver.inner.borrow_mut();
+            inner.submit_pending();
+        }
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "the ring operation must actually be in the kernel, or the count \
+             below is being compared against nothing"
+        );
+
+        // And one pipe accept, which goes nowhere near the ring.
+        let name = format!(
+            r"\\.\pipe\win-ioring-slab-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let mut server = Server::create(&name).expect("a pipe instance");
+        let mut accept = Box::pin(server.accept());
+        assert!(accept.as_mut().poll(&mut cx).is_pending());
+
+        assert_eq!(
+            driver.inner.borrow().slab.awaiting_kernel(),
+            1,
+            "still one. The accept is an overlapped Win32 call with its own \
+             OVERLAPPED and its own event -- it has no completion to reap and no \
+             slot to occupy. Two would mean it had taken one"
+        );
+
+        drop(accept);
+        drop(server);
+        drop(read);
     }
 
     /// Establishes the premise every long-running shutdown test rests on: a read

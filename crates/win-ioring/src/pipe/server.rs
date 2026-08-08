@@ -27,7 +27,8 @@
 
 use crate::error::Error;
 use crate::file::File;
-use crate::sys::ArmedEvent;
+use crate::runtime::AbortOnUnwind;
+use crate::sys::{ArmedEvent, Registration};
 use windows::Win32::Foundation::{
     ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_CONNECTED, HANDLE,
 };
@@ -52,31 +53,69 @@ const DEFAULT_BUFFER: u32 = 4096;
 /// about the operation rather than a record of what was submitted.
 const STATUS_PENDING_INTERNAL: usize = 0x0000_0103;
 
-// Test seam: forces the next cancel-and-collect to fail.
+// Test seam: forces the next cancel to report a chosen outcome.
 //
-// `CancelIoEx` has no reliably reproducible failure mode, so the server's
-// leak-rather-than-free teardown branch cannot be exercised without injecting
-// one. The same reason `ArmedEvent::fail_next_arm` exists, and a thread-local
-// for the same reason: tests running in parallel must not consume each other's
-// injection.
+// `CancelIoEx` has no reliably reproducible failure mode, so neither the
+// never-submitted branch nor the cancel-failed branch of the server's teardown
+// can be exercised without injecting one. The same reason
+// `ArmedEvent::fail_next_arm` exists, and a thread-local for the same reason:
+// tests running in parallel must not consume each other's injection.
+//
+// It carries an outcome rather than a bool because `ERROR_NOT_FOUND` and a
+// genuine failure lead to *different* leak reasons, and a seam that could only
+// say "not the happy path" would leave one of them unreachable.
 #[cfg(test)]
 thread_local! {
-    static FAIL_NEXT_CANCEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCED_CANCEL: std::cell::Cell<Option<CancelOutcome>> =
+        const { std::cell::Cell::new(None) };
 }
 
-// Test seam: forces the next collect to observe an unfinished operation.
+// Test seam: forces the next teardown collect to observe an unfinished
+// operation.
+//
+// `GetOverlappedResult(bWait = TRUE)` returning with the status word still
+// pending is not something a test can arrange, and the branch that answers it is
+// the one where being wrong frees memory the kernel is writing into. A branch
+// whose only cost is invisible is exactly the shape that ships unexecuted.
+#[cfg(test)]
+thread_local! {
+    static FORCE_TEARDOWN_UNFINISHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Test seam: forces collects to observe an unfinished operation.
 //
 // The `ERROR_IO_INCOMPLETE` path -- event signalled, kernel status not yet
 // terminal -- is narrow enough that no test constructs it naturally, which was
 // measured: a mutation making that path report a connection survived the whole
 // pipe suite. It is also the one path where the wrong answer is silent, so it
 // gets a seam rather than a comment.
+//
+// A *latch*, not a one-shot, and that distinction was measured too. One
+// `accept()` can collect twice -- `begin_accept` collects a slot the kernel has
+// already satisfied, and `Accept::poll` collects again after the event reports
+// ready -- so a one-shot seam is consumed by the first and the second returns
+// the real, complete status. The accept then resolves and the test fails,
+// intermittently, at a rate set by whether the thread-pool callback has run yet:
+// 10 failures in 40 runs. A latch models the state the path actually describes,
+// which is that the kernel has not finished *yet*, and every collect while that
+// holds must say so.
 #[cfg(test)]
 thread_local! {
     static FORCE_COLLECT_INCOMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-// Test seam: records which teardown branch `Drop for Server` last took.
+// Test seam: panics partway through the teardown, to gate the unwind fence.
+//
+// The fence aborts the process, so the only way to observe it is from another
+// process. A `#[test]` cannot assert "and this one aborted" about itself. The
+// seam therefore exists so that a child process can be made to unwind out of a
+// half-finished teardown, and the parent can assert the child died the way the
+// fence says it should rather than the way an unfenced drop would.
+#[cfg(test)]
+thread_local! {
+    static PANIC_IN_TEARDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 //
 // The same shape as `sys::event`'s `TEARDOWN_TRACE`, and for the same reason.
 // The teardown *rule* is a pure function and can be tested directly, but nothing
@@ -269,15 +308,18 @@ struct AcceptSlot {
     /// Signalled by the kernel when the connect completes.
     ///
     /// A plain `ArmedEvent`, deliberately not `ManuallyDrop`: releasing the
-    /// thread-pool registration is idempotent, so a teardown path *can* release
-    /// it early and then let the value drop normally. Wrapping it would suppress
-    /// the drop glue for its shared reference count too, leaking that.
+    /// thread-pool registration is idempotent, so the teardown path releases it
+    /// early — before the blocking collect — and then lets the value drop
+    /// normally, which reclaims the shared count and closes the handle in that
+    /// order. Wrapping it would suppress the drop glue for its shared reference
+    /// count too, leaking that.
     ///
-    /// The early release is not reachable from here yet —
-    /// `ArmedEvent::release_registration` is private to `sys::event`. Widening it
-    /// and calling it before the blocking collect is outstanding work, and until
-    /// it lands this drop runs that collect with the pool wait still armed on the
-    /// same auto-reset event.
+    /// The early release is the load-bearing part and it is not an
+    /// optimisation. The event is auto-reset, so one signal releases exactly one
+    /// waiter; a blocking collect entered with the pool wait still armed is a
+    /// second consumer of that single signal, and the configuration measured
+    /// hanging. The handle is left *open* across the collect — closing it is
+    /// what must wait for the collect, not the other way round.
     event: ArmedEvent,
     /// The event's raw handle value, recorded so a test can ask the operating
     /// system whether it is still open once its owner is gone.
@@ -658,7 +700,7 @@ impl Server {
         // the real one. Diverting to a separate early return would test the
         // injection rather than the code.
         #[cfg(test)]
-        let result = if FORCE_COLLECT_INCOMPLETE.with(|f| f.replace(false)) {
+        let result = if FORCE_COLLECT_INCOMPLETE.with(|f| f.get()) {
             Err(windows::core::Error::from_hresult(
                 ERROR_IO_INCOMPLETE.to_hresult(),
             ))
@@ -795,25 +837,77 @@ impl Server {
         self.connect_submissions
     }
 
-    /// Test seam: makes the next cancel on this thread report the operation as
-    /// not found, without issuing it.
+    /// Test seam: makes the next cancel on this thread report a chosen outcome,
+    /// without issuing it.
     ///
     /// `CancelIoEx` has no reproducible failure mode, so the teardown's
-    /// leak-rather-than-free branch — the most safety-critical path here — is
-    /// otherwise unreachable and would ship unexecuted.
+    /// leak-rather-than-free branches — the most safety-critical paths here —
+    /// are otherwise unreachable and would ship unexecuted. It takes the outcome
+    /// rather than only forcing failure because `ERROR_NOT_FOUND` and a genuine
+    /// failure lead to different leak reasons, and a seam that conflated them
+    /// would leave one reason gated by nothing.
     #[cfg(test)]
-    pub(crate) fn fail_next_cancel() {
-        FAIL_NEXT_CANCEL.with(|f| f.set(true));
+    pub(crate) fn force_next_cancel(outcome: CancelOutcome) {
+        FORCED_CANCEL.with(|f| f.set(Some(outcome)));
     }
 
-    /// Test seam: makes the next collect on this thread observe an operation the
-    /// kernel has not finished writing a status for.
+    /// Test seam: makes the next *teardown* collect on this thread observe an
+    /// operation the kernel has not finished with.
+    ///
+    /// Distinct from `force_next_collect_incomplete` below, which acts on the
+    /// polling path. This one gates the branch where the blocking collect
+    /// returns and the status word is still pending — the only place where
+    /// trusting the platform's answer would free memory the kernel is writing
+    /// into.
+    #[cfg(test)]
+    pub(crate) fn force_next_teardown_unfinished() {
+        FORCE_TEARDOWN_UNFINISHED.with(|f| f.set(true));
+    }
+
+    /// Test seam: makes collects on this thread observe an operation the kernel
+    /// has not finished writing a status for, until cleared.
     ///
     /// Gates the one path in this type where a wrong answer is silent rather
-    /// than loud — an accept resolving `Ok` having delivered no client.
+    /// than loud — an accept resolving `Ok` having delivered no client. A latch
+    /// rather than a one-shot because one `accept()` can collect twice, so a
+    /// one-shot leaves the second collect seeing the real status; that produced
+    /// a test that failed 10 runs in 40.
     #[cfg(test)]
-    pub(crate) fn force_next_collect_incomplete() {
-        FORCE_COLLECT_INCOMPLETE.with(|f| f.set(true));
+    pub(crate) fn force_collect_incomplete(on: bool) {
+        FORCE_COLLECT_INCOMPLETE.with(|f| f.set(on));
+    }
+
+    /// Which teardown branch this thread's last `Drop for Server` took.    ///
+    /// The teardown *rules* are pure functions and testable directly, but
+    /// nothing would establish that `Drop` consults them: replacing a call with
+    /// a constant leaves every other gate green and restores the deadlock the
+    /// rules exist to prevent. Measured, not assumed — that mutation survived a
+    /// nine-row harness.
+    #[cfg(test)]
+    pub(crate) fn last_teardown() -> Option<Teardown> {
+        LAST_TEARDOWN.with(|t| t.get())
+    }
+
+    /// Test seam: makes the next teardown on this thread panic while the    /// `OVERLAPPED` is still live.
+    ///
+    /// Only useful in a child process — the fence turns the panic into an
+    /// abort, so the calling process does not survive to assert anything. That
+    /// is the point: an unfenced teardown would unwind instead, and the two are
+    /// distinguishable only from outside.
+    #[cfg(test)]
+    pub(crate) fn panic_in_next_teardown() {
+        PANIC_IN_TEARDOWN.with(|f| f.set(true));
+    }
+
+    /// The server's `File`, cloned, regardless of accept state.
+    ///
+    /// Distinct from the public [`Server::file`], which refuses in every state
+    /// but `Connected` — a refusal that is the point of that method and would
+    /// make the leak assertions unwritable. This exists so a test can hold a
+    /// reference across a `mem::forget` and read the count afterwards.
+    #[cfg(test)]
+    pub(crate) fn file_for_test(&self) -> File {
+        self.file.clone()
     }
 }
 
@@ -921,16 +1015,43 @@ impl std::future::Future for Accept<'_> {
     }
 }
 
+/// What `CancelIoEx` reported about the operation.
+///
+/// Three outcomes rather than a boolean, because the middle one licenses a
+/// *different* action from either neighbour. `NotFound` is not a failure — it is
+/// the one signal that distinguishes an operation the kernel is finishing from
+/// one it never had — while a genuine failure means the cancel's effect is
+/// unknown, which FR-014 answers by leaking. Collapsing `NotFound` and `Failed`
+/// into "did not cancel" would leak where it should collect; collapsing
+/// `Failed` and `Located` into "cancel returned" would collect on a status word
+/// nothing may ever write.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum CancelOutcome {
+    /// The kernel found the operation and has asked it to stop. A terminal
+    /// status is coming.
+    Located,
+    /// `ERROR_NOT_FOUND` — the kernel has no such operation for this handle.
+    NotFound,
+    /// Any other error. What the cancel did, if anything, is unknown.
+    Failed,
+}
+
 /// What [`Drop for Server`](Server) must do with an accept slot it is tearing
 /// down.
 ///
 /// Extracted from the drop body because the wrong choice here is a deadlock or
 /// a use-after-free, and neither is observable from a test that drops a server
-/// through the public API: the state that gets it wrong is currently
-/// unreachable. Deciding it in a pure function makes the rule itself testable,
-/// which is the only way this can be pinned at all.
+/// through the public API: most of the states that get it wrong are reachable
+/// only through an injection seam. Deciding it in pure functions makes the rules
+/// themselves testable, which is the only way this can be pinned at all.
+///
+/// The leak variants are distinct rather than one `Leak`, because they are
+/// FR-014's three separate triggers plus the never-submitted case, and a test
+/// that asserts only "it leaked" cannot tell which one fired. That distinction
+/// is the whole content of the requirement: an implementation that leaked for
+/// the wrong reason would satisfy a single-variant criterion.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Teardown {
+pub(crate) enum Teardown {
     /// The kernel has, or may have, the operation. Collect it, then free.
     ///
     /// The collect on this branch blocks, and **is not bounded** — see the
@@ -946,123 +1067,233 @@ enum Teardown {
     /// exists precisely because that reasoning was once wrong, and the crate's
     /// standing rule is that a leak costs one allocation while the alternative
     /// corrupts unrelated memory later.
-    LeakWithoutWaiting,
+    LeakNeverSubmitted,
+    /// `CancelIoEx` failed for a reason other than `ERROR_NOT_FOUND`, so what it
+    /// did is unknown and the operation may still be live.
+    LeakCancelFailed,
+    /// The blocking `UnregisterWaitEx` failed, so the thread pool may still be a
+    /// consumer of the event the collect is about to wait on.
+    ///
+    /// This is the trigger FR-014's rationale singles out. Proceeding to the
+    /// collect here would be worse than not releasing the registration at all:
+    /// releasing it early exists precisely to remove the competing consumer, and
+    /// a failed release means it was not removed.
+    LeakUnregisterFailed,
+    /// The blocking collect returned and the kernel's status word is *still*
+    /// `STATUS_PENDING`, so the operation is not finished after all.
+    ///
+    /// Freeing here would hand back memory the kernel is still writing into,
+    /// which is the exact hazard the collect exists to rule out. That the collect
+    /// returned without doing so means its answer cannot be trusted.
+    LeakCollectUnfinished,
 }
 
-/// Chooses the teardown action from what the kernel just told us.
+impl Teardown {
+    /// Whether this outcome frees rather than leaks.
+    fn frees(self) -> bool {
+        matches!(self, Teardown::CollectThenFree)
+    }
+}
+
+/// Chooses the teardown action from what the cancel just reported.
 ///
-/// `cancel_found` is whether `CancelIoEx` located the operation; `completed` is
-/// whether the kernel has written a terminal status into the `OVERLAPPED`.
-///
-/// The only case that must not collect is "the kernel could not find it **and**
-/// it was never completed" — that pair means no I/O for this structure exists in
-/// the kernel, so no terminal status will ever be written and the collect would
+/// The first of three decision points, and the only one with a non-obvious rule.
+/// A `Failed` cancel leaks outright: FR-014's first trigger. Otherwise the only
+/// case that must not collect is "the kernel could not find it **and** it was
+/// never completed" — that pair means no I/O for this structure exists in the
+/// kernel, so no terminal status will ever be written and the collect would
 /// block forever. If either holds the other way a terminal status is coming: a
 /// located operation gets one after the cancel, and a completed one already has
 /// one. Neither says *when*; see the `Drop` body.
-fn teardown_action(cancel_found: bool, completed: bool) -> Teardown {
-    if !cancel_found && !completed {
-        Teardown::LeakWithoutWaiting
+fn teardown_action(cancel: CancelOutcome, completed: bool) -> Teardown {
+    match (cancel, completed) {
+        (CancelOutcome::Failed, _) => Teardown::LeakCancelFailed,
+        (CancelOutcome::NotFound, false) => Teardown::LeakNeverSubmitted,
+        _ => Teardown::CollectThenFree,
+    }
+}
+
+/// Whether the teardown may proceed to the blocking collect after releasing the
+/// thread-pool registration.
+///
+/// The second decision point. `Live` is unreachable here — `release_registration`
+/// never returns it — but is handled rather than asserted away, because the one
+/// thing that must not happen on this path is proceeding into a blocking wait on
+/// an event a thread-pool callback may also be waiting on. Treating an
+/// unexpected answer as permission is the failure this whole ordering exists to
+/// prevent.
+fn release_permits_collect(release: Registration) -> Option<Teardown> {
+    match release {
+        Registration::Released => None,
+        Registration::Failed | Registration::Live => Some(Teardown::LeakUnregisterFailed),
+    }
+}
+
+/// Whether the blocking collect actually finished the operation.
+///
+/// The third decision point. `GetOverlappedResult(bWait = TRUE)` is *supposed* to
+/// return only once a terminal status has been written; this reads the status
+/// word afterwards rather than trusting that, because the cost of being wrong is
+/// freeing memory the kernel is writing into and the cost of the check is one
+/// volatile load on a path that has just blocked.
+fn collect_finished_it(still_pending: bool) -> Teardown {
+    if still_pending {
+        Teardown::LeakCollectUnfinished
     } else {
         Teardown::CollectThenFree
     }
 }
 
+/// Asks the kernel to cancel an outstanding operation, and classifies the answer.
+///
+/// Separate from `Drop` so that the test injection can replace *the call*, not
+/// falsify its result. Falsifying the result would not model a failing cancel:
+/// the real call still succeeds, the kernel still terminates the operation, and
+/// the slot then reads as completed — which sends the teardown down the
+/// collecting branch anyway, leaving the leak branches unreachable. Measured, by
+/// writing it the other way first and watching the leak branch stay unreachable.
+fn issue_cancel(handle: HANDLE, overlapped: &OVERLAPPED) -> CancelOutcome {
+    #[cfg(test)]
+    if let Some(injected) = FORCED_CANCEL.with(|f| f.replace(None)) {
+        return injected;
+    }
+
+    // SAFETY: the caller holds the handle open for the duration of this call,
+    // and the pointer is to an allocation the caller still owns.
+    match unsafe { CancelIoEx(handle, Some(overlapped)) } {
+        Ok(()) => CancelOutcome::Located,
+        // `ERROR_NOT_FOUND` is not a failure to report, but it is not nothing
+        // either: it is the one signal that distinguishes an operation the
+        // kernel is finishing from one it never had.
+        Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult() => CancelOutcome::NotFound,
+        Err(_) => CancelOutcome::Failed,
+    }
+}
+
 impl Drop for Server {
-    /// Cancels and collects any outstanding connect before the memory the kernel
-    /// is writing into goes away.
+    /// Cancels, unregisters, and collects any outstanding connect before the
+    /// memory the kernel is writing into goes away.
     ///
-    /// The order is forced and none of it is optional. `CancelIoEx` asks the
-    /// kernel to stop, but asking is not the same as it having stopped, so the
-    /// result is collected afterwards — that collect is what establishes the
-    /// kernel is finished with the `OVERLAPPED`. Only then may the allocation be
-    /// freed.
+    /// The order is forced and none of it is optional.
     ///
-    /// The exception is the case where the kernel never had the operation at
-    /// all, which must not wait — waiting there is on a status word nothing will
-    /// ever write. That distinction is drawn by the private `teardown_action`
-    /// rule rather than inline here, so that it can be tested directly; the
-    /// state that needs it is not reachable through this type's public API.
+    /// 1. `CancelIoEx` asks the kernel to stop. Asking is not the same as it
+    ///    having stopped.
+    /// 2. The thread-pool registration is released, blocking until no callback
+    ///    for it is running or can start. This is before the collect, not after,
+    ///    because the event is auto-reset and so releases exactly one waiter: a
+    ///    collect entered with the wait still armed is a *second consumer* of a
+    ///    single signal, and measurement found that configuration hanging 8
+    ///    times in 200 while the same test with no armed wait hung 0 in 200. The
+    ///    event handle is deliberately left open across the collect — closing it
+    ///    is what must wait for the collect, not the reverse.
+    /// 3. The result is collected. That collect is what establishes the kernel
+    ///    is finished with the `OVERLAPPED`. Only then may any of it be freed.
+    ///
+    /// Every step can decline to continue, and declining always means leaking
+    /// rather than freeing: a cancel that failed, a release that failed, a
+    /// collect that returned with the status word still pending, or a kernel
+    /// that never had the operation at all. Those four are kept as separate
+    /// outcomes so a test can assert *which* one fired. The crate's standing
+    /// rule applies to all of them — a leak costs one allocation, and the
+    /// alternative corrupts unrelated memory later.
+    ///
+    /// The whole body is fenced against unwinding, as `Drop for Driver` is
+    /// (`runtime/mod.rs:1469`): a panic escaping halfway would drop the
+    /// `OVERLAPPED` with the kernel still holding its address.
     fn drop(&mut self) {
-        let AcceptState::Accepting(slot) = &self.accept else {
+        let fence = AbortOnUnwind;
+
+        let AcceptState::Accepting(slot) = &mut self.accept else {
+            std::mem::forget(fence);
             return;
         };
 
+        // The seam is read here, inside the fence and with the `OVERLAPPED`
+        // still live -- which is the state the fence exists for. Reading it
+        // before the fence, or after the collect, would gate a panic the fence
+        // was never meant to catch.
+        #[cfg(test)]
+        if PANIC_IN_TEARDOWN.with(|f| f.replace(false)) {
+            panic!("injected: a panic escaping a half-finished pipe teardown");
+        }
+
         // A completed slot needs no cancel; treat it as located, since the
         // reason not to cancel is that the kernel already finished with it.
-        let mut cancel_found = true;
-        if !slot.completed() {
-            // The injection is consumed *instead of* the call, not applied to
-            // its result. Falsifying the result would not model a failing
-            // cancel: the real call still succeeds, the kernel still terminates
-            // the operation, and the slot then reads as completed -- which sends
-            // the teardown down the collecting branch anyway. Measured, by
-            // writing it the other way first and watching the leak branch stay
-            // unreachable.
-            #[cfg(test)]
-            let injected = FAIL_NEXT_CANCEL.with(|f| f.replace(false));
-            #[cfg(not(test))]
-            let injected = false;
+        let cancel = if slot.completed() {
+            CancelOutcome::Located
+        } else {
+            issue_cancel(self.file.as_raw_handle(), &slot.overlapped)
+        };
 
-            if injected {
-                cancel_found = false;
-            } else {
-                // SAFETY: the handle is open until this server's `File` reference
-                // is released, which happens after this body runs. The pointer is
-                // to an allocation this server still owns.
-                let cancelled =
-                    unsafe { CancelIoEx(self.file.as_raw_handle(), Some(&*slot.overlapped)) };
-                // `ERROR_NOT_FOUND` is not a failure to report, but it is not
-                // nothing either: it is the one signal that distinguishes an
-                // operation the kernel is finishing from one it never had.
-                cancel_found =
-                    !matches!(&cancelled, Err(e) if e.code() == ERROR_NOT_FOUND.to_hresult());
+        let mut action = teardown_action(cancel, slot.completed());
+
+        if action.frees() {
+            // Step two. Releasing before the collect is what stops the collect
+            // being a second consumer of a single auto-reset signal; a failed
+            // release means it was not removed, so the collect must not run.
+            if let Some(leak) = release_permits_collect(slot.event.release_registration()) {
+                action = leak;
             }
         }
 
-        let action = teardown_action(cancel_found, slot.completed());
+        if action.frees() {
+            let mut transferred = 0_u32;
+            // SAFETY: the same structure, still owned here and not yet freed.
+            // `bWait` is true here and only here, and only on this branch: the
+            // operation has either been located by the cancel or has already
+            // completed, so a terminal status will be written rather than never
+            // arriving. The registration has been released, so nothing else is
+            // waiting on this event.
+            //
+            // This wait is **not bounded**, and neither is this drop. The
+            // measured costs are microseconds, but `CancelIoEx` is a request and
+            // not a revocation — the same property ring cancellation has — and
+            // `docs/buffer-ownership.md:90-91` gives a second reason independent
+            // of promptness: an operation against a dead endpoint may not
+            // complete for a long time. What is promised here is the crate's
+            // standing one, that shutdown never abandons memory the kernel may
+            // still write to. How long that takes is the platform's to decide.
+            let _ = unsafe {
+                GetOverlappedResult(
+                    self.file.as_raw_handle(),
+                    &*slot.overlapped,
+                    &mut transferred,
+                    true,
+                )
+            };
+
+            #[cfg(test)]
+            let still_pending =
+                FORCE_TEARDOWN_UNFINISHED.with(|f| f.replace(false)) || !slot.completed();
+            #[cfg(not(test))]
+            let still_pending = !slot.completed();
+
+            action = collect_finished_it(still_pending);
+        }
+
         #[cfg(test)]
         LAST_TEARDOWN.with(|t| t.set(Some(action)));
 
-        match action {
-            Teardown::CollectThenFree => {
-                let mut transferred = 0_u32;
-                // SAFETY: the same structure, still owned here and not yet
-                // freed. `bWait` is true here and only here, and only on this
-                // branch: the operation has either been located by the cancel or
-                // has already completed, so a terminal status will be written
-                // rather than never arriving.
-                //
-                // This wait is **not bounded**, and neither is this drop. The
-                // measured costs are microseconds, but `CancelIoEx` is a request
-                // and not a revocation — the same property ring cancellation
-                // has — and `docs/buffer-ownership.md:90-91` gives a second
-                // reason independent of promptness: an operation against a dead
-                // endpoint may not complete for a long time. What is promised
-                // here is the crate's standing one, that shutdown never abandons
-                // memory the kernel may still write to. How long that takes is
-                // the platform's to decide.
-                let _ = unsafe {
-                    GetOverlappedResult(
-                        self.file.as_raw_handle(),
-                        &*slot.overlapped,
-                        &mut transferred,
-                        true,
-                    )
-                };
-                // Only now is the allocation the kernel was writing into safe to
-                // free. `Idle` rather than `Fresh`: a connect was submitted
-                // against this instance, so the platform will not admit a client
-                // without another one. Nothing can observe this on the drop
-                // path, but a state that is wrong only where nobody looks is
-                // still a trap for the next change.
-                self.accept = AcceptState::Idle;
-            }
-            Teardown::LeakWithoutWaiting => {
-                let stale = std::mem::replace(&mut self.accept, AcceptState::Idle);
-                std::mem::forget(stale);
-            }
+        if action.frees() {
+            // Only now is the allocation the kernel was writing into safe to
+            // free, and the event handle safe to close — which is what dropping
+            // the slot does, the registration already being released. `Idle`
+            // rather than `Fresh`: a connect was submitted against this
+            // instance, so the platform will not admit a client without another
+            // one. Nothing can observe this on the drop path, but a state that is
+            // wrong only where nobody looks is still a trap for the next change.
+            self.accept = AcceptState::Idle;
+        } else {
+            let stale = std::mem::replace(&mut self.accept, AcceptState::Idle);
+            std::mem::forget(stale);
+            // The `File` reference goes with it. FR-014 leaks the server's own
+            // strong reference too, which pins the `Rc` count above zero
+            // permanently, so no surviving clone can close the handle either —
+            // and the kernel may still be writing through it.
+            std::mem::forget(self.file.clone());
         }
+
+        std::mem::forget(fence);
     }
 }
 
@@ -1530,41 +1761,98 @@ mod tests {
         );
     }
 
-    /// The teardown decision, over all four inputs.
+    /// The three teardown decisions, each over all of its inputs.
     ///
-    /// Exhaustive rather than sampled, because the space is four cases and one
-    /// of them is a deadlock. Written after a mutation exposed that `Drop` waited
-    /// unconditionally: an accept slot the kernel never took has a status word
-    /// nothing will ever write, and `GetOverlappedResult` with `bWait` set waits
-    /// on it forever. That state is unreachable through the public API today,
-    /// which is exactly why nothing could catch it — the mutation reached it in
-    /// one edit, and the next real change might too.
+    /// Exhaustive rather than sampled: the spaces are six, three and two cases,
+    /// and the wrong answer in each is either a deadlock or a use-after-free.
+    /// Written after a mutation exposed that `Drop` waited unconditionally: an
+    /// accept slot the kernel never took has a status word nothing will ever
+    /// write, and `GetOverlappedResult` with `bWait` set waits on it forever.
+    /// That state is unreachable through the public API today, which is exactly
+    /// why nothing could catch it — the mutation reached it in one edit, and the
+    /// next real change might too.
     #[test]
-    fn the_teardown_decision_waits_unless_the_kernel_never_had_the_operation() {
+    fn the_teardown_decisions_are_exhaustive_and_each_case_is_distinct() {
+        // -- after the cancel, six cases --
         assert_eq!(
-            teardown_action(false, false),
-            Teardown::LeakWithoutWaiting,
+            teardown_action(CancelOutcome::NotFound, false),
+            Teardown::LeakNeverSubmitted,
             "not found and never completed is the only pair that means no I/O \
              exists for this structure -- waiting on it never returns"
         );
-
-        // The other three all terminate, and each for its own reason. Asserted
-        // separately so that a rule collapsing to a constant fails here.
         assert_eq!(
-            teardown_action(true, false),
+            teardown_action(CancelOutcome::Failed, false),
+            Teardown::LeakCancelFailed,
+            "a failed cancel is not a not-found cancel: what it did is unknown"
+        );
+        assert_eq!(
+            teardown_action(CancelOutcome::Failed, true),
+            Teardown::LeakCancelFailed,
+            "and it stays unknown even for a slot that reads as completed, \
+             because the failure is about the cancel, not the status word"
+        );
+        assert_eq!(
+            teardown_action(CancelOutcome::Located, false),
             Teardown::CollectThenFree,
             "a located operation reaches a terminal state after the cancel"
         );
         assert_eq!(
-            teardown_action(false, true),
+            teardown_action(CancelOutcome::NotFound, true),
             Teardown::CollectThenFree,
             "not found because it had already finished; the wait returns at once"
         );
         assert_eq!(
-            teardown_action(true, true),
+            teardown_action(CancelOutcome::Located, true),
             Teardown::CollectThenFree,
             "found and finished"
         );
+
+        // -- after the release, three cases --
+        assert_eq!(
+            release_permits_collect(Registration::Released),
+            None,
+            "a released registration is the only state that permits the collect"
+        );
+        assert_eq!(
+            release_permits_collect(Registration::Failed),
+            Some(Teardown::LeakUnregisterFailed),
+            "a failed release leaves the pool a possible consumer of the same \
+             single auto-reset signal the collect is about to wait for"
+        );
+        assert_eq!(
+            release_permits_collect(Registration::Live),
+            Some(Teardown::LeakUnregisterFailed),
+            "and an answer that cannot occur must not be read as permission -- \
+             treating the unexpected as the happy path is the failure this whole \
+             ordering exists to prevent"
+        );
+
+        // -- after the collect, two cases --
+        assert_eq!(
+            collect_finished_it(true),
+            Teardown::LeakCollectUnfinished,
+            "a collect that returns with the status still pending has not \
+             established that the kernel is finished"
+        );
+        assert_eq!(
+            collect_finished_it(false),
+            Teardown::CollectThenFree,
+            "and one that returns with a terminal status has"
+        );
+
+        // Only one variant frees. Asserted, because `frees()` is what every
+        // branch in `Drop` consults, and a version returning true for a leak
+        // variant would free memory the kernel may still be writing into while
+        // every assertion above still passed.
+        assert!(Teardown::CollectThenFree.frees());
+        for leak in [
+            Teardown::LeakNeverSubmitted,
+            Teardown::LeakCancelFailed,
+            Teardown::LeakUnregisterFailed,
+            Teardown::LeakCollectUnfinished,
+        ] {
+            assert!(!leak.frees(), "{leak:?} must not free");
+        }
     }
 
     /// Dropping a server with an accept outstanding completes, and the process
@@ -1632,7 +1920,7 @@ mod tests {
             "the kernel to record the connect as complete",
         );
 
-        Server::force_next_collect_incomplete();
+        Server::force_collect_incomplete(true);
         {
             let mut fut = Box::pin(server.accept());
             let polled = poll_once(&mut fut);
@@ -1647,7 +1935,12 @@ mod tests {
             "and the server must not claim a peer it has not collected"
         );
 
-        // The injection is one-shot, so this collect sees the real status.
+        // Cleared, so the next collect sees the real status. The latch is
+        // released explicitly rather than consumed, because one `accept()` can
+        // collect twice and a self-clearing seam leaves the second collect
+        // seeing the truth -- which is how the assertion above became a 25%
+        // flake before this was measured.
+        Server::force_collect_incomplete(false);
         {
             let mut fut = Box::pin(server.accept());
             assert!(
@@ -1664,37 +1957,36 @@ mod tests {
         );
     }
 
-    /// The teardown rule is not merely correct, it is the one `Drop` uses.
+    /// The teardown rules are not merely correct, they are the ones `Drop` uses.
     ///
-    /// Written because the exhaustive test above it gates a **pure function**,
-    /// and nothing gated the call. Replacing the call with a constant left every
-    /// other gate in this file green while restoring the deadlock the rule
-    /// exists to prevent, which is the "covered token, unplanned distinction"
+    /// Written because the exhaustive tests above gate **pure functions**, and
+    /// nothing gated the calls. Replacing a call with a constant left every
+    /// other gate in this file green while restoring the deadlock the rules
+    /// exist to prevent, which is the "covered token, unplanned distinction"
     /// failure exactly.
     ///
-    /// The injection is what makes the leak branch reachable: `CancelIoEx` has
-    /// no reproducible failure mode, and the state that would take this branch
-    /// naturally cannot be built through the public API.
+    /// Each of FR-014's leak triggers gets its own arm, and each asserts *which*
+    /// leak fired rather than merely that one did. A test that only asked
+    /// "did it leak" would pass against an implementation that leaked for the
+    /// wrong reason — and the reasons are the requirement.
     #[test]
-    fn the_leak_branch_is_reachable_and_drop_takes_it() {
-        let name = unique("leak-branch");
+    fn every_leak_trigger_is_reachable_and_drop_distinguishes_them() {
+        // Trigger: the kernel never had the operation.
+        let name = unique("leak-never");
         let mut server = Server::create(&name).unwrap();
-
         {
             let mut fut = Box::pin(server.accept());
             assert!(poll_once(&mut fut).is_pending());
         }
         let watch = server.accept_event_watch().expect("an event exists");
-
-        Server::fail_next_cancel();
+        Server::force_next_cancel(CancelOutcome::NotFound);
         drop(server);
-
         assert_eq!(
-            LAST_TEARDOWN.with(|t| t.get()),
-            Some(Teardown::LeakWithoutWaiting),
-            "a cancel that failed to locate the operation must take the leak \
-             branch -- if this reports the collecting branch the injection is \
-             inert and every test built on it proves nothing"
+            Server::last_teardown(),
+            Some(Teardown::LeakNeverSubmitted),
+            "a cancel that could not find an uncompleted operation must take the \
+             never-submitted branch -- if this reports the collecting branch the \
+             injection is inert and every test built on it proves nothing"
         );
         assert!(
             watch.upgrade().is_some(),
@@ -1702,20 +1994,89 @@ mod tests {
              not reclaimed, because the kernel may still hold the OVERLAPPED"
         );
 
-        // The injection is one-shot, so it cannot leak into another test on this
-        // thread. Asserted rather than assumed: a seam that stays armed would
-        // silently divert the next drop.
-        let name2 = unique("leak-branch-after");
-        let mut after = Server::create(&name2).unwrap();
+        // Trigger: the cancel failed outright. A *different* branch from the
+        // one above, and the distinction is the point -- ERROR_NOT_FOUND is
+        // information, any other error is the absence of it.
+        let name = unique("leak-cancel");
+        let mut server = Server::create(&name).unwrap();
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let watch = server.accept_event_watch().expect("an event exists");
+        Server::force_next_cancel(CancelOutcome::Failed);
+        drop(server);
+        assert_eq!(
+            Server::last_teardown(),
+            Some(Teardown::LeakCancelFailed),
+            "a cancel that failed for any other reason leaves the operation's \
+             fate unknown, which is not the same as knowing it never existed"
+        );
+        assert!(watch.upgrade().is_some());
+
+        // Trigger: the blocking unregister failed. FR-014's rationale singles
+        // this one out, because a failed release means the pool may still be a
+        // consumer -- which is the entire premise of releasing before the
+        // collect.
+        let name = unique("leak-unreg");
+        let mut server = Server::create(&name).unwrap();
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let watch = server.accept_event_watch().expect("an event exists");
+        ArmedEvent::fail_next_unregister();
+        drop(server);
+        assert_eq!(
+            Server::last_teardown(),
+            Some(Teardown::LeakUnregisterFailed),
+            "a failed release must stop the teardown before the collect: the \
+             collect would then be a second consumer of a single auto-reset \
+             signal, which is the configuration measured hanging"
+        );
+        assert!(watch.upgrade().is_some());
+
+        // Trigger: the collect returned with the status still pending. The one
+        // branch where trusting the platform's answer frees memory the kernel
+        // is writing into.
+        let name = unique("leak-collect");
+        let mut server = Server::create(&name).unwrap();
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let watch = server.accept_event_watch().expect("an event exists");
+        Server::force_next_teardown_unfinished();
+        drop(server);
+        assert_eq!(
+            Server::last_teardown(),
+            Some(Teardown::LeakCollectUnfinished),
+            "a collect that returns without a terminal status has not \
+             established what it was called to establish"
+        );
+        assert!(watch.upgrade().is_some());
+
+        // Every injection is one-shot, so none can leak into another test on
+        // this thread. Asserted rather than assumed: a seam that stayed armed
+        // would silently divert the next drop, and three of the four above were
+        // consumed by different mechanisms.
+        let name = unique("leak-after");
+        let mut after = Server::create(&name).unwrap();
         {
             let mut fut = Box::pin(after.accept());
             assert!(poll_once(&mut fut).is_pending());
         }
+        let watch = after.accept_event_watch().expect("an event exists");
         drop(after);
         assert_eq!(
-            LAST_TEARDOWN.with(|t| t.get()),
+            Server::last_teardown(),
             Some(Teardown::CollectThenFree),
-            "the injection must be consumed by the drop that used it"
+            "with nothing injected the teardown must collect and free"
+        );
+        assert!(
+            watch.upgrade().is_none(),
+            "and freeing means freeing -- without this the leak assertions above \
+             would pass against an implementation that leaks unconditionally"
         );
     }
 
@@ -1878,6 +2239,476 @@ mod tests {
             assert!(matches!(poll_once(&mut fut), Poll::Ready(Ok(()))));
         }
         assert!(first.is_connected() && second.is_connected());
+    }
+
+    // ---- teardown -----------------------------------------------------------
+
+    /// Whether the *server's own* event is still open at a recorded value.
+    ///
+    /// `GetHandleInformation` alone answers "is some handle open at this value",
+    /// not "is ours". Windows reuses handle values aggressively and this suite
+    /// runs in parallel, so a correct close is regularly reported as still-open
+    /// by a handle another thread opened at the same value in the interval.
+    /// Measured, not anticipated: the `GetHandleInformation`-only form of this
+    /// helper failed 2 runs in 40.
+    ///
+    /// The spec's answer was to query immediately and treat a still-open report
+    /// as a signal to re-run. That is not enough here, because the interfering
+    /// handle comes from *another thread*, which no discipline on this one can
+    /// prevent, and "re-run it" is how a real leak gets explained away.
+    ///
+    /// So identity is compared rather than mere presence. A duplicate of the
+    /// event is taken before the teardown; afterwards, the value is ours only if
+    /// something is open there *and* it names the same kernel object. Holding the
+    /// duplicate keeps the object alive, which is fine — the claim under test is
+    /// that the server closed *its* handle, not that the object was destroyed.
+    /// An unrelated handle landing on the value now reports correctly closed,
+    /// and a genuinely leaked handle still reports open.
+    struct EventIdentity {
+        recorded: isize,
+        duplicate: HANDLE,
+    }
+
+    impl EventIdentity {
+        fn of(recorded: isize) -> Self {
+            use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+            use windows::Win32::System::Threading::GetCurrentProcess;
+            let mut duplicate = HANDLE::default();
+            // SAFETY: `recorded` names an event the server still owns, so it is
+            // open for the duration of this call. The out-pointer is to a local.
+            unsafe {
+                let me = GetCurrentProcess();
+                DuplicateHandle(
+                    me,
+                    HANDLE(recorded as *mut _),
+                    me,
+                    &mut duplicate,
+                    0,
+                    false,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            }
+            .expect("the accept event must be duplicable while the server holds it");
+            Self {
+                recorded,
+                duplicate,
+            }
+        }
+
+        /// Whether the recorded value still names this event.
+        fn still_open(&self) -> bool {
+            use windows::Win32::Foundation::{CompareObjectHandles, GetHandleInformation};
+            let mut flags = 0_u32;
+            // SAFETY: both are queries, defined for any value. `GetHandleInformation`
+            // returns an error for a value that is not an open handle, which is
+            // the first half of the question; `CompareObjectHandles` answers the
+            // second half only when the first has already said something is
+            // there.
+            unsafe {
+                if GetHandleInformation(HANDLE(self.recorded as *mut _), &mut flags).is_err() {
+                    return false;
+                }
+                CompareObjectHandles(HANDLE(self.recorded as *mut _), self.duplicate).as_bool()
+            }
+        }
+    }
+
+    impl Drop for EventIdentity {
+        fn drop(&mut self) {
+            // SAFETY: the duplicate is this value's own, created by
+            // `DuplicateHandle` above and not closed elsewhere.
+            unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.duplicate); }
+        }
+    }
+
+    /// Dropping an accept future releases nothing; dropping the server releases
+    /// everything.
+    ///
+    /// Both halves matter and they are opposite claims. The first is FR-006's
+    /// premise — the future does not own the operation, so abandoning it must
+    /// not cancel or free anything. The second is FR-012's — the server does own
+    /// it, so its drop must reclaim the allocation, the event's shared state,
+    /// the event *handle*, and its own `File` reference.
+    ///
+    /// The handle observable is the non-obvious one. `watch()` reports the
+    /// shared allocation's reference count, which is an adequate proxy for the
+    /// handle only while `Drop for ArmedEvent` fuses reclaim and close — and
+    /// this teardown deliberately unfuses them. Once separated, an
+    /// implementation that reclaims the count and never closes the handle passes
+    /// every count-based assertion and leaks one OS event handle per served
+    /// client.
+    #[test]
+    fn dropping_the_future_releases_nothing_and_dropping_the_server_releases_all() {
+        let name = unique("release-all");
+        let mut server = Server::create(&name).unwrap();
+        let file = server.file_for_test();
+        assert_eq!(
+            file.reference_count(),
+            2,
+            "the server's own reference plus this clone"
+        );
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+
+        // Dropping the future released nothing.
+        assert_eq!(
+            server.live_accept_allocations(),
+            1,
+            "abandoning the future must not free the OVERLAPPED the kernel holds"
+        );
+        let watch = server.accept_event_watch().expect("an event exists");
+        let handle = server.accept_event_handle_value().expect("a handle exists");
+        let event = EventIdentity::of(handle);
+        assert!(
+            event.still_open(),
+            "nor close the event the kernel may still signal -- if this fails, \
+             every assertion below about the close is being read after the fact"
+        );
+
+        drop(server);
+
+        assert!(
+            watch.upgrade().is_none(),
+            "the server's drop reclaims the event's shared state"
+        );
+        assert!(
+            !event.still_open(),
+            "and closes the event handle, which is a separate step from the \
+             reclaim above and can fail on its own"
+        );
+        // The `File` reference is the third thing released, and the one nothing
+        // else here would notice. A server that leaked it on the success path
+        // would pin the pipe handle open forever while every assertion above
+        // still passed.
+        assert_eq!(
+            file.reference_count(),
+            1,
+            "and releases its own reference to the pipe handle"
+        );
+    }
+
+    /// An abandoned accept is still outstanding, and a later accept resumes it.
+    ///
+    /// The test above proves the future's drop frees nothing. That is only half
+    /// of FR-006, and it is the half that a mutation can satisfy while breaking
+    /// the requirement: a `Drop` that cancelled the operation and waited for the
+    /// abort to land would free no memory, close no handle, and leave every
+    /// count-based assertion above intact — while destroying the connection the
+    /// caller was waiting for. Mutation row Q4 does exactly that, and it
+    /// survived the release test.
+    ///
+    /// So the claim needs its behavioural half stated separately: the operation
+    /// the kernel holds must still be *live* after the future is gone, and a
+    /// second `accept()` must adopt it rather than start over. The client here
+    /// arrives only after the abandonment, so the connect it satisfies can only
+    /// be the one begun before it.
+    #[test]
+    fn an_abandoned_accept_is_still_outstanding_and_a_later_accept_resumes_it() {
+        let name = unique("abandon-resume");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        assert!(
+            server.accept_outstanding(),
+            "PREMISE: the abandoned operation is still with the kernel, so the \
+             connect below has something to satisfy"
+        );
+
+        // The second future adopts the outstanding operation rather than
+        // beginning a new one. If it began a new one, the allocation count would
+        // rise and the first would have been leaked.
+        let mut fut = Box::pin(server.accept());
+        assert!(poll_once(&mut fut).is_pending());
+
+        let _client = Client::connect(&name).expect("the client should connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let outcome = loop {
+            match poll_once(&mut fut) {
+                Poll::Ready(r) => break r,
+                Poll::Pending if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Poll::Pending => panic!(
+                    "the accept begun before the future was dropped never \
+                     completed, so abandoning the future lost the connection"
+                ),
+            }
+        };
+        outcome.expect("the resumed accept should succeed");
+        drop(fut);
+        assert_eq!(
+            server.live_accept_allocations(),
+            0,
+            "and exactly one operation existed throughout"
+        );
+    }
+
+    /// The same, for an accept the kernel has already satisfied.    ///
+    /// The other case SC-006 names, and it takes a different branch: the slot
+    /// reads as completed, so the teardown does not cancel at all. An
+    /// implementation correct only for the pending case would pass the test
+    /// above and fail here.
+    #[test]
+    fn dropping_a_server_whose_accept_was_already_satisfied_releases_all() {
+        let name = unique("release-satisfied");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let _client = Client::connect(&name).expect("the client should connect");
+        wait_until(
+            || !server.accept_outstanding(),
+            "the kernel to satisfy the connect",
+        );
+
+        let watch = server.accept_event_watch().expect("an event exists");
+        let handle = server.accept_event_handle_value().expect("a handle exists");
+        let event = EventIdentity::of(handle);
+        assert!(event.still_open());
+
+        drop(server);
+
+        assert_eq!(
+            Server::last_teardown(),
+            Some(Teardown::CollectThenFree),
+            "a satisfied accept has a terminal status waiting, so this collects"
+        );
+        assert!(watch.upgrade().is_none());
+        assert!(!event.still_open());
+    }
+
+    /// The leak path leaves the handle open, which is what makes the assertion
+    /// above a measurement rather than a coincidence.
+    ///
+    /// SC-006c requires the handle observable to be read in *both* directions.
+    /// Without this arm, an implementation that never closed the handle at all
+    /// would be caught, but one whose observable always reported "closed" would
+    /// not.
+    #[test]
+    fn the_leak_path_leaves_the_event_handle_open() {
+        let name = unique("leak-handle");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let handle = server.accept_event_handle_value().expect("a handle exists");
+        let event = EventIdentity::of(handle);
+        let file = server.file_for_test();
+        assert_eq!(file.reference_count(), 2);
+
+        Server::force_next_cancel(CancelOutcome::Failed);
+        drop(server);
+
+        assert_eq!(Server::last_teardown(), Some(Teardown::LeakCancelFailed));
+        assert!(
+            event.still_open(),
+            "a leak that closed the event handle would still be undefined \
+             behaviour: the kernel may signal it. Leaking means leaking all of it"
+        );
+        assert_eq!(
+            file.reference_count(),
+            2,
+            "and the server's own `File` reference goes with it -- the kernel may \
+             still write through that handle, so no surviving clone may close it"
+        );
+    }
+
+    /// `mem::forget` of a live server leaks everything the kernel may touch.
+    ///
+    /// Not a defect but the required outcome: a forgotten server never runs
+    /// `Drop`, so nothing establishes the kernel is finished, so nothing may be
+    /// released. The event handle is the non-trivial half — an implementation
+    /// that leaked the allocation but let the event drop would satisfy a naive
+    /// reading of this and still be unsound.
+    #[test]
+    fn forgetting_a_server_with_an_accept_live_leaks_everything() {
+        let name = unique("forget");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        let watch = server.accept_event_watch().expect("an event exists");
+        let handle = server.accept_event_handle_value().expect("a handle exists");
+        let event = EventIdentity::of(handle);
+        let file = server.file_for_test();
+        assert_eq!(file.reference_count(), 2);
+
+        std::mem::forget(server);
+
+        assert!(
+            watch.upgrade().is_some(),
+            "the event's shared state must survive a forgotten server"
+        );
+        assert!(
+            event.still_open(),
+            "and so must the handle the kernel may signal"
+        );
+        assert_eq!(
+            file.reference_count(),
+            2,
+            "and the forgotten server's own reference must not fall, which is \
+             what keeps the pipe handle open while the kernel may still write \
+             through it"
+        );
+    }
+
+    /// `disconnect` is refused while an accept is outstanding, and the instance
+    /// still works afterwards.
+    ///
+    /// The second half is what stops this being a test of an error path that
+    /// broke the server. A refusal that left the instance unusable would satisfy
+    /// the first assertion alone.
+    #[test]
+    fn disconnect_is_refused_during_an_accept_and_the_instance_survives_it() {
+        let name = unique("disc-refuse");
+        let mut server = Server::create(&name).unwrap();
+
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        assert!(
+            matches!(server.disconnect(), Err(Error::AcceptOutstanding)),
+            "disconnecting an instance the kernel is writing a connect result \
+             for would leave that result describing a connection that is gone"
+        );
+
+        let _client = Client::connect(&name).expect("the instance should still be listening");
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(matches!(poll_once(&mut fut), Poll::Ready(Ok(()))));
+        }
+        assert!(server.is_connected());
+        assert!(
+            server.disconnect().is_ok(),
+            "and now that there is a client, disconnecting it is permitted"
+        );
+    }
+
+    /// The unwind fence is present, established from outside the process.
+    ///
+    /// A `#[test]` cannot assert that it aborted. So the assertion is made by a
+    /// parent: a child process is told to panic partway through a teardown, and
+    /// the parent reads how it died. A fenced teardown aborts; an unfenced one
+    /// unwinds and the harness reports an ordinary test failure, exit code 101.
+    ///
+    /// Both codes are asserted rather than only the abort, because "not 101" is
+    /// satisfied by a child that failed to start.
+    #[test]
+    fn a_panic_in_the_teardown_aborts_rather_than_unwinding() {
+        if std::env::var_os("WIN_IORING_PIPE_FENCE_CHILD").is_some() {
+            // In the child. Everything below runs in the parent.
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "pipe::server::tests::the_fence_child_panics_in_a_teardown",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("WIN_IORING_PIPE_FENCE_CHILD", "1")
+            .output()
+            .expect("the child test binary should run");
+
+        let code = output.status.code();
+        assert_ne!(
+            code,
+            Some(101),
+            "101 is the harness's ordinary failure code, which is what an \
+             unwinding panic in a drop produces. Reaching it means the teardown \
+             was not fenced.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            code,
+            Some(0),
+            "and a child that succeeded did not reach the panic at all"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("panic escaped teardown"),
+            "the abort must be the fence's, named in its own message, not some \
+             other death. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The child half of the test above. Aborts by design; runs only when the
+    /// parent asks for it by name and by environment.
+    #[test]
+    fn the_fence_child_panics_in_a_teardown() {
+        if std::env::var_os("WIN_IORING_PIPE_FENCE_CHILD").is_none() {
+            return;
+        }
+        let name = unique("fence-child");
+        let mut server = Server::create(&name).unwrap();
+        {
+            let mut fut = Box::pin(server.accept());
+            assert!(poll_once(&mut fut).is_pending());
+        }
+        Server::panic_in_next_teardown();
+        drop(server);
+        unreachable!("the fence should have ended this process");
+    }
+
+    /// A drop that races the client's arrival completes.
+    ///
+    /// This is the configuration measurement found hanging, and it is neither of
+    /// the two obvious ones. The client is spawned on a helper thread and the
+    /// server is dropped **without joining it**, so the connect can resolve
+    /// *during* the collect rather than before or after it. With both the cancel
+    /// and the early unregister removed, that window hung 8 times in 200 on this
+    /// host; with either one present it hung 0 in 500.
+    ///
+    /// **The iteration count is the gate, not decoration.** The hang rate is
+    /// host-sensitive by roughly tenfold — 8/200 here, 25/200 and 7/200 on other
+    /// hosts — so a single pass would detect the mutation about 4% of the time,
+    /// which is worse than no gate at all: it would report success occasionally
+    /// and be believed. At the low end of the measured range, 400 passes catch it
+    /// with about 86% probability, and the mutation harness runs it once.
+    ///
+    /// The assertion is completion, not a wall-clock bound: the harness's own
+    /// timeout is the failure mode. A timing assertion would inherit the
+    /// load-sensitive flakes this tree already has, and no `assert!` can catch a
+    /// hang anyway.
+    #[test]
+    fn a_drop_racing_the_clients_arrival_completes() {
+        for _ in 0..400 {
+            let name = unique("race");
+            let mut server = Server::create(&name).unwrap();
+            {
+                let mut fut = Box::pin(server.accept());
+                assert!(poll_once(&mut fut).is_pending());
+            }
+
+            let peer = name.clone();
+            let joiner = std::thread::spawn(move || {
+                let _ = Client::connect(&peer);
+            });
+
+            // Deliberately not joined first. Joining would resolve the connect
+            // before the teardown starts and this would test the already-
+            // satisfied path instead -- which is covered elsewhere and does not
+            // enter the window.
+            drop(server);
+            let _ = joiner.join();
+        }
+        // Reaching here is the assertion. A hang is the failure mode, and it is
+        // one no `assert!` can catch.
     }
 }
 
