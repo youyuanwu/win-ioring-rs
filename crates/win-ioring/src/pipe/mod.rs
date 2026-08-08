@@ -78,6 +78,8 @@
 //!   exposed to a less trusted local principal needs a descriptor this API does
 //!   not yet accept.
 
+pub mod error;
+
 mod client;
 mod server;
 

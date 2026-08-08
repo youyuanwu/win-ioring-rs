@@ -6,6 +6,8 @@
 //! is dequeued. For a safe API that tracks these lifetimes, see
 //! [`crate::runtime`].
 
+pub mod error;
+
 mod api;
 pub use api::{BufferInfo, Capabilities, IoRing, IoRingBuilder, RingInfo};
 pub mod ops;

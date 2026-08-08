@@ -922,4 +922,89 @@ mod tests {
             | Error::AcceptOutstanding => {}
         }
     }
+
+    /// SC-17: every view type carries an unrecognised code through Other
+    /// without losing it.
+    ///
+    /// This is the property the whole design rests on. A type that names only
+    /// the conditions its surface can produce is only honest if everything it
+    /// does *not* name survives intact — otherwise the split would be trading
+    /// precision at one surface for lost information at another. Asserting the
+    /// code is recoverable, not merely that some Other was produced, is the
+    /// difference between the two.
+    #[test]
+    fn every_view_carries_an_unrecognised_code_through_other() {
+        // Not in the table, and not plausibly added to it.
+        let hr = windows::core::HRESULT(0x8007_0525_u32 as i32);
+
+        macro_rules! assert_carries {
+            ($ty:ty, $pat:path) => {{
+                let e: $ty = view::<$ty>(hr);
+                match e {
+                    $pat(inner) => assert_eq!(
+                        inner.code(),
+                        hr,
+                        concat!(stringify!($ty), " lost the code it could not name")
+                    ),
+                    other => panic!(
+                        concat!(stringify!($ty), " did not demote to Other: {:?}"),
+                        other
+                    ),
+                }
+            }};
+        }
+
+        assert_carries!(
+            crate::io_ring::error::BuildError,
+            crate::io_ring::error::BuildError::Other
+        );
+        assert_carries!(
+            crate::io_ring::error::Error,
+            crate::io_ring::error::Error::Other
+        );
+        assert_carries!(
+            crate::runtime::error::Error,
+            crate::runtime::error::Error::Other
+        );
+        assert_carries!(crate::file::error::Error, crate::file::error::Error::Other);
+        assert_carries!(crate::pipe::error::Error, crate::pipe::error::Error::Other);
+    }
+
+    /// The four pipe conditions demote on `file::Error` **with the code
+    /// intact**, which is what makes the recovery path of §4.3 possible.
+    ///
+    /// `file::Error` deliberately does not name them. If it demoted them to a
+    /// substituted code — `E_FAIL`, say — a pipe surface handed the same error
+    /// could never recover the condition, and the split would be lossy in
+    /// exactly the way the design claims it is not. Proven here rather than
+    /// asserted, because it is a property of five hand-written methods.
+    #[test]
+    fn file_error_demotes_pipe_conditions_without_substituting_the_code() {
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+        };
+
+        for win32 in [
+            ERROR_PIPE_BUSY,
+            ERROR_BROKEN_PIPE,
+            ERROR_NO_DATA,
+            ERROR_PIPE_LISTENING,
+        ] {
+            let hr = win32.to_hresult();
+            let demoted = view::<crate::file::error::Error>(hr);
+            let carried = match demoted {
+                crate::file::error::Error::Other(ref e) => e.code(),
+                ref other => panic!("file::Error named a pipe condition it should not: {other:?}"),
+            };
+            assert_eq!(carried, hr, "file::Error substituted a code for {win32:?}");
+
+            // And the code it carried re-classifies to the condition the pipe
+            // surface names, which is the round trip itself.
+            let recovered = view::<crate::pipe::error::Error>(carried);
+            assert!(
+                !matches!(recovered, crate::pipe::error::Error::Other(_)),
+                "re-classifying {win32:?} at the pipe surface did not recover a named condition"
+            );
+        }
+    }
 }

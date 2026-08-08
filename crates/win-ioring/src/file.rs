@@ -13,6 +13,8 @@
 //! was dropped. Raw handles remain available through [`crate::io_ring`], which
 //! is unsafe and documents the obligation.
 
+pub mod error;
+
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;

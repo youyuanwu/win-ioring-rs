@@ -32,6 +32,8 @@
 //! the operation's result. For length-tracking types the initialized length is
 //! additionally updated to match.
 
+pub mod error;
+
 use crate::error::{Error, Result};
 
 /// A buffer an operation can read from.

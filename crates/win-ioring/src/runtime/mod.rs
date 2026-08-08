@@ -30,6 +30,8 @@
 //! retries. Resolving the future would mean handing back a buffer the submission
 //! queue still points at.
 
+pub mod error;
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
