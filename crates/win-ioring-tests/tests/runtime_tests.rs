@@ -928,7 +928,19 @@ async fn registering_buffers_takes_ownership_and_returns_them_on_failure() {
             // actually useful.
             let empty: Vec<Vec<u8>> = Vec::new();
             match handle.register_buffers(empty).await {
-                Registered::Failed(_, returned) => assert!(returned.is_empty()),
+                Registered::Failed(e, returned) => {
+                    assert!(returned.is_empty());
+                    // Pinned to the variant, not just to "it failed". The
+                    // operation builders now report their own narrow type, and
+                    // this path deliberately does not: it sits on the data path
+                    // where every other variant is reachable too. A refactor
+                    // that routed this through the builders' type would be a
+                    // behaviour change, and this is what catches it.
+                    assert!(
+                        matches!(e, win_ioring::Error::MissingField { field: "buffers" }),
+                        "expected a missing-field report for `buffers`, got {e:?}"
+                    );
+                }
                 Registered::Ok(_) => panic!("an empty registration should be refused"),
             }
 

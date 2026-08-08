@@ -206,6 +206,60 @@ in two ways rather than one, or correct the string. It is listed here rather tha
 fixed inside the Criterion migration because it changes what is measured, and
 that migration's whole premise is that what is measured did not change.
 
+### `io_ring::BuildError` was costed and declined
+
+Carving a `BuildError` for `IoRingBuilder::build`, `IoRing::create` and
+`query_io_ring_capabilities` would narrow those three from 25 reachable variants
+to 4 — `Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`, `Os`.
+
+Declined because the gain and the cost are the same fact. The gain is that
+`build()` could no longer return `PipeBroken`; the cost is that
+`Error::from_create_failure` would stop delegating to `Error::from_hresult`, so a
+creation failure carrying any of that table's **five** codes — including
+`IORING_E_SUBMISSION_QUEUE_FULL` → `QueueFull`, not only the pipe codes — would
+become `Os`. Neither `CreateIoRing` nor `QueryIoRingCapabilities` realistically
+emits any of them, which means the defect being fixed is documentary and the
+regression introduced is theoretical. Paying a breaking change for that is not
+obviously right in either direction, so it was left alone.
+
+If taken later: `from_create_failure` has exactly two callers, both inside the
+proposed surface, so the change is contained. Pin all five rows, not just the
+pipe ones.
+
+### `runtime::RegistryError` was costed and declined
+
+Carving a `RegistryError` for `RegisteredBuffers::check_out` and
+`RegisteredBuf::fill` would narrow them from 25 variants to 6: `ShuttingDown`,
+`RegistrationPending`, `RegistrationSuperseded`, `InvalidRegisteredIndex`,
+`BufferCheckedOut`, `BufferTooSmall`.
+
+Declined on cost. All six remain reachable elsewhere — five on the `Handle` data
+path (`register_buffers`, `read_registered`), and `BufferTooSmall` from
+`Handle::read`, whose capacity check produces it — so the carve duplicates six
+conditions while removing none: six of the eight duplications the full proposal
+would have introduced, for two methods. And the set it would enforce is
+**already written out verbatim** in those methods' own rustdoc, which lists the
+refusals in order with the reason for each. The carve buys compiler enforcement
+of a promise the documentation already makes precisely, at +6 variant slots.
+
+Both of these were declined together with a wider per-module split; see
+`docs/errors-and-the-funnel.md` for why the errors do not partition by API at
+all.
+
+### `source()` chains only through `Error::Os`
+
+`std::error::Error::source` returns `Some` only for `Error::Os`; every other
+variant is a leaf, including the ones that wrap a condition with a cause worth
+naming. `ops::MissingField` matches this deliberately.
+
+Adding chaining would be an improvement and is a behaviour change: code that
+walks the source chain would start seeing links that were not there. It was left
+out of the error-type work deliberately rather than bundled into it, on the
+grounds that improvements should not ride along inside a refactor where nobody is
+looking for them. Cost if taken: an audit of all 25 variants for what their cause
+actually is, plus a decision about whether `Display` should then stop repeating
+what the source already says.
+
 ### SQE flags are not available on every path
 
 `read_with_flags` / `write_with_options` / `flush_with_options` expose

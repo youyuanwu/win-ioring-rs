@@ -1923,7 +1923,7 @@ impl Handle {
 
         let op = match op {
             Ok(op) => op,
-            Err(e) => return Err((e, recover_buffer(&mut inner, token))),
+            Err(e) => return Err((Error::from(e), recover_buffer(&mut inner, token))),
         };
 
         // SAFETY: the payload lives in the slab until this operation's own
@@ -2070,7 +2070,7 @@ impl Handle {
 
         let op = match op {
             Ok(op) => op,
-            Err(e) => return Err((e, recover_buffer(&mut inner, token))),
+            Err(e) => return Err((Error::from(e), recover_buffer(&mut inner, token))),
         };
 
         // SAFETY: the payload lives in the slab until this operation's own
@@ -2203,7 +2203,7 @@ impl Handle {
             Ok(op) => op,
             Err(e) => {
                 drop(inner.slab.complete(token));
-                return Err(e);
+                return Err(Error::from(e));
             }
         };
 
@@ -2614,7 +2614,7 @@ impl Handle {
                 FileTarget::Owned(file) => builder.with_raw_handle(file.as_raw_handle()),
                 FileTarget::Registered { index } => builder.with_registered_handle_index(index),
             };
-            builder.build().and_then(|op| {
+            builder.build().map_err(Error::from).and_then(|op| {
                 // SAFETY: the registered buffer and handle are owned by the
                 // driver's registrations, which outlive this operation.
                 unsafe { inner.ring.build_write_file(op) }
@@ -2629,7 +2629,7 @@ impl Handle {
                 FileTarget::Owned(file) => builder.with_raw_handle(file.as_raw_handle()),
                 FileTarget::Registered { index } => builder.with_registered_handle_index(index),
             };
-            builder.build().and_then(|op| {
+            builder.build().map_err(Error::from).and_then(|op| {
                 // SAFETY: as above.
                 unsafe { inner.ring.build_read_file(op) }
             })

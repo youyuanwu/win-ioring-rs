@@ -2,10 +2,19 @@
 //!
 //! Each descriptor is built with a fluent builder and then handed to the
 //! matching `IoRing::build_*` method. Builders validate that required fields
-//! were supplied and report omissions as [`Error::MissingField`].
+//! were supplied and report omissions as [`MissingField`].
 //!
 //! Only read, write and flush accept submission queue entry flags; the
 //! platform's cancellation and registration builders take no such parameter.
+//!
+//! # Why these builders have their own error type
+//!
+//! Building an operation is pure field validation: it inspects the `Option`s the
+//! caller filled in and touches no platform call, so the set of ways it can fail
+//! is closed by construction rather than by inspection. That makes it one of the
+//! few surfaces in this crate that can honestly report a narrower type than
+//! [`crate::Error`]. Most cannot — see `docs/errors-and-the-funnel.md` for why
+//! the crate's errors do not partition by API, and what was costed and declined.
 
 use windows::Win32::{
     Foundation::HANDLE,
@@ -17,7 +26,49 @@ use windows::Win32::{
     },
 };
 
-use crate::error::{Error, Result};
+/// A required field was not supplied when building an operation.
+///
+/// Returned by the `build` method of every operation builder in this module.
+/// Those methods do nothing but check that the fields the caller set cover the
+/// ones the platform requires, so this is the only way any of them can fail.
+///
+/// Converts into [`crate::Error::MissingField`] with [`From`], so a caller
+/// working in [`crate::Result`] can still use `?`. The same condition exists in
+/// both types deliberately: driver-level registration
+/// ([`Handle::register_buffers`](crate::runtime::Handle::register_buffers),
+/// [`Handle::register_files`](crate::runtime::Handle::register_files)) reports a
+/// missing field too, and it is not built by these builders.
+///
+/// # Why this is `#[non_exhaustive]`
+///
+/// For consistency with [`crate::Error`] and to leave cheap room, not because a
+/// second field is anticipated. One plausible candidate exists — which builder
+/// produced the error — but it is weak, since the caller knows which `build` it
+/// called. Do not read the attribute as a plan to add fields, and do not remove
+/// it as pointless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MissingField {
+    /// The name of the field that was not set.
+    pub field: &'static str,
+}
+
+impl std::fmt::Display for MissingField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "required field `{}` was not set", self.field)
+    }
+}
+
+impl std::error::Error for MissingField {}
+
+// A public error type, which callers may send between threads or wrap in
+// `std::io::Error::other` — both of which need `Send + Sync`. Pinned rather than
+// left to inference so that adding a non-`Send` field is a compile error here
+// rather than a breaking change discovered downstream.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MissingField>();
+};
 
 /// Names the file an operation targets, either directly or by registration
 /// index.
@@ -191,13 +242,11 @@ impl ReadOpBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingField`] if the handle or data reference was not
+    /// Returns [`MissingField`] if the handle or data reference was not
     /// supplied.
-    pub fn build(self) -> Result<ReadOp> {
-        let handle_ref = self
-            .handle_ref
-            .ok_or(Error::MissingField { field: "handle" })?;
-        let data_ref = self.data_ref.ok_or(Error::MissingField { field: "data" })?;
+    pub fn build(self) -> std::result::Result<ReadOp, MissingField> {
+        let handle_ref = self.handle_ref.ok_or(MissingField { field: "handle" })?;
+        let data_ref = self.data_ref.ok_or(MissingField { field: "data" })?;
 
         Ok(ReadOp {
             handle_ref: handle_ref.to_platform(),
@@ -304,13 +353,11 @@ impl WriteOpBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingField`] if the handle or data reference was not
+    /// Returns [`MissingField`] if the handle or data reference was not
     /// supplied.
-    pub fn build(self) -> Result<WriteOp> {
-        let handle_ref = self
-            .handle_ref
-            .ok_or(Error::MissingField { field: "handle" })?;
-        let data_ref = self.data_ref.ok_or(Error::MissingField { field: "data" })?;
+    pub fn build(self) -> std::result::Result<WriteOp, MissingField> {
+        let handle_ref = self.handle_ref.ok_or(MissingField { field: "handle" })?;
+        let data_ref = self.data_ref.ok_or(MissingField { field: "data" })?;
 
         Ok(WriteOp {
             handle_ref: handle_ref.to_platform(),
@@ -388,12 +435,10 @@ impl FlushOpBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingField`] if the handle reference was not
+    /// Returns [`MissingField`] if the handle reference was not
     /// supplied.
-    pub fn build(self) -> Result<FlushOp> {
-        let handle_ref = self
-            .handle_ref
-            .ok_or(Error::MissingField { field: "handle" })?;
+    pub fn build(self) -> std::result::Result<FlushOp, MissingField> {
+        let handle_ref = self.handle_ref.ok_or(MissingField { field: "handle" })?;
 
         Ok(FlushOp {
             handle_ref: handle_ref.to_platform(),
@@ -467,13 +512,11 @@ impl CancelOpBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::MissingField`] if the handle reference or the target
+    /// Returns [`MissingField`] if the handle reference or the target
     /// operation was not supplied.
-    pub fn build(self) -> Result<CancelOp> {
-        let handle_ref = self
-            .handle_ref
-            .ok_or(Error::MissingField { field: "handle" })?;
-        let op_to_cancel = self.op_to_cancel.ok_or(Error::MissingField {
+    pub fn build(self) -> std::result::Result<CancelOp, MissingField> {
+        let handle_ref = self.handle_ref.ok_or(MissingField { field: "handle" })?;
+        let op_to_cancel = self.op_to_cancel.ok_or(MissingField {
             field: "op_to_cancel",
         })?;
 
@@ -529,39 +572,39 @@ mod tests {
             .build()
             .err()
             .unwrap();
-        assert!(matches!(err, Error::MissingField { field: "handle" }));
+        assert!(matches!(err, MissingField { field: "handle" }));
 
         let err = ReadOp::builder()
             .with_registered_handle_index(0)
             .build()
             .err()
             .unwrap();
-        assert!(matches!(err, Error::MissingField { field: "data" }));
+        assert!(matches!(err, MissingField { field: "data" }));
     }
 
     #[test]
     fn write_builder_requires_handle_and_data() {
         let err = WriteOp::builder().build().err().unwrap();
-        assert!(matches!(err, Error::MissingField { field: "handle" }));
+        assert!(matches!(err, MissingField { field: "handle" }));
 
         let err = WriteOp::builder()
             .with_registered_handle_index(0)
             .build()
             .err()
             .unwrap();
-        assert!(matches!(err, Error::MissingField { field: "data" }));
+        assert!(matches!(err, MissingField { field: "data" }));
     }
 
     #[test]
     fn flush_builder_requires_handle() {
         let err = FlushOp::builder().build().err().unwrap();
-        assert!(matches!(err, Error::MissingField { field: "handle" }));
+        assert!(matches!(err, MissingField { field: "handle" }));
     }
 
     #[test]
     fn cancel_builder_requires_handle_and_target() {
         let err = CancelOp::builder().build().err().unwrap();
-        assert!(matches!(err, Error::MissingField { field: "handle" }));
+        assert!(matches!(err, MissingField { field: "handle" }));
 
         let err = CancelOp::builder()
             .with_registered_handle_index(0)
@@ -570,10 +613,60 @@ mod tests {
             .unwrap();
         assert!(matches!(
             err,
-            Error::MissingField {
+            MissingField {
                 field: "op_to_cancel"
             }
         ));
+    }
+
+    /// The conversion into the crate error must carry the field name through.
+    ///
+    /// Driven from a real builder failure rather than a constructed
+    /// `MissingField`, so that a refactor which reroutes the builder is caught
+    /// here too. A test that built the value itself would keep passing while the
+    /// builder reported something else entirely.
+    #[test]
+    fn a_builder_failure_widens_into_the_crate_error_with_its_field_intact() {
+        let narrow = FlushOp::builder().build().err().unwrap();
+        let wide: crate::Error = narrow.clone().into();
+        assert!(matches!(
+            wide,
+            crate::Error::MissingField { field: "handle" }
+        ));
+
+        let narrow = CancelOp::builder()
+            .with_registered_handle_index(0)
+            .build()
+            .err()
+            .unwrap();
+        let wide: crate::Error = narrow.into();
+        assert!(matches!(
+            wide,
+            crate::Error::MissingField {
+                field: "op_to_cancel"
+            }
+        ));
+    }
+
+    /// The narrow type's `Display` must match what the crate error prints, so
+    /// that widening an error does not change the message a caller logs.
+    #[test]
+    fn the_narrow_and_wide_types_print_identically() {
+        let narrow = FlushOp::builder().build().err().unwrap();
+        let wide: crate::Error = narrow.clone().into();
+        assert_eq!(narrow.to_string(), "required field `handle` was not set");
+        assert_eq!(narrow.to_string(), wide.to_string());
+    }
+
+    /// `MissingField` reports no underlying cause, matching the variant it
+    /// widens into. Pinned because adding a source here would be a silent
+    /// behaviour change to an error that is otherwise a leaf.
+    #[test]
+    fn a_missing_field_has_no_source() {
+        use std::error::Error as _;
+
+        let err = FlushOp::builder().build().err().unwrap();
+        assert!(err.source().is_none());
     }
 
     #[test]
