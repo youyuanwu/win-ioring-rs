@@ -1556,7 +1556,8 @@ mod tests {
         let name = unique("client-first");
         let mut server = Server::create(&name).unwrap();
 
-        let _client = Client::connect(&name).expect("the client should connect to a listening instance");
+        let _client =
+            Client::connect(&name).expect("the client should connect to a listening instance");
         assert_eq!(
             server.synchronous_accepts(),
             0,
@@ -1658,7 +1659,9 @@ mod tests {
             .expect("the parked accept should have been woken by the client")
             .expect("the accept should have succeeded");
 
-        let _peer = peer.join().expect("the peer thread should not have panicked");
+        let _peer = peer
+            .join()
+            .expect("the peer thread should not have panicked");
         assert!(server.is_connected());
         assert_eq!(server.synchronous_accepts(), 0);
     }
@@ -1700,7 +1703,10 @@ mod tests {
         );
 
         let _client = Client::connect(&name).expect("the client should connect");
-        server.accept().await.expect("the resumed accept should deliver");
+        server
+            .accept()
+            .await
+            .expect("the resumed accept should deliver");
 
         assert!(server.is_connected());
         assert_eq!(
@@ -1857,7 +1863,8 @@ mod tests {
         drop(fut);
         assert!(server.accepts_clients(), "and now it admits one");
 
-        let _second = Client::connect(&name).expect("a second client should now reach this instance");
+        let _second =
+            Client::connect(&name).expect("a second client should now reach this instance");
         server_resolves(&mut server);
         assert!(server.is_connected());
         assert_eq!(
@@ -2405,7 +2412,10 @@ mod tests {
         // The control: raising the cap admits the instance that was just
         // refused, so the refusal is the cap's doing.
         let roomy = unique("cap-control");
-        let _c = ServerOptions::new().max_instances(2).create(&roomy).unwrap();
+        let _c = ServerOptions::new()
+            .max_instances(2)
+            .create(&roomy)
+            .unwrap();
         ServerOptions::new()
             .max_instances(2)
             .create(&roomy)
@@ -2424,7 +2434,8 @@ mod tests {
         let mut second = ServerOptions::new().max_instances(2).create(&name).unwrap();
 
         let _a = Client::connect(&name).expect("the first client should connect");
-        let _b = Client::connect(&name).expect("the second client should reach the second instance");
+        let _b =
+            Client::connect(&name).expect("the second client should reach the second instance");
 
         for server in [&mut first, &mut second] {
             let mut fut = Box::pin(server.accept());
@@ -2509,7 +2520,9 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: the duplicate is this value's own, created by
             // `DuplicateHandle` above and not closed elsewhere.
-            unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.duplicate); }
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.duplicate);
+            }
         }
     }
 
@@ -2903,4 +2916,3 @@ mod tests {
         // one no `assert!` can catch.
     }
 }
-

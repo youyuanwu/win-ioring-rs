@@ -404,10 +404,7 @@ impl fmt::Display for Error {
                 write!(f, "required field `{field}` was not set")
             }
             Error::Os(e) => write!(f, "{e}"),
-            Error::PipeBusy => write!(
-                f,
-                "every pipe instance is already serving a client"
-            ),
+            Error::PipeBusy => write!(f, "every pipe instance is already serving a client"),
             Error::PipeBroken => write!(f, "the peer closed its end of the pipe"),
             Error::PipeNoPeer => write!(f, "the pipe has no peer connected"),
             Error::PipeListening => {
