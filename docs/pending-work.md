@@ -544,6 +544,47 @@ closed-form prediction for the declared shape and routes a mismatch through
 
 ## Deferred by the per-API errors work
 
+### `a_pipe_read_succeeds_through_a_registered_file_handle` fails intermittently on CI
+
+Unattributed. It failed once on a GitHub runner with
+`Other(HRESULT(0x80070006), "The handle is invalid.")` at
+`crates/win-ioring-tests/tests/pipe_tests.rs:194` — the `read_registered`
+against `FileTarget::Registered { index: 0 }`.
+
+The evidence, in full, because it does not settle the question:
+
+| Where | Runs | Failures |
+|---|---|---|
+| `feature/per-api-errors` | 6 | 1 |
+| `main` (pushed to throwaway branches) | 7 | 0 |
+| Local, same test in a loop | 25 | 0 |
+
+1-in-6 against 0-in-7 is not a difference; it is two samples consistent with the
+same underlying rate. **So this is recorded as unattributed rather than as a
+pre-existing flake**, which is the reading that would let the per-API error work
+off the hook.
+
+Two things were ruled out:
+
+- **`File::clone` at `:182` is not a double-close.** `File` is
+  `Rc<FileState>`; cloning shares the handle.
+- **The test text is unchanged from `main`.** But the crate underneath it
+  changed substantially, so that alone clears nothing.
+
+One piece of evidence was withdrawn: `main` appeared to have 19 consecutive
+green runs, which looked like strong baseline. Only **one** of them postdates
+the named-pipes merge that added this test, so the figure was worthless. The
+seven baseline runs above were generated deliberately for this reason.
+
+This is most likely the same failure as the single unattributed local failure
+during Phase 7 of the per-API error work, which cleared before its name could be
+captured. That is a hypothesis, not an identification.
+
+Worth suspecting first if it recurs: registered *file handles* are the most
+version-sensitive IoRing feature this crate uses, and the runner's Windows build
+need not match a developer machine's. See `docs/platform-notes.md`.
+
+
 Three recorded decisions, not omissions. Each was reached during the split of
 `crate::Error` into six per-API types and deliberately left out of it.
 
