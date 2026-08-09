@@ -11,10 +11,10 @@
 //!
 //! Building an operation is pure field validation: it inspects the `Option`s the
 //! caller filled in and touches no platform call, so the set of ways it can fail
-//! is closed by construction rather than by inspection. That makes it one of the
-//! few surfaces in this crate that can honestly report a narrower type than
-//! their surface's error type. Most cannot — see `docs/errors-and-the-funnel.md`
-//! the crate's errors do not partition by API, and what was costed and declined.
+//! is closed by construction rather than by inspection. That is a stronger
+//! property than the other error types in this crate have: they are closed by
+//! design and enforcement, which needs guards to stay honest, while this one
+//! cannot reach the classifier at all. See `docs/errors-and-the-funnel.md`.
 
 use windows::Win32::{
     Foundation::HANDLE,

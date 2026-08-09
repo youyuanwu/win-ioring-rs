@@ -173,9 +173,14 @@ and a synchronous accept on a dedicated handle were all considered; each hides
 the asymmetry somewhere less visible rather than removing it. The overlapped
 route at least puts the exception where a reader can find it.
 
-One consequence reaches further than pipes. Because a connected pipe *is* a
-`File` — `Server::file` hands one out and `Client` derefs into one — pipe I/O
-uses the same futures and the same completion path as file I/O, so it also uses
-the same error type. That is why the crate's errors cannot be split per API, and
-why `PipeBroken` has no producer anywhere under `pipe/`. See
-`docs/errors-and-the-funnel.md`.
+One consequence reaches further than pipes. A connected pipe still *holds* a
+`File` — `Server::file` hands one out — and pipe I/O still uses the same
+completion path as file I/O, which is why `PipeBroken` has no producer anywhere
+under `pipe/`: it is classified from a platform code by the one classifier, like
+every other condition.
+
+What that no longer implies is a shared error *type*. `Client` and `Server` have
+their own `read_at`/`write_at` returning `pipe::Error`, and `Client` no longer
+derefs to `File`. Classification funnels; the type is chosen at the boundary,
+where the API is known. See `docs/errors-and-the-funnel.md`, which previously
+concluded the opposite and records why.

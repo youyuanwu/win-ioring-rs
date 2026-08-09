@@ -242,9 +242,11 @@ would have introduced, for two methods. And the set it would enforce is
 refusals in order with the reason for each. The carve buys compiler enforcement
 of a promise the documentation already makes precisely, at +6 variant slots.
 
-Both of these were declined together with a wider per-module split; see
-`docs/errors-and-the-funnel.md` for why the errors do not partition by API at
-all.
+Both of these were declined at the time, together with a wider per-module
+split. **The wider split has since been done** — the crate now has six per-API
+error types — so the reasoning that bundled these two with it no longer applies
+and they would need re-costing on their own merits. See
+`docs/errors-and-the-funnel.md`.
 
 ### `source()` chains only through `Error::Os`
 
@@ -529,6 +531,53 @@ closed-form prediction for the declared shape and routes a mismatch through
   means "the plan forgot nothing", which is much weaker than "nothing was
   forgotten". Closing the gap needs a link from each criterion to the tests that
   gate it, which this repository has no convention for.
+
+## Deferred by the per-API errors work
+
+Three recorded decisions, not omissions. Each was reached during the split of
+`crate::Error` into six per-API types and deliberately left out of it.
+
+### The pipe surface has no ordering interlock
+
+`Client` and `Server` now have `read_at`/`write_at` returning `pipe::Error`
+(FR-18). Neither has the interlock the file surface has for sequential I/O:
+`File::read`/`File::write` refuse to run concurrently with themselves because
+they track a cursor, and `sequential_outstanding` enforces that. The pipe methods
+are positional and hold no cursor, so nothing there needs the same guard — but
+nothing stops a caller issuing overlapping reads on a stream, where the *kernel*
+does not guarantee which lands first.
+
+**Cost of doing it:** an outstanding-operation flag per pipe handle, plus a
+`pipe::Error` variant to report the refusal. **Cost of not doing it:** a caller
+who overlaps pipe reads gets interleaved bytes with no diagnostic. Deferred
+because it is a pre-existing property of positional I/O rather than something the
+error split introduced, and adding a refusal is a behaviour change that wants its
+own justification rather than riding inside an error-type change.
+
+### `register_files` is not generalised over the new types
+
+Registration takes files specifically. Now that pipes have their own surface and
+their own error type, the natural question is whether a pipe handle can be
+registered the same way. It can — `Client` and `Server` hold a `File` — but the
+API says `File` and the error it returns is `runtime::Error`.
+
+**Cost:** a generic bound plus a decision about which error type a registration
+failure reports when the thing registered is a pipe. That decision is the same
+shape as the one the error split spent most of its design budget on, and it did
+not need re-opening to ship the split. Deferred with the reasoning intact.
+
+### Shutdown with a full slab drains slowly in unoptimised builds
+
+Tearing down a driver holding 65,536 outstanding operations takes ~40 seconds in
+a debug build and ~1.7 seconds in release — roughly 0.6 ms per operation
+unoptimised against 26 µs optimised. Measured while pinning the two exhaustion
+producers (`crates/win-ioring-tests/tests/exhaustion.rs`), which is why that test
+carries a stated cost.
+
+The 23x ratio says this is unoptimised-build overhead rather than a shutdown
+defect, so it is recorded rather than filed as a bug. It is worth knowing before
+anyone adds a second test that leaves the slab full: the cost is per-operation
+and it is paid in every debug `cargo test` run.
 
 ## Minor
 
