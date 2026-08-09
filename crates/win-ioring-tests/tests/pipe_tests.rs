@@ -322,3 +322,133 @@ async fn a_refused_pipe_operation_has_no_identifier() {
     })
     .await;
 }
+
+/// SC-7: a **real** broken pipe, driven through the pipe surface, returns the
+/// named `pipe::Error` variant.
+///
+/// Not a constructed error and not a unit test over a conversion: a genuine
+/// connection, genuinely broken by dropping the server, with the failure
+/// travelling the whole route — kernel, completion queue, driver
+/// classification, boundary conversion — before anything is asserted.
+///
+/// Both directions are checked because they produce *different* conditions and a
+/// test that checked one would report the design working when half of it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_broken_pipe_reports_a_named_pipe_condition() {
+    with_driver(|handle| async move {
+        let name = unique("really-broken");
+        let mut server = ServerOptions::new().create(&name).unwrap();
+        let mut accept = Box::pin(server.accept());
+        assert!(futures::poll!(accept.as_mut()).is_pending());
+        let client = ClientOptions::new().open(&name).unwrap();
+        accept.await.unwrap();
+
+        // The break. Closing the server's handle is what the peer observes.
+        drop(server);
+
+        let (result, _) = client
+            .read_at(&handle, vec![0_u8; 8], 8, 0)
+            .await
+            .into_parts();
+        let error: win_ioring::pipe::Error = result.unwrap_err();
+        assert!(
+            matches!(error, win_ioring::pipe::Error::Broken),
+            "reading a pipe whose peer has gone must report Broken, got {error:?}"
+        );
+
+        let (result, _) = client
+            .write_at(&handle, b"x".to_vec(), 1, 0)
+            .await
+            .into_parts();
+        let error: win_ioring::pipe::Error = result.unwrap_err();
+        assert!(
+            matches!(error, win_ioring::pipe::Error::NoPeer),
+            "writing a pipe whose peer has gone must report NoPeer, got {error:?}"
+        );
+    })
+    .await;
+}
+
+/// The design's central claim, demonstrated on a **real** failure rather than a
+/// constructed one.
+///
+/// # What is being claimed
+///
+/// `docs/errors-and-the-funnel.md` argued that this crate's errors cannot
+/// partition by API. The argument was about classifying *at the funnel*, where
+/// the driver has no idea which API issued the operation. This design classifies
+/// once and defers the *naming* to the boundary, which is a different thing —
+/// and its whole viability rests on one property:
+///
+/// > A condition a surface cannot name is demoted to `Other` **carrying its
+/// > code**, so a surface that can name it recovers it without loss.
+///
+/// If that fails, the design is unsound and the document was right after all.
+///
+/// # Why through the file surface
+///
+/// This is the route where demotion actually happens on a real path. A pipe
+/// holds a `File`, and reading it *as a file* — which `Server::file()` hands out
+/// and which callers legitimately do — produces a `file::Error`. A regular file
+/// cannot be broken in the way a pipe can, so `file::Error` has no name for the
+/// condition and must demote.
+///
+/// The pipe surface's own `read_at` does **not** take this route: the driver
+/// names `PipeBroken`, and `From<runtime::Error> for pipe::Error` reads that
+/// name directly. That is verified separately by
+/// `a_real_broken_pipe_reports_a_named_pipe_condition`, and the two are
+/// deliberately not merged — they exercise different arms, and a test covering
+/// only one would report the design working when half of it was.
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_broken_pipe_survives_a_surface_that_cannot_name_it() {
+    with_driver(|handle| async move {
+        let name = unique("recovery");
+        let mut server = ServerOptions::new().create(&name).unwrap();
+        let mut accept = Box::pin(server.accept());
+        assert!(futures::poll!(accept.as_mut()).is_pending());
+        let client = ClientOptions::new().open(&name).unwrap();
+        accept.await.unwrap();
+        drop(server);
+
+        // Read the pipe *as a file*, which is what a caller holding a `&File`
+        // does. Nothing here mentions pipes.
+        let (result, _) = client
+            .file()
+            .read_at(&handle, vec![0_u8; 8], 8, 0)
+            .await
+            .into_parts();
+        let error: win_ioring::file::Error = result.unwrap_err();
+
+        // The demotion. The file surface has no name for this, so it says so —
+        // and keeps the code.
+        let code = match &error {
+            win_ioring::file::Error::Other(w) => w.code(),
+            other => panic!(
+                "a broken pipe read as a file must demote to Other; got \
+                 {other:?}. If the file surface has grown a name for this \
+                 condition, this test is no longer testing recovery."
+            ),
+        };
+
+        // The recovery, at a surface that does have a name for it. This is the
+        // step the whole design rests on.
+        let recovered = win_ioring::pipe::Error::from(code);
+        assert!(
+            matches!(recovered, win_ioring::pipe::Error::Broken),
+            "the pipe surface must recover Broken from the demoted code, got \
+             {recovered:?}. This failing would mean a condition is lost when it \
+             crosses a surface that cannot name it, which is exactly the \
+             objection this design has to answer."
+        );
+
+        // And the code that survived is the one the platform actually reported,
+        // not a canonical stand-in the crate substituted along the way.
+        assert_eq!(
+            code,
+            windows::Win32::Foundation::ERROR_BROKEN_PIPE.to_hresult(),
+            "the recovered code must be the platform's own, or the round trip \
+             is laundering the error rather than carrying it"
+        );
+    })
+    .await;
+}

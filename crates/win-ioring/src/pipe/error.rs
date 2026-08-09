@@ -204,11 +204,6 @@ impl From<crate::runtime::error::Error> for Error {
             // silently box a *new* condition this surface *can* produce, which
             // is the one failure this design exists to prevent. Adding a
             // `runtime::Error` variant must fail to compile here.
-            // Driver-only, and unreachable from a pipe completion. Named
-            // individually rather than caught by a wildcard: a wildcard would
-            // silently box a *new* condition this surface *can* produce, which
-            // is the one failure this design exists to prevent. Adding a
-            // `runtime::Error` variant must fail to compile here.
             other @ (R::ShutdownStalled { .. }
             | R::InvalidRegisteredIndex { .. }
             | R::RegisteredRangeOutOfBounds { .. }

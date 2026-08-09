@@ -467,6 +467,130 @@ mod classification {
         /// only works if the inverse is exact: a canonical code that classified as
         /// anything else would turn a demotion into a silent reclassification, and
         /// the recovery path would return the wrong condition rather than fail.
+        /// SC-9: every completion-derived pipe condition survives a trip through a
+        /// type that has no name for it.
+        ///
+        /// # What this actually proves
+        ///
+        /// The design's central claim is that classification can be *deferred to the
+        /// boundary*: the driver classifies once, and a surface that cannot name a
+        /// condition demotes it to `Other` **carrying the code**, so a surface that can
+        /// name it recovers it. If that fails for even one condition, the claim is false
+        /// and `docs/errors-and-the-funnel.md` was right after all.
+        ///
+        /// Two earlier arguments in this series asserted that failure, in opposite
+        /// directions, and neither demonstrated it. So this is a demonstration.
+        ///
+        /// # Why the list is built by an exhaustive match
+        ///
+        /// A hand-written list of four conditions is a list that silently stays at four
+        /// when a fifth is added. Matching on `Condition` makes adding a variant `E0004`
+        /// here, so whoever adds it has to say whether it round-trips. That is the same
+        /// reasoning the views themselves are built on.
+        #[test]
+        fn every_completion_derived_pipe_condition_survives_a_type_that_cannot_name_it() {
+            use crate::pipe::Error as P;
+            use crate::runtime::Error as R;
+
+            /// Whether this condition can arrive on a *completion*, and if so what the
+            /// pipe surface must call it.
+            ///
+            /// Returning `None` is a claim, so each one carries its justification.
+            fn expected(c: Condition) -> Option<(windows::core::HRESULT, &'static str)> {
+                match c {
+                    // Produced by the ring's submission path, not by a completion.
+                    // Every surface that can see it names it, so it never demotes.
+                    Condition::QueueFull => None,
+                    Condition::PipeBusy => Some((canonical::pipe_busy(), "Busy")),
+                    Condition::PipeBroken => Some((canonical::pipe_broken(), "Broken")),
+                    Condition::PipeNoPeer => Some((canonical::pipe_no_peer(), "NoPeer")),
+                    Condition::PipeListening => Some((canonical::pipe_listening(), "Listening")),
+                    // Not a condition but the absence of one. It has no canonical code
+                    // by construction, and `classify` is deterministic, so it
+                    // reclassifies to itself forever.
+                    Condition::Other(_) => None,
+                }
+            }
+
+            let all = [
+                Condition::QueueFull,
+                Condition::PipeBusy,
+                Condition::PipeBroken,
+                Condition::PipeNoPeer,
+                Condition::PipeListening,
+                Condition::Other(windows::core::HRESULT(0x1234)),
+            ];
+
+            let mut checked = 0;
+            for condition in all {
+                let Some((hr, name)) = expected(condition) else {
+                    continue;
+                };
+
+                // The demotion. A surface that cannot name a pipe condition carries the
+                // code instead, and `runtime::Error::Other` is what does the carrying.
+                let demoted = R::Other(windows::core::Error::from_hresult(hr));
+
+                // The recovery, at a surface that can name it.
+                let recovered = P::from(demoted);
+
+                let actual = match recovered {
+                    P::Busy => "Busy",
+                    P::Broken => "Broken",
+                    P::NoPeer => "NoPeer",
+                    P::Listening => "Listening",
+                    ref other => panic!(
+                        "{name} did not survive the round trip: {other:?}. The design's \
+                         central claim is that a condition demoted to a code by one \
+                         surface is recovered by another; this is that claim failing."
+                    ),
+                };
+                assert_eq!(actual, name, "{name} round-tripped to the wrong condition");
+                checked += 1;
+            }
+
+            assert_eq!(
+                checked, 4,
+                "expected four completion-derived pipe conditions, got {checked}. A \
+                 lower number means `expected` started returning `None` for one of them \
+                 and this test quietly stopped covering it."
+            );
+        }
+
+        /// SC-9's companion: the demotion is real, not a no-op.
+        ///
+        /// Without this, the test above would pass just as well if `file::Error`
+        /// happened to name the pipe conditions after all. It asserts that recovery
+        /// works; this asserts that something was lost for recovery to recover.
+        #[test]
+        fn a_file_surface_genuinely_cannot_name_a_pipe_condition() {
+            use crate::file::Error as F;
+
+            for (hr, name) in [
+                (canonical::pipe_busy(), "PipeBusy"),
+                (canonical::pipe_broken(), "PipeBroken"),
+                (canonical::pipe_no_peer(), "PipeNoPeer"),
+                (canonical::pipe_listening(), "PipeListening"),
+            ] {
+                let demoted = F::from(crate::runtime::Error::Other(
+                    windows::core::Error::from_hresult(hr),
+                ));
+                match demoted {
+                    F::Other(ref e) => assert_eq!(
+                        e.code(),
+                        hr,
+                        "{name} demoted to `Other` but lost its code, which would make \
+                         recovery impossible"
+                    ),
+                    other => panic!(
+                        "{name} is named on the file surface as {other:?}; if that is \
+                         intended, the round-trip test above is not testing recovery at \
+                         all"
+                    ),
+                }
+            }
+        }
+
         #[test]
         fn the_canonical_codes_round_trip() {
             let cases: [(windows::core::HRESULT, Condition); 5] = [
