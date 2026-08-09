@@ -19,11 +19,16 @@
 //! classifier. Two surfaces cannot disagree about what `ERROR_PIPE_BUSY` means,
 //! because neither of them decides.
 //!
-//! A condition one surface names and another does not is demoted through the
-//! module's canonical inverse, which attaches the code the table would have classified. So a
-//! pipe condition that passes through a file error survives as
-//! `Other(ERROR_BROKEN_PIPE)` and a pipe surface handed the same error recovers
-//! `Broken`. Nothing is invented and nothing is lost.
+//! A condition one surface names and another does not is demoted to `Other`
+//! **carrying the code it arrived with**. So a pipe condition that passes
+//! through a file error survives as `Other(ERROR_BROKEN_PIPE)` and a pipe
+//! surface handed the same error recovers `Broken`. Nothing is invented and
+//! nothing is lost.
+//!
+//! Only [`crate::pipe::Error`] names a pipe condition. Everything else demotes
+//! it, because nothing else can know a handle is a pipe: `Handle::read` takes a
+//! `&File`, `read_registered` takes a registration index, and `Client::file()`
+//! hands out a `&File`. A type that cannot know does not claim to.
 //!
 //! The operation builders in [`crate::io_ring::ops`] are the one surface that
 //! does not consult the platform at all: their `build` methods return
@@ -72,7 +77,7 @@
 //!
 //! ## The variants that were classified but report `None`
 //!
-//! Ten named variants are reached from a platform code yet carry none, because
+//! Six named variants are reached from a platform code yet carry none, because
 //! their view discards the `HRESULT` when it names the condition:
 //!
 //! - [`crate::io_ring::Error::QueueFull`] — also produced by slab exhaustion,
@@ -81,10 +86,6 @@
 //! - [`crate::pipe::Error::Busy`], [`Broken`](crate::pipe::Error::Broken),
 //!   [`NoPeer`](crate::pipe::Error::NoPeer),
 //!   [`Listening`](crate::pipe::Error::Listening)
-//! - [`crate::runtime::Error::PipeBusy`],
-//!   [`PipeBroken`](crate::runtime::Error::PipeBroken),
-//!   [`PipeNoPeer`](crate::runtime::Error::PipeNoPeer),
-//!   [`PipeListening`](crate::runtime::Error::PipeListening)
 //! - [`crate::io_ring::BuildError::Unsupported`], which is `E_NOTIMPL` named
 //!
 //! [`crate::buf::Error`] reports `None` for every variant: both of its
@@ -207,56 +208,6 @@ mod classification {
             Condition::PipeListening
         } else {
             Condition::Other(hr)
-        }
-    }
-
-    /// One canonical code per condition the table names.
-    ///
-    /// [`classify`] is many-to-one only in its `Other` arm; each named condition
-    /// has exactly one code today. These constants are that mapping read
-    /// backwards, and `the_canonical_codes_round_trip` pins the property that
-    /// makes them safe to use: viewing a canonical code routes to the method
-    /// named for its condition.
-    ///
-    /// They exist so a conversion between two surface types can demote a
-    /// condition the destination does not name **with a real code attached**,
-    /// which is what lets a third surface recover it. Without them a conversion
-    /// would have to either invent a code or drop the condition, and both defeat
-    /// the design.
-    pub(crate) mod canonical {
-        use windows::Win32::Foundation::{
-            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
-            IORING_E_SUBMISSION_QUEUE_FULL,
-        };
-        use windows::core::HRESULT;
-
-        /// The canonical code for a full submission queue.
-        ///
-        /// Unused by todays conversions -- no surface demotes `QueueFull`,
-        /// because every surface that can see it names it. Kept so the inverse
-        /// is complete: a partial inverse is the kind of thing someone later
-        /// completes wrongly.
-        #[allow(dead_code)]
-        pub(crate) const QUEUE_FULL: HRESULT = IORING_E_SUBMISSION_QUEUE_FULL;
-
-        /// The canonical code for "all pipe instances are busy".
-        pub(crate) fn pipe_busy() -> HRESULT {
-            ERROR_PIPE_BUSY.to_hresult()
-        }
-
-        /// The canonical code for "the peer closed its end".
-        pub(crate) fn pipe_broken() -> HRESULT {
-            ERROR_BROKEN_PIPE.to_hresult()
-        }
-
-        /// The canonical code for "no peer is connected".
-        pub(crate) fn pipe_no_peer() -> HRESULT {
-            ERROR_NO_DATA.to_hresult()
-        }
-
-        /// The canonical code for "listening, not yet connected".
-        pub(crate) fn pipe_listening() -> HRESULT {
-            ERROR_PIPE_LISTENING.to_hresult()
         }
     }
 
@@ -519,15 +470,13 @@ mod classification {
             );
         }
 
-        /// The canonical inverse must land back on the condition it names.
+        /// Every completion-derived pipe condition survives a trip through a type
+        /// that has no name for it.
         ///
-        /// `canonical` exists so a surface can demote a condition it cannot name
-        /// while attaching a real code, letting a third surface recover it. That
-        /// only works if the inverse is exact: a canonical code that classified as
-        /// anything else would turn a demotion into a silent reclassification, and
-        /// the recovery path would return the wrong condition rather than fail.
-        /// SC-9: every completion-derived pipe condition survives a trip through a
-        /// type that has no name for it.
+        /// A surface that cannot name a condition demotes it to `Other` carrying
+        /// the code, so a surface that can name it recovers it. Since the driver
+        /// no longer names any pipe condition, the demotion needs no inverse: the
+        /// code the platform sent is the code that travels. SC-9.
         ///
         /// # What this actually proves
         ///
@@ -550,6 +499,9 @@ mod classification {
         fn every_completion_derived_pipe_condition_survives_a_type_that_cannot_name_it() {
             use crate::pipe::Error as P;
             use crate::runtime::Error as R;
+            use windows::Win32::Foundation::{
+                ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            };
 
             /// Whether this condition can arrive on a *completion*, and if so what the
             /// pipe surface must call it.
@@ -560,10 +512,12 @@ mod classification {
                     // Produced by the ring's submission path, not by a completion.
                     // Every surface that can see it names it, so it never demotes.
                     Condition::QueueFull => None,
-                    Condition::PipeBusy => Some((canonical::pipe_busy(), "Busy")),
-                    Condition::PipeBroken => Some((canonical::pipe_broken(), "Broken")),
-                    Condition::PipeNoPeer => Some((canonical::pipe_no_peer(), "NoPeer")),
-                    Condition::PipeListening => Some((canonical::pipe_listening(), "Listening")),
+                    Condition::PipeBusy => Some((ERROR_PIPE_BUSY.to_hresult(), "Busy")),
+                    Condition::PipeBroken => Some((ERROR_BROKEN_PIPE.to_hresult(), "Broken")),
+                    Condition::PipeNoPeer => Some((ERROR_NO_DATA.to_hresult(), "NoPeer")),
+                    Condition::PipeListening => {
+                        Some((ERROR_PIPE_LISTENING.to_hresult(), "Listening"))
+                    }
                     // Not a condition but the absence of one. It has no canonical code
                     // by construction, and `classify` is deterministic, so it
                     // reclassifies to itself forever.
@@ -625,11 +579,15 @@ mod classification {
         fn a_file_surface_genuinely_cannot_name_a_pipe_condition() {
             use crate::file::Error as F;
 
+            use windows::Win32::Foundation::{
+                ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            };
+
             for (hr, name) in [
-                (canonical::pipe_busy(), "PipeBusy"),
-                (canonical::pipe_broken(), "PipeBroken"),
-                (canonical::pipe_no_peer(), "PipeNoPeer"),
-                (canonical::pipe_listening(), "PipeListening"),
+                (ERROR_PIPE_BUSY.to_hresult(), "PipeBusy"),
+                (ERROR_BROKEN_PIPE.to_hresult(), "PipeBroken"),
+                (ERROR_NO_DATA.to_hresult(), "PipeNoPeer"),
+                (ERROR_PIPE_LISTENING.to_hresult(), "PipeListening"),
             ] {
                 let demoted = F::from(crate::runtime::Error::Other(
                     windows::core::Error::from_hresult(hr),
@@ -647,27 +605,6 @@ mod classification {
                          all"
                     ),
                 }
-            }
-        }
-
-        #[test]
-        fn the_canonical_codes_round_trip() {
-            let cases: [(windows::core::HRESULT, Condition); 5] = [
-                (canonical::QUEUE_FULL, Condition::QueueFull),
-                (canonical::pipe_busy(), Condition::PipeBusy),
-                (canonical::pipe_broken(), Condition::PipeBroken),
-                (canonical::pipe_no_peer(), Condition::PipeNoPeer),
-                (canonical::pipe_listening(), Condition::PipeListening),
-            ];
-
-            for (code, expected) in cases {
-                let got = classify(code);
-                assert_eq!(
-                    std::mem::discriminant(&got),
-                    std::mem::discriminant(&expected),
-                    "canonical code {code:?} classifies as {got:?}, not {expected:?}; \
-                     the inverse and the table have diverged"
-                );
             }
         }
 
@@ -760,7 +697,7 @@ mod classification {
     }
 }
 
-pub(crate) use classification::{ConditionView, canonical, view};
+pub(crate) use classification::{ConditionView, view};
 
 #[cfg(test)]
 mod conversion_tests {
@@ -1022,12 +959,21 @@ mod conversion_tests {
             other => panic!("a file cannot name a broken pipe, so it must demote: got {other:?}"),
         }
 
-        // The runtime names it too — it is what reaps the completion.
+        // The runtime reaps the completion but does not name it: it is reached
+        // through a `&File` or a registration index, neither of which can say
+        // the handle is a pipe. It demotes, keeping the code, exactly as the
+        // file surface does.
         let runtime_view: RuntimeError = PIPE_BROKEN.into();
-        assert!(
-            matches!(runtime_view, RuntimeError::PipeBroken),
-            "got {runtime_view:?}"
-        );
+        match &runtime_view {
+            RuntimeError::Other(e) => assert_eq!(
+                e.code(),
+                PIPE_BROKEN,
+                "the driver must carry the code it could not name, or the pipe                  surface has nothing to recover from"
+            ),
+            other => panic!(
+                "the driver names a pipe condition again: got {other:?}. Only                  `pipe::Error` may name one — see the `ConditionView` impl in                  `runtime/error.rs` for why."
+            ),
+        }
     }
 
     #[test]
@@ -1158,11 +1104,16 @@ mod os_error_tests {
     #[test]
     fn a_named_condition_reports_none_on_every_surface_that_names_it() {
         assert_eq!(super::view::<PipeError>(PIPE_BROKEN).os_error(), None);
-        assert_eq!(super::view::<RuntimeError>(PIPE_BROKEN).os_error(), None);
-        // `QueueFull` is named by the ring view and wrapped by the rest. The
-        // code comes from the platform crate rather than this module's
-        // `canonical` inverse, which deliberately has no entry for it: no view
-        // ever needs to reconstruct it, because none demotes it.
+        // The driver demotes rather than names, so it reports `Some` here. That
+        // is the whole difference the accessor exposes, and asserting it beside
+        // the pipe surface is what keeps the two readings visibly distinct.
+        assert_eq!(
+            super::view::<RuntimeError>(PIPE_BROKEN)
+                .os_error()
+                .map(|e| e.code()),
+            Some(PIPE_BROKEN)
+        );
+        // `QueueFull` is named by the ring view and wrapped by the rest.
         let queue_full =
             super::view::<RingError>(windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL);
         assert!(matches!(queue_full, RingError::QueueFull));

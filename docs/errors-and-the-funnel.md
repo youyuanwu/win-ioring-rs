@@ -36,16 +36,23 @@ The crate now has six error types:
 | `io_ring::BuildError` | 4 |
 | `io_ring::Error` | 4 |
 | `buf::Error` | 2 |
-| `runtime::Error` | 17 |
+| `runtime::Error` | 13 |
 | `file::Error` | 10 |
 | `pipe::Error` | 13 |
-| **Total public slots** | **50** |
+| **Total public slots** | **46** |
 
-Fifty slots against the previous twenty-five. That is the honest cost: the
+Forty-six slots against the previous twenty-five. That is the honest cost: the
 duplication is real and roughly doubles the number of variants a reader can
 encounter across the crate. What it buys is that no single signature exposes more
 than it can produce — `File::read_at` returns 10 possibilities instead of 25, and
 `Client::read_at` returns 13 that are actually a pipe's.
+
+`runtime::Error` carries 13 rather than the 17 an earlier draft of this document
+reported. It named the four pipe conditions until it was observed that nothing it
+is reached through can know a handle is a pipe: `Handle::read` takes a `&File`,
+`read_registered` takes a registration index, and `Client::file()` hands out a
+`&File`. Naming was therefore a guess, and it is now the rule that **only
+`pipe::Error` names a pipe condition**.
 
 The mechanism that makes this affordable is a single `Other` variant on each
 type. A surface names the conditions it can produce and everything else falls
@@ -160,7 +167,11 @@ document once already.
 
 Some conditions really are reachable from several surfaces, and under the new
 design they are named by several types. That is the duplication the table above
-prices at 50 slots.
+prices at 46 slots.
+
+The pipe conditions are **not** among them any more. They are reachable from
+several surfaces but named by exactly one, which is why the total fell by four:
+reachability earns a demotion carrying the code, not a name.
 
 It is not *divergence*, because every one of them is a view over the same table
 entry: the same `HRESULT` produces the same condition everywhere, and a test
@@ -168,7 +179,8 @@ walks every condition through every view to prove it rather than asserting it.
 
 Ten conditions still partition cleanly — ring construction's three
 (`Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`), the runtime's six
-registration and shutdown conditions, and the pipe's `AcceptOutstanding`.
+registration and shutdown conditions, and the pipe's `AcceptOutstanding`. The
+four pipe conditions now partition too, by decision rather than by reachability.
 
 The two exhaustion conditions deserve care because they look identical and are
 not. `io_ring::Error::QueueFull` is the kernel's submission queue;

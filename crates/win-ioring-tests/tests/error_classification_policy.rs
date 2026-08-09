@@ -278,21 +278,13 @@ fn policed_lines(text: &str) -> Vec<(usize, &str)> {
 
         let starts_classify =
             trimmed.starts_with("pub(crate) fn classify(") || trimmed.starts_with("fn classify(");
-        // The table's inverse. It has to name the same five constants -- that
-        // is what makes it an inverse -- so it cannot be policed by a rule that
-        // counts mentions. What keeps it honest is
-        // `the_canonical_codes_round_trip`, which classifies every canonical
-        // code and asserts it lands on the condition it names. Divergence is
-        // caught by evidence rather than forbidden by spelling.
-        let starts_canonical = trimmed.starts_with("pub(crate) mod canonical {")
-            || trimmed.starts_with("mod canonical {");
         let starts_test_mod = trimmed == "#[cfg(test)]"
             && lines
                 .get(index + 1)
                 .is_some_and(|next| next.trim().starts_with("mod ") && !next.trim().ends_with(';'));
 
-        if starts_classify || starts_canonical || starts_test_mod {
-            let open_indent = indent(if starts_classify || starts_canonical {
+        if starts_classify || starts_test_mod {
+            let open_indent = indent(if starts_classify {
                 line
             } else {
                 lines[index + 1]

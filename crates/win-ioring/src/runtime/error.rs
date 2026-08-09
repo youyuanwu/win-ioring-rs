@@ -70,14 +70,6 @@ pub enum Error {
     RegistrationSuperseded,
     /// The registration has not completed yet.
     RegistrationPending,
-    /// All pipe instances are busy.
-    PipeBusy,
-    /// The pipe's peer closed its end.
-    PipeBroken,
-    /// The pipe has no peer connected.
-    PipeNoPeer,
-    /// The pipe is listening and has not yet been connected to.
-    PipeListening,
     /// A platform error this type does not name, carried verbatim.
     Other(windows::core::Error),
 }
@@ -88,7 +80,7 @@ impl Error {
     /// `None` does not mean "no platform error was involved" — a condition that
     /// was named during classification reports `None` because the variant holds
     /// no code. See [the module docs](crate::error#recovering-the-platform-error)
-    /// for the contract and the ten variants this affects.
+    /// for the contract and the six variants this affects.
     #[deny(clippy::wildcard_enum_match_arm)]
     pub fn os_error(&self) -> Option<&windows::core::Error> {
         match self {
@@ -104,11 +96,7 @@ impl Error {
             | Error::RegisteredRangeOutOfBounds { .. }
             | Error::BufferCheckedOut { .. }
             | Error::RegistrationSuperseded
-            | Error::RegistrationPending
-            | Error::PipeBusy
-            | Error::PipeBroken
-            | Error::PipeNoPeer
-            | Error::PipeListening => None,
+            | Error::RegistrationPending => None,
         }
     }
 }
@@ -118,20 +106,34 @@ impl ConditionView for Error {
         Error::Ring(crate::io_ring::error::Error::QueueFull)
     }
 
-    fn pipe_busy(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeBusy
+    // Only `pipe::Error` names a pipe condition; every other view demotes it to
+    // `Other` carrying the code.
+    //
+    // This type is reached through `Handle::read`/`write`/`flush`, which take a
+    // `&File`, and through `read_registered`/`write_registered`, which take a
+    // `FileTarget`. Neither can know whether the handle is a pipe:
+    // `Client::file()` and `Server::file()` hand out a `&File`, and
+    // `FileTarget::Registered` carries only a slot index. A type that cannot
+    // know must not claim to know, so naming would be a guess dressed as a fact.
+    //
+    // Nothing is lost. The code rides in `Other`, and a caller who *does* know
+    // it is a pipe converts to `pipe::Error`, whose `From` re-classifies it and
+    // names it. That is the recovery path, and it is why these take `hr` rather
+    // than discarding it.
+    fn pipe_busy(hr: windows::core::HRESULT) -> Self {
+        Error::Other(hr.into())
     }
 
-    fn pipe_broken(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeBroken
+    fn pipe_broken(hr: windows::core::HRESULT) -> Self {
+        Error::Other(hr.into())
     }
 
-    fn pipe_no_peer(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeNoPeer
+    fn pipe_no_peer(hr: windows::core::HRESULT) -> Self {
+        Error::Other(hr.into())
     }
 
-    fn pipe_listening(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeListening
+    fn pipe_listening(hr: windows::core::HRESULT) -> Self {
+        Error::Other(hr.into())
     }
 
     fn other(hr: windows::core::HRESULT) -> Self {
@@ -192,10 +194,6 @@ impl fmt::Display for Error {
                 f,
                 "a registration request is in flight, so no buffer may be checked out"
             ),
-            Error::PipeBusy => write!(f, "every pipe instance is already serving a client"),
-            Error::PipeBroken => write!(f, "the peer closed its end of the pipe"),
-            Error::PipeNoPeer => write!(f, "the pipe has no peer connected"),
-            Error::PipeListening => write!(f, "the pipe instance is still waiting for a client"),
             Error::Other(error) => write!(f, "{error}"),
         }
     }
@@ -216,11 +214,7 @@ impl std::error::Error for Error {
             | Error::RegisteredRangeOutOfBounds { .. }
             | Error::BufferCheckedOut { .. }
             | Error::RegistrationSuperseded
-            | Error::RegistrationPending
-            | Error::PipeBusy
-            | Error::PipeBroken
-            | Error::PipeNoPeer
-            | Error::PipeListening => None,
+            | Error::RegistrationPending => None,
         }
     }
 }
@@ -299,10 +293,6 @@ mod display_tests {
             Error::BufferCheckedOut { index: 2 },
             Error::RegistrationSuperseded,
             Error::RegistrationPending,
-            Error::PipeBusy,
-            Error::PipeBroken,
-            Error::PipeNoPeer,
-            Error::PipeListening,
             Error::Other(windows::core::Error::from(
                 windows::Win32::Foundation::E_FAIL,
             )),
@@ -339,10 +329,6 @@ mod display_tests {
             | Error::BufferCheckedOut { .. }
             | Error::RegistrationSuperseded
             | Error::RegistrationPending
-            | Error::PipeBusy
-            | Error::PipeBroken
-            | Error::PipeNoPeer
-            | Error::PipeListening
             | Error::Other(_) => {}
         }
     }

@@ -36,7 +36,7 @@ impl Error {
     /// `None` does not mean "no platform error was involved" — a condition that
     /// was named during classification reports `None` because the variant holds
     /// no code. See [the module docs](crate::error#recovering-the-platform-error)
-    /// for the contract and the ten variants this affects.
+    /// for the contract and the six variants this affects.
     #[deny(clippy::wildcard_enum_match_arm)]
     pub fn os_error(&self) -> Option<&windows::core::Error> {
         match self {

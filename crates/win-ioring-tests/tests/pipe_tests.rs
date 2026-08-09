@@ -197,6 +197,85 @@ async fn a_pipe_read_succeeds_through_a_registered_file_handle() {
     .await;
 }
 
+/// The trade this design accepts, pinned rather than merely conceded.
+///
+/// Registered I/O is the one pipe path with no pipe-surface wrapper: a caller
+/// must go through `read_registered`, which yields a `runtime::Error`. The
+/// driver cannot know that `FileTarget::Registered { index }` refers to a pipe
+/// — it is a slot number — so it does not name the condition. Only
+/// `pipe::Error` names one.
+///
+/// What is given up is the **name**, not the capability and not the
+/// information. The read still works, which
+/// `a_pipe_read_succeeds_through_a_registered_file_handle` covers; the failure
+/// still carries the platform's own code; and a caller who knows it is a pipe
+/// recovers the condition exactly as any other surface does.
+///
+/// That distinction is why this test exists. Restoring naming to the driver, or
+/// dropping the code while demoting, each fails a different assertion below.
+#[tokio::test(flavor = "current_thread")]
+async fn a_registered_pipe_read_demotes_its_condition_but_keeps_the_code() {
+    with_driver(|handle| async move {
+        let name = unique("reg-broken");
+        let mut server = ServerOptions::new().create(&name).unwrap();
+        let client = ClientOptions::new().open(&name).unwrap();
+        server.accept().await.unwrap();
+
+        let buffers = handle.register_buffers(vec![vec![0_u8; 32]]).await.unwrap();
+        let buffer = buffers.check_out(0).unwrap();
+
+        // The peer leaves, so the next read finds a broken pipe.
+        drop(server);
+
+        // `FileTarget::Owned` rather than `Registered { index }`. Both reach the
+        // same conclusion -- neither can tell the driver the handle is a pipe --
+        // and `Owned` makes the point more sharply, since the driver is holding
+        // an actual `&File` and *still* cannot know. It also keeps this test off
+        // `register_files`, which `docs/pending-work.md` records as
+        // intermittently failing with `ERROR_INVALID_HANDLE`; pinning a design
+        // decision on the least reliable primitive in the crate would mean this
+        // test reported on the platform more often than on the design.
+        let (result, _buffer) = handle
+            .read_registered(FileTarget::Owned(client.file()), buffer, 0, 8, 0)
+            .await
+            .into_parts();
+        let error = result.unwrap_err();
+
+        // Demoted, not named.
+        let code = match &error {
+            win_ioring::runtime::Error::Other(w) => w.code(),
+            other => panic!(
+                "the driver named a pipe condition on a registered read: got \
+                 {other:?}. A `&File` does not say whether it is a pipe -- \
+                 `Client::file()` hands one out -- so naming one here is a \
+                 guess dressed as a fact."
+            ),
+        };
+
+        // The code is the platform's own, reachable through the accessor. This
+        // is the half that makes the demotion a rename rather than a loss.
+        let expected = windows::Win32::Foundation::ERROR_BROKEN_PIPE.to_hresult();
+        assert_eq!(
+            code, expected,
+            "the demoted condition must keep the code the platform reported"
+        );
+        assert_eq!(
+            error.os_error().map(|e| e.code()),
+            Some(expected),
+            "os_error must reach the carried code, or a caller has no way to \
+             tell which condition this was"
+        );
+
+        // And a caller who does know it is a pipe gets the name back.
+        let recovered = win_ioring::pipe::Error::from(error);
+        assert!(
+            matches!(recovered, win_ioring::pipe::Error::Broken),
+            "the pipe surface must still recover Broken, got {recovered:?}"
+        );
+    })
+    .await;
+}
+
 /// SC-22: bytes move both ways through the **pipe surface's own** methods, and
 /// a failure from them is a `pipe::Error`.
 ///
@@ -393,12 +472,11 @@ async fn a_real_broken_pipe_reports_a_named_pipe_condition() {
 /// cannot be broken in the way a pipe can, so `file::Error` has no name for the
 /// condition and must demote.
 ///
-/// The pipe surface's own `read_at` does **not** take this route: the driver
-/// names `PipeBroken`, and `From<runtime::Error> for pipe::Error` reads that
-/// name directly. That is verified separately by
-/// `a_real_broken_pipe_reports_a_named_pipe_condition`, and the two are
-/// deliberately not merged — they exercise different arms, and a test covering
-/// only one would report the design working when half of it was.
+/// The pipe surface's own `read_at` reaches the same demoted code and names it,
+/// which is verified separately by
+/// `a_real_broken_pipe_reports_a_named_pipe_condition`. The two are deliberately
+/// not merged: they exercise different surfaces, and a test covering only one
+/// would report the design working when half of it was.
 #[tokio::test(flavor = "current_thread")]
 async fn a_real_broken_pipe_survives_a_surface_that_cannot_name_it() {
     with_driver(|handle| async move {

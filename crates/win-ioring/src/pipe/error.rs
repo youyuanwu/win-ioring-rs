@@ -73,7 +73,7 @@ impl Error {
     /// `None` does not mean "no platform error was involved" — a condition that
     /// was named during classification reports `None` because the variant holds
     /// no code. See [the module docs](crate::error#recovering-the-platform-error)
-    /// for the contract and the ten variants this affects.
+    /// for the contract and the six variants this affects.
     #[deny(clippy::wildcard_enum_match_arm)]
     pub fn os_error(&self) -> Option<&windows::core::Error> {
         match self {
@@ -226,9 +226,17 @@ impl From<crate::runtime::error::Error> for Error {
     #[deny(clippy::wildcard_enum_match_arm)]
     /// Narrows a driver error onto the pipe surface.
     ///
-    /// This is the direction the design exists for: all four pipe conditions are
-    /// *named* here, so a completion the driver classified arrives with its
-    /// meaning intact rather than as an opaque code the caller has to decode.
+    /// This is the direction the design exists for, and it is the **only** place
+    /// a pipe condition is named. The driver demotes all four to
+    /// [`R::Other`] carrying the code, because nothing it is reached through can
+    /// know a handle is a pipe. This type does know, so the `R::Other` arm
+    /// re-classifies the code and names it.
+    ///
+    /// Recovery is therefore not a special case bolted beside the conversion --
+    /// it *is* the conversion. There is no `R::PipeBroken` arm to find, because
+    /// there is no such variant.
+    ///
+    /// [`R::Other`]: crate::runtime::Error::Other
     fn from(value: crate::runtime::error::Error) -> Self {
         use crate::runtime::error::Error as R;
 
@@ -239,10 +247,7 @@ impl From<crate::runtime::error::Error> for Error {
             R::AbandonedAtShutdown => Error::AbandonedAtShutdown,
             R::MissingField { field } => Error::MissingField { field },
             R::TooManyOperations => Error::TooManyOperations,
-            R::PipeBusy => Error::Busy,
-            R::PipeBroken => Error::Broken,
-            R::PipeNoPeer => Error::NoPeer,
-            R::PipeListening => Error::Listening,
+            // Every pipe condition arrives here, not in an arm of its own.
             R::Other(e) => crate::error::view::<Error>(e.code()),
             // Driver-only, and unreachable from a pipe completion. Named
             // individually rather than caught by a wildcard: a wildcard would

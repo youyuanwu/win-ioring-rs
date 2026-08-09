@@ -67,7 +67,7 @@ impl Error {
     /// `None` does not mean "no platform error was involved" — a condition that
     /// was named during classification reports `None` because the variant holds
     /// no code. See [the module docs](crate::error#recovering-the-platform-error)
-    /// for the contract and the ten variants this affects.
+    /// for the contract and the six variants this affects.
     #[deny(clippy::wildcard_enum_match_arm)]
     pub fn os_error(&self) -> Option<&windows::core::Error> {
         match self {
@@ -221,12 +221,14 @@ impl From<crate::runtime::error::Error> for Error {
     #[deny(clippy::wildcard_enum_match_arm)]
     /// Narrows a driver error onto the file surface.
     ///
-    /// The four pipe conditions have no name here, because a regular file
-    /// cannot produce them. They are not dropped: each is re-viewed from its
-    /// canonical code, so it arrives as [`Error::Other`] carrying that code, and
-    /// a pipe surface handed the same error recovers the condition.
+    /// The pipe conditions have no name here, because a regular file cannot
+    /// produce them. Nothing special is needed to demote them: the driver does
+    /// not name them either, so they arrive inside [`R::Other`] already carrying
+    /// their code and pass through the same arm as any other unnamed code. A
+    /// pipe surface handed the same error recovers the condition.
+    ///
+    /// [`R::Other`]: crate::runtime::Error::Other
     fn from(value: crate::runtime::error::Error) -> Self {
-        use crate::error::canonical;
         use crate::runtime::error::Error as R;
 
         match value {
@@ -237,12 +239,6 @@ impl From<crate::runtime::error::Error> for Error {
             R::MissingField { field } => Error::MissingField { field },
             R::TooManyOperations => Error::TooManyOperations,
             R::Other(e) => crate::error::view::<Error>(e.code()),
-            // Named on the driver, unnamed here: demote through the same table,
-            // with the code attached so it can be recovered elsewhere.
-            R::PipeBusy => crate::error::view::<Error>(canonical::pipe_busy()),
-            R::PipeBroken => crate::error::view::<Error>(canonical::pipe_broken()),
-            R::PipeNoPeer => crate::error::view::<Error>(canonical::pipe_no_peer()),
-            R::PipeListening => crate::error::view::<Error>(canonical::pipe_listening()),
             // Driver-only, and unreachable from a file completion. Named
             // individually rather than caught by a wildcard: a wildcard would
             // silently box a *new* condition this surface *can* produce, which

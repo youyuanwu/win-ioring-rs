@@ -182,5 +182,11 @@ every other condition.
 What that no longer implies is a shared error *type*. `Client` and `Server` have
 their own `read_at`/`write_at` returning `pipe::Error`, and `Client` no longer
 derefs to `File`. Classification funnels; the type is chosen at the boundary,
-where the API is known. See `docs/errors-and-the-funnel.md`, which previously
+where the API is known.
+
+It also means `pipe::Error` is the **only** type that names a pipe condition.
+Reading the same pipe through `File::read_at` or `Handle::read` yields
+`file::Error` or `runtime::Error`, and both demote to `Other` carrying the code:
+neither is given anything that could tell it the handle is a pipe. Use the pipe
+surface if you want the name, or `pipe::Error::from` on the code if you cannot. See `docs/errors-and-the-funnel.md`, which previously
 concluded the opposite and records why.

@@ -645,6 +645,22 @@ Worth suspecting first if it recurs: registered *file handles* are the most
 version-sensitive IoRing feature this crate uses, and the runner's Windows build
 need not match a developer machine's. See `docs/platform-notes.md`.
 
+**New evidence, from the Option B work.** A second test was written against
+`FileTarget::Registered { index: 0 }` on a pipe, to pin the demoted-but-code-
+preserved behaviour. It failed on its **first** full-workspace run with the same
+`0x80070006`, then passed **12 of 12** runs in isolation. That is a second test,
+with different text and a different assertion, failing the same way on the same
+primitive — which shifts the suspicion further towards `register_files` itself
+and away from anything specific to the original test. It is still not an
+identification: the isolation result says the failure needs concurrent load to
+appear, and nothing here explains *why*.
+
+That test was rebuilt on `FileTarget::Owned` and has since passed 6 of 6
+full-workspace runs. **That change is not evidence about the flake** — it is a
+test moved off a suspect primitive so it reports on the design decision it exists
+to pin rather than on the platform. The `Registered { index }` path is still
+covered by the original test above, which remains the one to watch.
+
 
 Three recorded decisions, not omissions. Each was reached during the split of
 `crate::Error` into six per-API types and deliberately left out of it.
@@ -677,6 +693,30 @@ API says `File` and the error it returns is `runtime::Error`.
 failure reports when the thing registered is a pipe. That decision is the same
 shape as the one the error split spent most of its design budget on, and it did
 not need re-opening to ship the split. Deferred with the reasoning intact.
+
+### Registered pipe I/O cannot report a named pipe condition
+
+`read_registered` / `write_registered` are the only pipe-capable I/O with no
+pipe-surface wrapper, so a caller reading a pipe through a registration gets a
+`runtime::Error`. Only `pipe::Error` names a pipe condition, so a broken pipe
+arrives there as `Other(ERROR_BROKEN_PIPE)` rather than as `Broken`.
+
+This is a **deliberate trade, not an oversight**. `FileTarget::Registered { index }`
+is a slot number; nothing in it can say the handle behind it is a pipe, and
+`FileTarget::Owned(&File)` cannot either, because `Client::file()` and
+`Server::file()` hand out a `&File`. Naming the condition there would be a guess
+that happened to be right in the cases anyone tested.
+
+**What is lost is the name only.** The read works, the platform's own code is
+carried in `Other` and reachable through `os_error()`, and
+`pipe::Error::from(code)` recovers the condition for a caller who knows what they
+registered. `a_registered_pipe_read_demotes_its_condition_but_keeps_the_code`
+pins exactly that, so the trade fails loudly if either half stops holding.
+
+**Cost to close:** a pipe-surface wrapper for registered I/O, which needs a
+registration that remembers what kind of handle it holds — the same decision
+deferred by *`register_files` is not generalised over the new types* above, and
+the two should be done together or not at all.
 
 ### Shutdown with a full slab drains slowly in unoptimised builds
 
