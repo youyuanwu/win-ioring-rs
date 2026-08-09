@@ -456,8 +456,10 @@ impl File {
         buffer: B,
         len: u32,
         offset: u64,
-    ) -> ReadFuture<B> {
-        handle.read(self, buffer, len, offset)
+    ) -> PositionalRead<B> {
+        PositionalRead {
+            inner: handle.read(self, buffer, len, offset),
+        }
     }
 
     /// Writes `len` bytes from `buffer` at `offset`, without touching the
@@ -468,8 +470,10 @@ impl File {
         buffer: B,
         len: u32,
         offset: u64,
-    ) -> WriteFuture<B> {
-        handle.write(self, buffer, len, offset)
+    ) -> PositionalWrite<B> {
+        PositionalWrite {
+            inner: handle.write(self, buffer, len, offset),
+        }
     }
 
     /// Reads `len` bytes from the cursor into `buffer`, advancing the cursor.
@@ -573,13 +577,105 @@ impl File {
     }
 
     /// Flushes the file, using the platform's default flush mode.
-    pub fn flush(&self, handle: &Handle) -> FlushFuture {
-        handle.flush(self)
+    pub fn flush(&self, handle: &Handle) -> Flush {
+        Flush {
+            inner: handle.flush(self),
+        }
     }
 
     /// Flushes the file with an explicit flush mode.
-    pub fn flush_with_mode(&self, handle: &Handle, mode: FILE_FLUSH_MODE) -> FlushFuture {
-        handle.flush_with_options(self, mode, SqeFlags::NONE)
+    pub fn flush_with_mode(&self, handle: &Handle, mode: FILE_FLUSH_MODE) -> Flush {
+        Flush {
+            inner: handle.flush_with_options(self, mode, SqeFlags::NONE),
+        }
+    }
+}
+
+/// A positional read in progress, reporting failures as [`Error`].
+///
+/// A thin wrapper over the driver's own future. The wrapping is what gives the
+/// file surface its own error type without the driver having one per caller:
+/// the driver classifies once, and this maps that condition onto the type this
+/// surface returns.
+///
+/// It is a wrapper rather than a type parameter on the driver's future because
+/// the driver's completion path is inside the region `docs/performance.md`'s
+/// matrix times. A type parameter would reach into that path; a wrapper cannot.
+pub struct PositionalRead<B: IoBufMut> {
+    inner: ReadFuture<B>,
+}
+
+impl<B: IoBufMut> PositionalRead<B> {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBufMut> Future for PositionalRead<B> {
+    type Output = BufResult<u32, B, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Delegated, so the double-poll panic stays where it was: this wrapper
+        // holds no state of its own to get wrong.
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(BufResult::new(
+            outcome.result.map_err(Error::from),
+            outcome.buffer,
+        ))
+    }
+}
+
+/// A positional write in progress, reporting failures as [`Error`].
+///
+/// See [`PositionalRead`] for why this is a wrapper.
+pub struct PositionalWrite<B: IoBuf> {
+    inner: WriteFuture<B>,
+}
+
+impl<B: IoBuf> PositionalWrite<B> {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBuf> Future for PositionalWrite<B> {
+    type Output = BufResult<u32, B, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(BufResult::new(
+            outcome.result.map_err(Error::from),
+            outcome.buffer,
+        ))
+    }
+}
+
+/// A flush in progress, reporting failures as [`Error`].
+///
+/// Decision 9: the error type is decided by the public surface that returns the
+/// future, not by where the future is defined. `FlushFuture` is reachable both
+/// from here and from [`Handle::flush`](crate::runtime::Handle::flush); the
+/// former answers with a file error and the latter with a driver error, and each
+/// is right for its own caller.
+pub struct Flush {
+    inner: FlushFuture,
+}
+
+impl Flush {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl Future for Flush {
+    type Output = Result<(), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(outcome.map_err(Error::from))
     }
 }
 

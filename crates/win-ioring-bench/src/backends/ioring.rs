@@ -277,6 +277,23 @@ impl Backend for IoRingPlain {
     }
 
     async fn sync(&self, file: &Self::File) -> io::Result<()> {
+        // Deliberately outside the measured region: `File::flush` returns a
+        // wrapper future, and the published matrix in `docs/performance.md`
+        // times only what happens inside `Runner::run`. Committing writes is
+        // setup between phases, not work being compared, so charging it to one
+        // backend would make the comparison unfair as well as changing the
+        // numbers.
+        //
+        // This is asserted rather than left to care, because the placement is
+        // invisible at the call site in `scenario.rs` and a later edit moving it
+        // into the loop would break the zero diff silently. See
+        // `concurrency::TimedRegion`.
+        assert!(
+            !crate::concurrency::in_timed_region(),
+            "`sync` reaches `File::flush`, whose wrapper future must not enter \
+             the region `docs/performance.md` times; move this call outside \
+             `Runner::run`"
+        );
         file.flush(&self.handle)
             .await
             .map(|_| ())
@@ -455,6 +472,23 @@ impl Backend for IoRingRegistered {
     }
 
     async fn sync(&self, file: &Self::File) -> io::Result<()> {
+        // Deliberately outside the measured region: `File::flush` returns a
+        // wrapper future, and the published matrix in `docs/performance.md`
+        // times only what happens inside `Runner::run`. Committing writes is
+        // setup between phases, not work being compared, so charging it to one
+        // backend would make the comparison unfair as well as changing the
+        // numbers.
+        //
+        // This is asserted rather than left to care, because the placement is
+        // invisible at the call site in `scenario.rs` and a later edit moving it
+        // into the loop would break the zero diff silently. See
+        // `concurrency::TimedRegion`.
+        assert!(
+            !crate::concurrency::in_timed_region(),
+            "`sync` reaches `File::flush`, whose wrapper future must not enter \
+             the region `docs/performance.md` times; move this call outside \
+             `Runner::run`"
+        );
         file.flush(&self.handle)
             .await
             .map(|_| ())
