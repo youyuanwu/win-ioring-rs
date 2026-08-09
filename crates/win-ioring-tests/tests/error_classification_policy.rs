@@ -566,6 +566,39 @@ fn condition_is_not_part_of_the_public_api() {
 
 /// How many view traits the crate is known to have.
 ///
+/// # Why one, when the spec anticipated four
+///
+/// Spec §3.4 lists six conversion rows and estimated a trait for each family.
+/// Implemented, only one row needs a trait, and the derivation is worth keeping
+/// because the number looks too low:
+///
+/// - **Rows 1–3** (`io_ring::Error`, `buf::Error`, `ops::MissingField` into the
+///   surface types) carry the source value *whole* — `Error::Ring(value)` and
+///   friends. Adding a variant to the source needs no edit at any destination,
+///   so there is no per-variant mapping that can go stale and nothing for a
+///   trait to guard. A trait here would be machinery protecting nothing.
+/// - **Rows 4–5** (`runtime::Error` into the two boundary types) *are*
+///   per-variant, and are guarded by two compiler errors rather than a trait: a
+///   new variant is E0004 because every variant is named, and the wildcard that
+///   would silence E0004 is itself an error under
+///   `#[deny(clippy::wildcard_enum_match_arm)]` at both impls. Those are the
+///   same two doors E0046 shuts, for one attribute instead of a seventeen-method
+///   trait implemented twice.
+/// - **Row 6** (a condition into every view) is the one that needs
+///   `ConditionView`, because it is the only row where several destinations map
+///   the *same* source variant independently — which is the divergence the whole
+///   design exists to prevent.
+///
+/// So the count is one because only one row has independent per-variant mapping
+/// across multiple destinations. If a second such row ever appears, this
+/// constant must rise with it.
+///
+/// Row 3 has a narrower hazard of its own — `MissingField` is a struct, so
+/// *widening* it would silently drop the new field at three destinations. That
+/// is pinned by destructuring rather than by a trait: the conversions bind
+/// `let MissingField { field } = value`, which is E0027 the moment a field is
+/// added. Verified by adding one.
+///
 /// Discovered traits are counted against this rather than being looked up by
 /// name, so a fifth trait cannot arrive un-covered: it either fails this
 /// assertion or is deliberately recorded here. A hand-written list of trait

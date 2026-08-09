@@ -162,7 +162,13 @@ impl From<crate::io_ring::ops::MissingField> for Error {
     /// their own single-condition type; this surface reports the same condition
     /// alongside everything else it can produce.
     fn from(value: crate::io_ring::ops::MissingField) -> Self {
-        Error::MissingField { field: value.field }
+        // Destructured rather than read field-by-field so that *widening* the
+        // source is E0027 here. `value.field` would keep compiling if
+        // `MissingField` grew a second field, and would silently carry half of
+        // it -- a payload loss that typechecks, returns the right variant, and
+        // passes any test that only asks which variant came out.
+        let crate::io_ring::ops::MissingField { field } = value;
+        Error::MissingField { field }
     }
 }
 
@@ -179,6 +185,15 @@ impl From<windows::core::HRESULT> for Error {
 }
 
 impl From<crate::runtime::error::Error> for Error {
+    // Two doors, both shut by the compiler rather than by review.
+    //
+    // A *new* `runtime::Error` variant is E0004 here, because every variant is
+    // named and none is caught by a wildcard. Writing that wildcard is the
+    // obvious way to make E0004 go away, and it would silently route a
+    // condition this surface *can* produce into the driver-only sink -- so the
+    // lint below makes the wildcard itself an error. A comment forbidding it
+    // was the previous guard; a comment is not a guard.
+    #[deny(clippy::wildcard_enum_match_arm)]
     /// Narrows a driver error onto the pipe surface.
     ///
     /// This is the direction the design exists for: all four pipe conditions are

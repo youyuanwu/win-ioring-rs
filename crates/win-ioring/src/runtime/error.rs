@@ -213,7 +213,13 @@ impl From<crate::io_ring::ops::MissingField> for Error {
     /// their own single-condition type; this surface reports the same condition
     /// alongside everything else it can produce.
     fn from(value: crate::io_ring::ops::MissingField) -> Self {
-        Error::MissingField { field: value.field }
+        // Destructured rather than read field-by-field so that *widening* the
+        // source is E0027 here. `value.field` would keep compiling if
+        // `MissingField` grew a second field, and would silently carry half of
+        // it -- a payload loss that typechecks, returns the right variant, and
+        // passes any test that only asks which variant came out.
+        let crate::io_ring::ops::MissingField { field } = value;
+        Error::MissingField { field }
     }
 }
 

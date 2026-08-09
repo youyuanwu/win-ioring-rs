@@ -702,3 +702,303 @@ mod classification {
 }
 
 pub(crate) use classification::{ConditionView, canonical, view};
+
+#[cfg(test)]
+mod conversion_tests {
+    //! One test per conversion the design declares (Spec §3.4).
+    //!
+    //! Six types replaced one, and the seams between them are `From` impls.
+    //! Those are the joints the whole split turns on: a caller who gets a
+    //! `file::Error` from a buffer fault, or a `pipe::Error` from a builder, is
+    //! reading something that crossed one of these.
+    //!
+    //! Every assertion here checks the **payload**, not merely the variant.
+    //! Matching `Error::Buf(_)` would pass against a conversion that threw the
+    //! numbers away and substituted zeroes; matching the numbers will not. A
+    //! conversion that loses its payload still typechecks, still returns the
+    //! right variant, and degrades the error to "something went wrong" — so
+    //! variant-only assertions would pin the shape and miss the content.
+    //!
+    //! **These live in the crate rather than in `win-ioring-tests` because
+    //! every error enum here is `#[non_exhaustive]`**, which makes its variants
+    //! unconstructible from outside. That is deliberate and worth keeping, but
+    //! it means a conversion test cannot be written as an integration test at
+    //! all: there is no way to build the input. Discovered by trying.
+    //!
+    //! The rows fall into two families:
+    //!
+    //! - **Wrapping** (rows 1–3): `io_ring::Error`, `buf::Error` and
+    //!   `ops::MissingField` are carried into the surface types whole. Nothing
+    //!   can go stale, because adding a variant to the source needs no edit at
+    //!   the destination.
+    //! - **Viewing** (rows 4–6): `runtime::Error` into the two boundary types,
+    //!   and a condition into every view. These *are* per-variant, and are the
+    //!   ones a new variant can leave behind — which is why the mechanism makes
+    //!   that a compile error rather than something a test must notice.
+
+    use crate::buf::error::Error as BufError;
+    use crate::file::error::Error as FileError;
+    use crate::io_ring::error::Error as RingError;
+    use crate::io_ring::ops::MissingField;
+    use crate::pipe::error::Error as PipeError;
+    use crate::runtime::error::Error as RuntimeError;
+
+    /// A code no surface in this crate names, so every view must demote it.
+    ///
+    /// `E_UNEXPECTED` is not plausibly reachable from any I/O path, so a view
+    /// that grows a name for it later has done something wrong.
+    const UNNAMEABLE: windows::core::HRESULT = windows::core::HRESULT(0x8000_FFFFu32 as i32);
+
+    /// A code the pipe surface names and the file surface does not.
+    ///
+    /// This asymmetry is what the design is built on, so it is worth a name.
+    const PIPE_BROKEN: windows::core::HRESULT = windows::core::HRESULT(0x8007_006Du32 as i32);
+
+    // -- Row 1: `io_ring::Error` into the three surfaces reporting ring faults.
+
+    #[test]
+    fn a_ring_fault_reaches_every_surface_with_its_own_identity_intact() {
+        // `UnsupportedOp` rather than `QueueFull`: it carries data. A
+        // conversion that substituted a default would be invisible against a
+        // fieldless variant, and a lost payload is this row's only real risk.
+        let source = || RingError::UnsupportedOp { op: 4242 };
+
+        let into_runtime: RuntimeError = source().into();
+        assert!(
+            matches!(
+                into_runtime,
+                RuntimeError::Ring(RingError::UnsupportedOp { op: 4242 })
+            ),
+            "got {into_runtime:?}"
+        );
+
+        let into_file: FileError = source().into();
+        assert!(
+            matches!(
+                into_file,
+                FileError::Ring(RingError::UnsupportedOp { op: 4242 })
+            ),
+            "got {into_file:?}"
+        );
+
+        let into_pipe: PipeError = source().into();
+        assert!(
+            matches!(
+                into_pipe,
+                PipeError::Ring(RingError::UnsupportedOp { op: 4242 })
+            ),
+            "got {into_pipe:?}"
+        );
+    }
+
+    // -- Row 2: `buf::Error` into the surfaces that can fault on a buffer.
+    //
+    // Spec §3.4 lists this row as reaching `file::Error` and `pipe::Error`. It
+    // also reaches `runtime::Error` (`runtime/error.rs:203`), which the table
+    // omits; the third conversion is exercised here so the omission cannot
+    // quietly become a gap.
+
+    #[test]
+    fn a_buffer_fault_reaches_every_surface_carrying_the_counts_that_explain_it() {
+        let source = || BufError::TooSmall {
+            requested: 9_001,
+            available: 17,
+        };
+
+        let into_file: FileError = source().into();
+        assert!(
+            matches!(
+                into_file,
+                FileError::Buf(BufError::TooSmall {
+                    requested: 9_001,
+                    available: 17
+                })
+            ),
+            "got {into_file:?}"
+        );
+
+        let into_pipe: PipeError = source().into();
+        assert!(
+            matches!(
+                into_pipe,
+                PipeError::Buf(BufError::TooSmall {
+                    requested: 9_001,
+                    available: 17
+                })
+            ),
+            "got {into_pipe:?}"
+        );
+
+        let into_runtime: RuntimeError = source().into();
+        assert!(
+            matches!(
+                into_runtime,
+                RuntimeError::Buf(BufError::TooSmall {
+                    requested: 9_001,
+                    available: 17
+                })
+            ),
+            "got {into_runtime:?}"
+        );
+
+        // The other variant too: one variant passing says nothing about a
+        // conversion that treats the two differently.
+        let uninitialized: FileError = BufError::UninitializedWriteRange {
+            requested: 64,
+            initialized: 8,
+        }
+        .into();
+        assert!(
+            matches!(
+                uninitialized,
+                FileError::Buf(BufError::UninitializedWriteRange {
+                    requested: 64,
+                    initialized: 8
+                })
+            ),
+            "got {uninitialized:?}"
+        );
+    }
+
+    // -- Row 3: `ops::MissingField` into the three surfaces that build ops.
+
+    #[test]
+    fn a_builder_fault_reaches_every_surface_still_naming_the_field() {
+        // The field name is the entire content of this error. Dropping it
+        // leaves a caller with "a field was missing" and no way to learn which,
+        // which is worse than useless in a builder with a dozen setters.
+        let source = || MissingField {
+            field: "raw_data_address",
+        };
+
+        let into_runtime: RuntimeError = source().into();
+        assert!(
+            matches!(
+                into_runtime,
+                RuntimeError::MissingField {
+                    field: "raw_data_address"
+                }
+            ),
+            "got {into_runtime:?}"
+        );
+
+        let into_file: FileError = source().into();
+        assert!(
+            matches!(
+                into_file,
+                FileError::MissingField {
+                    field: "raw_data_address"
+                }
+            ),
+            "got {into_file:?}"
+        );
+
+        let into_pipe: PipeError = source().into();
+        assert!(
+            matches!(
+                into_pipe,
+                PipeError::MissingField {
+                    field: "raw_data_address"
+                }
+            ),
+            "got {into_pipe:?}"
+        );
+    }
+
+    // -- Rows 4 and 5: `runtime::Error` into the two boundary types.
+
+    #[test]
+    fn the_runtime_error_a_file_can_name_arrives_named_and_the_rest_are_carried() {
+        let named: FileError = RuntimeError::TooManyOperations.into();
+        assert!(
+            matches!(named, FileError::TooManyOperations),
+            "got {named:?}"
+        );
+
+        // A driver-only condition has nowhere to land on a file, and must not
+        // be invented into an `HRESULT` it never had. It is carried whole
+        // instead, which is what the `Driver` variant exists for.
+        let driver_only: FileError = RuntimeError::RegistrationPending.into();
+        assert!(
+            matches!(&driver_only, FileError::Driver(inner)
+                if matches!(**inner, RuntimeError::RegistrationPending)),
+            "a driver-only condition must be carried, not flattened: got {driver_only:?}"
+        );
+    }
+
+    #[test]
+    fn the_runtime_error_a_pipe_can_name_arrives_named_and_the_rest_are_carried() {
+        let named: PipeError = RuntimeError::TooManyOperations.into();
+        assert!(
+            matches!(named, PipeError::TooManyOperations),
+            "got {named:?}"
+        );
+
+        let driver_only: PipeError = RuntimeError::RegistrationPending.into();
+        assert!(
+            matches!(&driver_only, PipeError::Driver(inner)
+                if matches!(**inner, RuntimeError::RegistrationPending)),
+            "a driver-only condition must be carried, not flattened: got {driver_only:?}"
+        );
+    }
+
+    // -- Row 6: a condition into every view, reached publicly through
+    //    `From<HRESULT>`, which classifies and then dispatches.
+
+    #[test]
+    fn one_code_reaches_every_view_and_each_answers_with_what_it_can_say() {
+        let pipe_view: PipeError = PIPE_BROKEN.into();
+        assert!(matches!(pipe_view, PipeError::Broken), "got {pipe_view:?}");
+
+        // A file surface cannot name it, so it demotes — keeping the code,
+        // which is the property the recovery path then relies on.
+        let file_view: FileError = PIPE_BROKEN.into();
+        match &file_view {
+            FileError::Other(e) => assert_eq!(
+                e.code(),
+                PIPE_BROKEN,
+                "a demoted condition must keep the code it came in with, or nothing \
+                 downstream can recover it"
+            ),
+            other => panic!("a file cannot name a broken pipe, so it must demote: got {other:?}"),
+        }
+
+        // The runtime names it too — it is what reaps the completion.
+        let runtime_view: RuntimeError = PIPE_BROKEN.into();
+        assert!(
+            matches!(runtime_view, RuntimeError::PipeBroken),
+            "got {runtime_view:?}"
+        );
+    }
+
+    #[test]
+    fn a_code_no_view_names_demotes_everywhere_rather_than_being_forced_into_a_variant() {
+        // `Other` is what makes the per-API split affordable: a surface lists
+        // what it can produce and everything else falls through *carrying its
+        // code*. If any view invented a name for an arbitrary code, the
+        // fall-through would be lossy and the recovery path unsound.
+        let from_file = match FileError::from(UNNAMEABLE) {
+            FileError::Other(e) => e.code(),
+            other => panic!("file must demote an unknown code: got {other:?}"),
+        };
+        let from_pipe = match PipeError::from(UNNAMEABLE) {
+            PipeError::Other(e) => e.code(),
+            other => panic!("pipe must demote an unknown code: got {other:?}"),
+        };
+        let from_runtime = match RuntimeError::from(UNNAMEABLE) {
+            RuntimeError::Other(e) => e.code(),
+            other => panic!("runtime must demote an unknown code: got {other:?}"),
+        };
+
+        for (label, code) in [
+            ("file", from_file),
+            ("pipe", from_pipe),
+            ("runtime", from_runtime),
+        ] {
+            assert_eq!(
+                code, UNNAMEABLE,
+                "{label} dropped the code it could not name, leaving nothing to recover"
+            );
+        }
+    }
+}
