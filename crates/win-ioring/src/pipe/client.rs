@@ -170,6 +170,31 @@ impl Client {
     }
 
     /// The underlying file, for reads, writes and flushes through the ring.
+    ///
+    /// # What this replaces
+    ///
+    /// This type used to `Deref` to [`File`] and to offer `into_file`. Both are
+    /// gone, because a pipe's reads and writes are not a file's: they fail in
+    /// ways a file cannot ([`Error::Broken`], [`Error::NoPeer`]) and they now
+    /// report [`Error`] rather than [`file::Error`](crate::file::Error).
+    ///
+    /// - For pipe I/O, use [`Client::read_at`] and [`Client::write_at`], which
+    ///   return this module's error type. Under `Deref` these calls silently
+    ///   resolved to [`File`]'s and handed back a file's error for a pipe's
+    ///   failure.
+    /// - For the deliberate case where a pipe is *wanted* as a byte stream --
+    ///   passing it to code that takes a [`File`] and does not care what is
+    ///   behind it -- this method still gives you one. What it gives you is a
+    ///   `&File`, and that is the difference that matters: [`File::read`] and
+    ///   [`File::write`] take `&mut self`, so a borrow cannot reach the
+    ///   *sequential* methods. Those track a cursor, a pipe has no seekable
+    ///   position, and the result was
+    ///   [`file::Error::NotSeekable`](crate::file::Error::NotSeekable) -- a file
+    ///   condition with no pipe counterpart, reached only because `into_file`
+    ///   handed out ownership. Removing it is what closes that route.
+    ///
+    /// A caller who genuinely needs an owned [`File`] should open the path as a
+    /// file rather than open it as a pipe and discard the distinction.
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -210,22 +235,6 @@ impl Client {
         offset: u64,
     ) -> PipeWrite<B> {
         PipeWrite::issue(handle, &self.file, buffer, len, offset)
-    }
-
-    /// Consumes the client and returns the file it wraps.
-    ///
-    /// The pipe stays open; only this wrapper goes away. Useful when the pipe's
-    /// identity as a pipe stops mattering and it is just a byte stream.
-    pub fn into_file(self) -> File {
-        self.file
-    }
-}
-
-impl std::ops::Deref for Client {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.file
     }
 }
 
