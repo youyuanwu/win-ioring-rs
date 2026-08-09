@@ -1,38 +1,51 @@
-//! Error types for the crate.
+//! The crate's one classification table, and the views over it.
 //!
-//! Almost every fallible operation in this crate reports failures through
-//! [`Error`], a closed enum whose variants callers can match on directly rather
-//! than inspecting `HRESULT` values. The underlying platform error is preserved
-//! in [`Error::Os`] whenever one is available.
+//! This module owns the single mapping from an `HRESULT` to a condition. It
+//! exposes no error type of its own: each public surface has its own, naming
+//! only the conditions that surface can produce, with everything else carried
+//! verbatim in that type's `Other` variant.
 //!
-//! The exception is the operation builders in [`crate::io_ring::ops`], whose
-//! `build` methods return [`MissingField`](crate::io_ring::ops::MissingField)
-//! because their failure set is closed without consulting the platform. That is
-//! the only surface in the crate narrow enough to carve;
-//! `docs/errors-and-the-funnel.md` records why the rest do not partition by API.
+//! | Surface | Type |
+//! |---|---|
+//! | buffers | [`crate::buf::Error`] |
+//! | ring construction | [`crate::io_ring::BuildError`] |
+//! | ring operations | [`crate::io_ring::Error`] |
+//! | driver | [`crate::runtime::Error`] |
+//! | files | [`crate::file::Error`] |
+//! | pipes | [`crate::pipe::Error`] |
+//!
+//! The point of the arrangement is that the classification happens **once**,
+//! here, and each type is a *view* over the result rather than an independent
+//! classifier. Two surfaces cannot disagree about what `ERROR_PIPE_BUSY` means,
+//! because neither of them decides.
+//!
+//! A condition one surface names and another does not is demoted through the
+//! module's canonical inverse, which attaches the code the table would have classified. So a
+//! pipe condition that passes through a file error survives as
+//! `Other(ERROR_BROKEN_PIPE)` and a pipe surface handed the same error recovers
+//! `Broken`. Nothing is invented and nothing is lost.
+//!
+//! The operation builders in [`crate::io_ring::ops`] are the one surface that
+//! does not consult the platform at all: their `build` methods return
+//! [`MissingField`](crate::io_ring::ops::MissingField), whose failure set is
+//! closed by construction. `docs/errors-and-the-funnel.md` records how this
+//! design relates to the funnel argument that preceded it.
 //!
 //! # Platform availability
 //!
 //! This crate binds the Windows IoRing API through statically imported symbols
 //! from `api-ms-win-core-ioring-l1-1-0.dll`. A host that lacks that API set
 //! entirely cannot report an error here, because the process fails to load
-//! before any code in this crate runs. [`Error::Unsupported`] and
-//! [`Error::UnsupportedFeature`] therefore describe hosts where the API set
-//! loads but does not provide what this crate needs.
-
-use std::fmt;
-
-use windows::Win32::Storage::FileSystem::IORING_VERSION;
-
-/// The result type used throughout this crate.
-pub type Result<T> = std::result::Result<T, Error>;
+//! before any code in this crate runs. [`crate::io_ring::BuildError::Unsupported`]
+//! and [`crate::io_ring::BuildError::UnsupportedFeature`] therefore describe
+//! hosts where the API set loads but does not provide what this crate needs.
 
 /// The classification table and the views over it.
 ///
 /// [Condition] and [classify] are private to this module and are not
 /// re-exported. That is the point: a second match on a condition is not
 /// forbidden elsewhere in the crate, it is **unrepresentable**, because no other
-/// module can name the type. The only way out is [iew], which classifies and
+/// module can name the type. The only way out is [`view`], which classifies and
 /// dispatches in one step.
 ///
 /// This replaces a source-scanning test that tried to recognise every match on a
@@ -135,6 +148,56 @@ mod classification {
             Condition::PipeListening
         } else {
             Condition::Other(hr)
+        }
+    }
+
+    /// One canonical code per condition the table names.
+    ///
+    /// [`classify`] is many-to-one only in its `Other` arm; each named condition
+    /// has exactly one code today. These constants are that mapping read
+    /// backwards, and `the_canonical_codes_round_trip` pins the property that
+    /// makes them safe to use: viewing a canonical code routes to the method
+    /// named for its condition.
+    ///
+    /// They exist so a conversion between two surface types can demote a
+    /// condition the destination does not name **with a real code attached**,
+    /// which is what lets a third surface recover it. Without them a conversion
+    /// would have to either invent a code or drop the condition, and both defeat
+    /// the design.
+    pub(crate) mod canonical {
+        use windows::Win32::Foundation::{
+            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            IORING_E_SUBMISSION_QUEUE_FULL,
+        };
+        use windows::core::HRESULT;
+
+        /// The canonical code for a full submission queue.
+        ///
+        /// Unused by todays conversions -- no surface demotes `QueueFull`,
+        /// because every surface that can see it names it. Kept so the inverse
+        /// is complete: a partial inverse is the kind of thing someone later
+        /// completes wrongly.
+        #[allow(dead_code)]
+        pub(crate) const QUEUE_FULL: HRESULT = IORING_E_SUBMISSION_QUEUE_FULL;
+
+        /// The canonical code for "all pipe instances are busy".
+        pub(crate) fn pipe_busy() -> HRESULT {
+            ERROR_PIPE_BUSY.to_hresult()
+        }
+
+        /// The canonical code for "the peer closed its end".
+        pub(crate) fn pipe_broken() -> HRESULT {
+            ERROR_BROKEN_PIPE.to_hresult()
+        }
+
+        /// The canonical code for "no peer is connected".
+        pub(crate) fn pipe_no_peer() -> HRESULT {
+            ERROR_NO_DATA.to_hresult()
+        }
+
+        /// The canonical code for "listening, not yet connected".
+        pub(crate) fn pipe_listening() -> HRESULT {
+            ERROR_PIPE_LISTENING.to_hresult()
         }
     }
 
@@ -257,754 +320,261 @@ mod classification {
             Condition::Other(_) => V::other(hr),
         }
     }
-}
 
-pub(crate) use classification::{ConditionView, view};
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-/// An error produced by this crate.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum Error {
-    /// IoRing is present on this host but is not usable by this crate.
-    ///
-    /// See the [module documentation](self) for why a host with no IoRing
-    /// support at all cannot produce this error.
-    Unsupported,
+        /// A code the table does not name must arrive as `Other`, carrying that
+        /// exact code.
+        ///
+        /// This is the property the `Other` variant exists for. Asserting the code
+        /// survives, rather than merely that `Other` was produced, is what makes it
+        /// a guarantee instead of a catch-all.
+        #[test]
+        fn an_unnamed_code_is_carried_verbatim() {
+            let os = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+            let condition = classify(os.code());
+            assert!(matches!(condition, Condition::Other(_)));
 
-    /// The requested ring version is not supported by this host.
-    UnsupportedVersion {
-        /// The version that was requested.
-        requested: i32,
-        /// The highest version the host reports supporting.
-        max_supported: i32,
-    },
-
-    /// The host does not report a ring feature this crate requires.
-    UnsupportedFeature {
-        /// The feature flag bits that were required but not reported.
-        required: i32,
-        /// The feature flag bits the host actually reports.
-        available: i32,
-    },
-
-    /// The host does not support the requested operation.
-    UnsupportedOp {
-        /// The operation code that is unsupported.
-        op: i32,
-    },
-
-    /// The submission queue has no room for another entry.
-    QueueFull,
-
-    /// A registered buffer or handle index does not refer to a live
-    /// registration.
-    InvalidRegisteredIndex {
-        /// The index that was supplied.
-        index: u32,
-    },
-
-    /// The supplied buffer is too small for the requested transfer.
-    BufferTooSmall {
-        /// The number of bytes the operation requested.
-        requested: u64,
-        /// The number of bytes the buffer can accommodate.
-        available: u64,
-    },
-
-    /// A write would have sourced bytes the caller has not initialized.
-    ///
-    /// Sending uninitialized memory to the kernel is never permitted, so the
-    /// operation is rejected before submission.
-    UninitializedWriteRange {
-        /// The number of bytes the write requested.
-        requested: u64,
-        /// The number of initialized bytes available to read from.
-        initialized: u64,
-    },
-
-    /// A registered buffer reference names a range outside its registration.
-    RegisteredRangeOutOfBounds {
-        /// The registered buffer index.
-        index: u32,
-        /// The offset within the registered buffer.
-        offset: u64,
-        /// The length requested from that offset.
-        length: u64,
-        /// The extent available for this operation.
-        extent: u64,
-    },
-
-    /// A registered buffer is already checked out.
-    ///
-    /// Only one handle to a given registered buffer may exist at a time, so
-    /// that an operation in flight and the application can never reach the same
-    /// bytes at once. A buffer held by an operation returns when that operation
-    /// reports, which may be later than the point its future was dropped.
-    BufferCheckedOut {
-        /// The index that is already checked out.
-        index: u32,
-    },
-
-    /// The registration this collection came from has been superseded.
-    ///
-    /// Its buffers remain valid for as long as any handle holds them, but the
-    /// collection no longer yields new ones: the indices it names belong to a
-    /// registration the platform is no longer resolving against.
-    RegistrationSuperseded,
-
-    /// A registration request is in flight, so no handle may be checked out.
-    ///
-    /// A registration is adopted when it completes rather than when it is
-    /// requested. A handle taken in between would name a set about to be
-    /// superseded, so checkout is refused for the duration.
-    RegistrationPending,
-
-    /// The driver is shutting down and is not accepting new operations.
-    ShuttingDown,
-
-    /// The operation was ended by shutdown before the platform ever ran it.
-    ///
-    /// Distinct from a natural I/O failure and from a cancellation: nothing was
-    /// attempted. It arises when teardown resolves an operation itself, rather
-    /// than waiting for a completion that is never coming — because the queue
-    /// entry was never accepted by the platform despite repeated attempts, and
-    /// closing the ring discards it. The caller's buffer is returned.
-    AbandonedAtShutdown,
-
-    /// Shutdown is taking an unusual amount of time to drain.
-    ///
-    /// Reported, throttled, while operations remain outstanding. Draining is
-    /// unbounded by design — it never abandons memory — so a shutdown blocked on
-    /// an operation that neither completes nor responds to cancellation would
-    /// otherwise be indistinguishable from a hang. Informational: the drain is
-    /// still making attempts.
-    ShutdownStalled {
-        /// How many operations are still outstanding.
-        outstanding: usize,
-    },
-
-    /// A sequential operation is already outstanding on this file.
-    ///
-    /// Sequential file operations are serialized because they share a cursor. A
-    /// previous sequential operation has not yet reached terminal completion,
-    /// which can happen when its future was dropped while the operation was
-    /// still in flight.
-    OperationOutstanding,
-
-    /// The sequential API was used on a handle that has no file offset.
-    ///
-    /// [`File::read`](crate::file::File::read) and
-    /// [`File::write`](crate::file::File::write) supply the file offset
-    /// themselves, from a cursor they advance. That contract is meaningless on a
-    /// pipe or a character device: the platform ignores the offset and consumes
-    /// from the head of the stream, so every operation after the first *would*
-    /// return success paired with bytes that did not come from where the cursor
-    /// says. This error is what prevents that, and it is the reason the crate
-    /// refuses rather than describing the hazard in a doc comment.
-    ///
-    /// The positional API is unaffected:
-    /// [`Handle::read`](crate::runtime::Handle::read) and
-    /// [`Handle::write`](crate::runtime::Handle::write) take an explicit offset
-    /// and continue to work on these handles. The platform ignores that offset
-    /// too, but the caller supplied it knowingly, and the crate's own pipe types
-    /// depend on that path to move bytes.
-    ///
-    /// The refusal is *fail-open*: a handle whose type the platform reports as
-    /// unknown is permitted, on the grounds that a kind nobody anticipated should
-    /// be left exactly where it is today rather than newly broken.
-    NoFileOffset {
-        /// The platform's handle-type code, as reported by `GetFileType`.
-        file_type: u32,
-    },
-
-    /// The ring has been closed and can no longer be used.
-    ///
-    /// The platform does not reliably reject a closed ring handle — passing one
-    /// to `PopIoRingCompletion` faults rather than returning an error — so this
-    /// crate refuses the call itself.
-    RingClosed,
-
-    /// A required field was not supplied when building an operation.
-    MissingField {
-        /// The name of the field that was not set.
-        field: &'static str,
-    },
-
-    /// An error reported by the operating system.
-    Os(windows::core::Error),
-
-    /// No pipe instance was available to connect to.
-    ///
-    /// Every instance the server created is already serving a client. The
-    /// condition is transient by nature: a client that retries after a peer
-    /// disconnects may succeed against the same server.
-    PipeBusy,
-
-    /// The peer closed its end of the pipe.
-    ///
-    /// Distinct from a zero-byte read. A pipe reports the peer's departure as
-    /// an error rather than as end-of-file, so treating this as "no more data"
-    /// would silently conflate a completed exchange with a truncated one.
-    PipeBroken,
-
-    /// The pipe is connected in the caller's own view but has no peer.
-    ///
-    /// Reported when a server writes to an instance the client has disconnected
-    /// from, or reads from one that was never connected. Separate from
-    /// [`Error::PipeBroken`] because the platform separates them, and folding
-    /// them together would lose the distinction between "the peer left" and
-    /// "there has not been one".
-    PipeNoPeer,
-
-    /// The pipe instance is still waiting for a client.
-    ///
-    /// A read or a write issued against a listening instance fails with this
-    /// rather than blocking. It means an accept has not completed, not that the
-    /// pipe is broken, so the remedy is to accept first rather than to reopen.
-    PipeListening,
-
-    /// An accept is already outstanding on this server.
-    ///
-    /// One instance can host one pending accept. This is refused rather than
-    /// queued because the alternative — two futures both waiting on the same
-    /// `OVERLAPPED` — has no sound completion story.
-    AcceptOutstanding,
-}
-
-impl Error {
-    /// Returns the underlying platform error, if this error wraps one.
-    pub fn as_os_error(&self) -> Option<&windows::core::Error> {
-        match self {
-            Error::Os(e) => Some(e),
-            _ => None,
-        }
-    }
-
-    /// Classifies a platform `HRESULT` into a crate error.
-    ///
-    /// This is [`classify`] followed by this type's view over the result, kept
-    /// as one call because it is what most call sites want. The classification
-    /// rules — exact codes, no ranges, and why `ERROR_PIPE_CONNECTED` is absent
-    /// — live on [`classify`], which is their single home.
-    ///
-    /// Only codes whose meaning is fully determined by the code itself are
-    /// reclassified. Version and feature failures are deliberately *not*
-    /// mapped here: their variants carry context — what was requested versus
-    /// what the host offers — that a bare `HRESULT` cannot supply, and
-    /// fabricating zeroed context would be worse than reporting the platform
-    /// error verbatim. Those variants are produced at the call sites that know
-    /// the context, such as [`IoRingBuilder::build`](crate::io_ring::IoRingBuilder::build).
-    pub(crate) fn from_hresult(hr: windows::core::HRESULT) -> Self {
-        view(hr)
-    }
-
-    /// Classifies a platform error produced while creating a ring.
-    ///
-    /// `E_NOTIMPL` is the signal that a host which can load this crate's
-    /// imports nonetheless cannot provide a ring. Argument errors such as
-    /// `E_INVALIDARG` are deliberately *not* folded into
-    /// [`Error::Unsupported`], because they usually indicate a bad queue size
-    /// rather than a platform limitation.
-    pub(crate) fn from_create_failure(err: windows::core::Error) -> Self {
-        use windows::Win32::Foundation::E_NOTIMPL;
-        if err.code() == E_NOTIMPL {
-            Error::Unsupported
-        } else {
-            Error::from_hresult(err.code())
-        }
-    }
-
-    /// Builds an [`Error::UnsupportedVersion`] from platform version values.
-    pub(crate) fn unsupported_version(requested: IORING_VERSION, max: IORING_VERSION) -> Self {
-        Error::UnsupportedVersion {
-            requested: requested.0,
-            max_supported: max.0,
-        }
-    }
-}
-
-/// The crate-wide error's view over [`Condition`].
-///
-/// This is the first of the views described on [`view_convention`]. It names
-/// every condition the table can report, so `other` is reached only by codes
-/// the table itself did not classify.
-impl ConditionView for Error {
-    fn queue_full(_hr: windows::core::HRESULT) -> Self {
-        Error::QueueFull
-    }
-
-    fn pipe_busy(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeBusy
-    }
-
-    fn pipe_broken(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeBroken
-    }
-
-    fn pipe_no_peer(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeNoPeer
-    }
-
-    fn pipe_listening(_hr: windows::core::HRESULT) -> Self {
-        Error::PipeListening
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        Error::Os(windows::core::Error::from(hr))
-    }
-}
-
-impl From<windows::core::HRESULT> for Error {
-    fn from(value: windows::core::HRESULT) -> Self {
-        Error::from_hresult(value)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Unsupported => {
-                write!(f, "IoRing is not usable on this host")
-            }
-            Error::UnsupportedVersion {
-                requested,
-                max_supported,
-            } => write!(
-                f,
-                "IoRing version {requested} is not supported; this host supports up to {max_supported}"
-            ),
-            Error::UnsupportedFeature {
-                required,
-                available,
-            } => write!(
-                f,
-                "IoRing feature flags {required:#x} are required but this host reports {available:#x}"
-            ),
-            Error::UnsupportedOp { op } => {
-                write!(f, "IoRing operation {op} is not supported on this host")
-            }
-            Error::QueueFull => write!(f, "the submission queue is full"),
-            Error::InvalidRegisteredIndex { index } => {
-                write!(
-                    f,
-                    "registered index {index} does not refer to a registration"
-                )
-            }
-            Error::BufferTooSmall {
-                requested,
-                available,
-            } => write!(
-                f,
-                "buffer too small: {requested} bytes requested but only {available} available"
-            ),
-            Error::UninitializedWriteRange {
-                requested,
-                initialized,
-            } => write!(
-                f,
-                "write of {requested} bytes would read past {initialized} initialized bytes"
-            ),
-            Error::RegisteredRangeOutOfBounds {
-                index,
-                offset,
-                length,
-                extent,
-            } => write!(
-                f,
-                "registered buffer {index} range {offset}..{} exceeds its extent of {extent}",
-                offset.saturating_add(*length)
-            ),
-            Error::BufferCheckedOut { index } => {
-                write!(f, "registered buffer {index} is already checked out")
-            }
-            Error::RegistrationSuperseded => write!(
-                f,
-                "the registration this collection came from has been superseded"
-            ),
-            Error::RegistrationPending => write!(
-                f,
-                "a registration request is in flight, so no buffer may be checked out"
-            ),
-            Error::ShuttingDown => write!(f, "the driver is shutting down"),
-            Error::AbandonedAtShutdown => write!(
-                f,
-                "the operation was abandoned at shutdown before the platform ran it"
-            ),
-            Error::ShutdownStalled { outstanding } => write!(
-                f,
-                "shutdown is still draining, with {outstanding} operation(s) outstanding"
-            ),
-            Error::OperationOutstanding => {
-                write!(
-                    f,
-                    "a sequential operation is already outstanding on this file"
-                )
-            }
-            Error::NoFileOffset { file_type } => write!(
-                f,
-                "the sequential API needs a file offset, and this handle has \
-                 none (GetFileType reported {file_type}); use the positional \
-                 read/write instead"
-            ),
-            Error::RingClosed => write!(f, "the ring has been closed"),
-            Error::MissingField { field } => {
-                write!(f, "required field `{field}` was not set")
-            }
-            Error::Os(e) => write!(f, "{e}"),
-            Error::PipeBusy => write!(f, "every pipe instance is already serving a client"),
-            Error::PipeBroken => write!(f, "the peer closed its end of the pipe"),
-            Error::PipeNoPeer => write!(f, "the pipe has no peer connected"),
-            Error::PipeListening => {
-                write!(f, "the pipe instance is still waiting for a client")
-            }
-            Error::AcceptOutstanding => {
-                write!(f, "an accept is already outstanding on this server")
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Os(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<crate::io_ring::ops::MissingField> for Error {
-    /// Widens a builder's missing-field report into the crate-wide error.
-    ///
-    /// The same condition lives in both types on purpose. The operation
-    /// builders can fail in exactly one way, so they say so
-    /// ([`MissingField`](crate::io_ring::ops::MissingField)); the driver's
-    /// registration entry points report a missing field too but sit on the data
-    /// path, where every other variant is also reachable. This conversion keeps
-    /// `?` working across that seam rather than forcing the narrow type to widen
-    /// at each call site.
-    fn from(value: crate::io_ring::ops::MissingField) -> Self {
-        Error::MissingField { field: value.field }
-    }
-}
-
-impl From<windows::core::Error> for Error {
-    fn from(value: windows::core::Error) -> Self {
-        Error::from_hresult(value.code())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn os_errors_round_trip() {
-        let os = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
-        let err = Error::from(os.clone());
-        assert!(matches!(err, Error::Os(_)));
-        assert_eq!(err.as_os_error().map(|e| e.code()), Some(os.code()));
-    }
-
-    /// Each pipe condition FR-010 names must be reachable as its own variant.
-    ///
-    /// Callers distinguish these by pattern. Two conditions sharing a variant
-    /// would be indistinguishable without parsing a rendered string, and the
-    /// pairs below are the ones most likely to be conflated by a well-meaning
-    /// simplification: busy is transient and worth retrying while listening is
-    /// not, and broken means the peer left while no-peer means there has not
-    /// been one.
-    #[test]
-    fn each_pipe_condition_maps_to_its_own_variant() {
-        use windows::Win32::Foundation::{
-            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
-        };
-
-        let cases = [
-            (ERROR_PIPE_BUSY, Error::PipeBusy),
-            (ERROR_BROKEN_PIPE, Error::PipeBroken),
-            (ERROR_NO_DATA, Error::PipeNoPeer),
-            (ERROR_PIPE_LISTENING, Error::PipeListening),
-        ];
-
-        let mut seen: Vec<String> = Vec::new();
-        for (code, expected) in cases {
-            let got = Error::from_hresult(code.to_hresult());
-            assert_eq!(
-                std::mem::discriminant(&got),
-                std::mem::discriminant(&expected),
-                "{code:?} classified as {got:?}, expected {expected:?}"
-            );
-            let rendered = got.to_string();
-            assert!(
-                !seen.contains(&rendered),
-                "two pipe conditions render identically: {rendered:?}"
-            );
-            seen.push(rendered);
-        }
-    }
-
-    /// The classifier matches exact codes, and must leave everything else to
-    /// `Error::Os`.
-    ///
-    /// `from_hresult` is the single funnel every ring completion passes
-    /// through, so widening it from exact codes to a facility or a range would
-    /// silently reclassify file and socket errors that have nothing to do with
-    /// pipes. The two codes below are not hypothetical: they are what the
-    /// existing `Error::Os(_)` assertions in `runtime_tests.rs` actually
-    /// observe — end-of-file on a read past the end, and the refusal of a
-    /// write-through on cached I/O — measured rather than assumed, because
-    /// "the new variants cannot collide with anything" is exactly the
-    /// comfortable claim that deserves evidence.
-    #[test]
-    fn codes_outside_the_pipe_set_are_still_reported_verbatim() {
-        use windows::Win32::Foundation::{ERROR_HANDLE_EOF, WIN32_ERROR};
-
-        // 509 is what the cached-I/O write-through refusal reports.
-        for code in [ERROR_HANDLE_EOF, WIN32_ERROR(509)] {
-            let got = Error::from_hresult(code.to_hresult());
-            assert!(
-                matches!(got, Error::Os(_)),
-                "{code:?} must stay an Os error, got {got:?}"
-            );
-        }
-
-        // Adjacent to the pipe codes on both sides, to catch a range match that
-        // happened to bracket them.
-        for code in [230_u32, 233, 534, 537] {
-            let got = Error::from_hresult(WIN32_ERROR(code).to_hresult());
-            assert!(
-                matches!(got, Error::Os(_)),
-                "code {code} is not a pipe condition this crate maps, got {got:?}"
-            );
-        }
-    }
-
-    /// `ERROR_PIPE_CONNECTED` is a success for an accept, so the classifier
-    /// must not claim it.
-    ///
-    /// If this funnel turned it into a typed error, the accept path could not
-    /// tell it apart from a real failure without unwrapping the variant again —
-    /// and a client that connected between create and accept would be dropped.
-    /// That is the single easiest connection in this API to lose, and the
-    /// easiest bug to write a test that never exercises.
-    #[test]
-    fn a_client_that_connected_early_is_not_classified_as_a_failure() {
-        use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
-
-        let got = Error::from_hresult(ERROR_PIPE_CONNECTED.to_hresult());
-        assert!(
-            matches!(got, Error::Os(_)),
-            "ERROR_PIPE_CONNECTED must not be reclassified here; the accept \
-             call site converts it to success, and a typed error would hide it. \
-             Got {got:?}"
-        );
-    }
-
-    #[test]
-    fn non_os_errors_have_no_source() {
-        use std::error::Error as _;
-        assert!(Error::QueueFull.source().is_none());
-        assert!(Error::QueueFull.as_os_error().is_none());
-    }
-
-    /// Callers must be able to distinguish these conditions by pattern, never
-    /// by comparing rendered strings.
-    #[test]
-    fn unsupported_conditions_are_distinct_variants() {
-        let host = Error::Unsupported;
-        let version = Error::unsupported_version(IORING_VERSION(9999), IORING_VERSION(400));
-        let op = Error::UnsupportedOp { op: 5 };
-        let feature = Error::UnsupportedFeature {
-            required: 2,
-            available: 0,
-        };
-
-        assert!(matches!(host, Error::Unsupported));
-        assert!(matches!(
-            version,
-            Error::UnsupportedVersion {
-                requested: 9999,
-                max_supported: 400
-            }
-        ));
-        assert!(matches!(op, Error::UnsupportedOp { op: 5 }));
-        assert!(matches!(
-            feature,
-            Error::UnsupportedFeature {
-                required: 2,
-                available: 0
-            }
-        ));
-    }
-
-    #[test]
-    fn display_is_non_empty_for_every_variant() {
-        let variants = [
-            Error::Unsupported,
-            Error::unsupported_version(IORING_VERSION(1), IORING_VERSION(400)),
-            Error::UnsupportedFeature {
-                required: 2,
-                available: 0,
-            },
-            Error::UnsupportedOp { op: 6 },
-            Error::QueueFull,
-            Error::InvalidRegisteredIndex { index: 3 },
-            Error::BufferTooSmall {
-                requested: 10,
-                available: 4,
-            },
-            Error::UninitializedWriteRange {
-                requested: 10,
-                initialized: 4,
-            },
-            Error::RegisteredRangeOutOfBounds {
-                index: 0,
-                offset: 8,
-                length: 16,
-                extent: 16,
-            },
-            Error::BufferCheckedOut { index: 2 },
-            Error::RegistrationSuperseded,
-            Error::RegistrationPending,
-            Error::ShuttingDown,
-            Error::AbandonedAtShutdown,
-            Error::ShutdownStalled { outstanding: 3 },
-            Error::OperationOutstanding,
-            Error::NoFileOffset { file_type: 3 },
-            Error::RingClosed,
-            Error::MissingField { field: "handle" },
-            Error::Os(windows::core::Error::from(
-                windows::Win32::Foundation::E_FAIL,
-            )),
-            Error::PipeBusy,
-            Error::PipeBroken,
-            Error::PipeNoPeer,
-            Error::PipeListening,
-            Error::AcceptOutstanding,
-        ];
-        for v in variants {
-            assert!(!v.to_string().is_empty(), "empty Display for {v:?}");
-        }
-    }
-
-    /// Fails to compile when a variant is added, so the list above cannot
-    /// silently fall behind.
-    ///
-    /// The `Display` test builds its variants by hand, and nothing else would
-    /// notice a new one being missed.
-    fn _every_variant_is_listed_above(e: &Error) {
-        match e {
-            Error::Unsupported
-            | Error::UnsupportedVersion { .. }
-            | Error::UnsupportedFeature { .. }
-            | Error::UnsupportedOp { .. }
-            | Error::QueueFull
-            | Error::InvalidRegisteredIndex { .. }
-            | Error::BufferTooSmall { .. }
-            | Error::UninitializedWriteRange { .. }
-            | Error::RegisteredRangeOutOfBounds { .. }
-            | Error::BufferCheckedOut { .. }
-            | Error::RegistrationSuperseded
-            | Error::RegistrationPending
-            | Error::ShuttingDown
-            | Error::AbandonedAtShutdown
-            | Error::ShutdownStalled { .. }
-            | Error::OperationOutstanding
-            | Error::NoFileOffset { .. }
-            | Error::RingClosed
-            | Error::MissingField { .. }
-            | Error::Os(_)
-            | Error::PipeBusy
-            | Error::PipeBroken
-            | Error::PipeNoPeer
-            | Error::PipeListening
-            | Error::AcceptOutstanding => {}
-        }
-    }
-
-    /// SC-17: every view type carries an unrecognised code through Other
-    /// without losing it.
-    ///
-    /// This is the property the whole design rests on. A type that names only
-    /// the conditions its surface can produce is only honest if everything it
-    /// does *not* name survives intact — otherwise the split would be trading
-    /// precision at one surface for lost information at another. Asserting the
-    /// code is recoverable, not merely that some Other was produced, is the
-    /// difference between the two.
-    #[test]
-    fn every_view_carries_an_unrecognised_code_through_other() {
-        // Not in the table, and not plausibly added to it.
-        let hr = windows::core::HRESULT(0x8007_0525_u32 as i32);
-
-        macro_rules! assert_carries {
-            ($ty:ty, $pat:path) => {{
-                let e: $ty = view::<$ty>(hr);
-                match e {
-                    $pat(inner) => assert_eq!(
-                        inner.code(),
-                        hr,
-                        concat!(stringify!($ty), " lost the code it could not name")
-                    ),
-                    other => panic!(
-                        concat!(stringify!($ty), " did not demote to Other: {:?}"),
-                        other
-                    ),
+            let err: crate::runtime::error::Error = os.clone().into();
+            match err {
+                crate::runtime::error::Error::Other(recovered) => {
+                    assert_eq!(recovered.code(), os.code());
                 }
-            }};
+                other => panic!("expected Other, got {other:?}"),
+            }
         }
 
-        assert_carries!(
-            crate::io_ring::error::BuildError,
-            crate::io_ring::error::BuildError::Other
-        );
-        assert_carries!(
-            crate::io_ring::error::Error,
-            crate::io_ring::error::Error::Other
-        );
-        assert_carries!(
-            crate::runtime::error::Error,
-            crate::runtime::error::Error::Other
-        );
-        assert_carries!(crate::file::error::Error, crate::file::error::Error::Other);
-        assert_carries!(crate::pipe::error::Error, crate::pipe::error::Error::Other);
-    }
-
-    /// The four pipe conditions demote on `file::Error` **with the code
-    /// intact**, which is what makes the recovery path of §4.3 possible.
-    ///
-    /// `file::Error` deliberately does not name them. If it demoted them to a
-    /// substituted code — `E_FAIL`, say — a pipe surface handed the same error
-    /// could never recover the condition, and the split would be lossy in
-    /// exactly the way the design claims it is not. Proven here rather than
-    /// asserted, because it is a property of five hand-written methods.
-    #[test]
-    fn file_error_demotes_pipe_conditions_without_substituting_the_code() {
-        use windows::Win32::Foundation::{
-            ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
-        };
-
-        for win32 in [
-            ERROR_PIPE_BUSY,
-            ERROR_BROKEN_PIPE,
-            ERROR_NO_DATA,
-            ERROR_PIPE_LISTENING,
-        ] {
-            let hr = win32.to_hresult();
-            let demoted = view::<crate::file::error::Error>(hr);
-            let carried = match demoted {
-                crate::file::error::Error::Other(ref e) => e.code(),
-                ref other => panic!("file::Error named a pipe condition it should not: {other:?}"),
+        /// Each pipe condition the table names must be a condition of its own.
+        ///
+        /// Callers distinguish these by pattern. Two conditions sharing one
+        /// `Condition` would be indistinguishable without parsing a rendered
+        /// string, and the pairs below are the ones most likely to be conflated by
+        /// a well-meaning simplification: busy is transient and worth retrying
+        /// while listening is not, and broken means the peer left while no-peer
+        /// means there has not been one.
+        ///
+        /// Asserted at the table rather than at a view, because the table is now
+        /// the single place the distinction is made -- every view inherits it.
+        #[test]
+        fn each_pipe_condition_is_its_own_condition() {
+            use windows::Win32::Foundation::{
+                ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
             };
-            assert_eq!(carried, hr, "file::Error substituted a code for {win32:?}");
 
-            // And the code it carried re-classifies to the condition the pipe
-            // surface names, which is the round trip itself.
-            let recovered = view::<crate::pipe::error::Error>(carried);
+            let cases = [
+                (ERROR_PIPE_BUSY, Condition::PipeBusy),
+                (ERROR_BROKEN_PIPE, Condition::PipeBroken),
+                (ERROR_NO_DATA, Condition::PipeNoPeer),
+                (ERROR_PIPE_LISTENING, Condition::PipeListening),
+            ];
+
+            let mut seen: Vec<String> = Vec::new();
+            for (code, expected) in cases {
+                let got = classify(code.to_hresult());
+                assert_eq!(
+                    std::mem::discriminant(&got),
+                    std::mem::discriminant(&expected),
+                    "{code:?} classified as {got:?}, expected {expected:?}"
+                );
+                // And the surface that names all four must render them apart.
+                let rendered = view::<crate::pipe::error::Error>(code.to_hresult()).to_string();
+                assert!(
+                    !seen.contains(&rendered),
+                    "two pipe conditions render identically: {rendered:?}"
+                );
+                seen.push(rendered);
+            }
+        }
+
+        /// The classifier matches exact codes, and must leave everything else
+        /// unnamed.
+        ///
+        /// `classify` is the single table every surface reads, so widening it from
+        /// exact codes to a facility or a range would silently reclassify file and
+        /// socket errors that have nothing to do with pipes -- and now it would do
+        /// so at *six* types at once. The two codes below are not hypothetical:
+        /// they are what the existing `Other` assertions in `runtime_tests.rs`
+        /// actually observe -- end-of-file on a read past the end, and the refusal
+        /// of a write-through on cached I/O -- measured rather than assumed,
+        /// because "the new variants cannot collide with anything" is exactly the
+        /// comfortable claim that deserves evidence.
+        #[test]
+        fn codes_outside_the_pipe_set_are_still_reported_verbatim() {
+            use windows::Win32::Foundation::{ERROR_HANDLE_EOF, WIN32_ERROR};
+
+            // 509 is what the cached-I/O write-through refusal reports.
+            for code in [ERROR_HANDLE_EOF, WIN32_ERROR(509)] {
+                let got = classify(code.to_hresult());
+                assert!(
+                    matches!(got, Condition::Other(_)),
+                    "{code:?} must stay unnamed, got {got:?}"
+                );
+            }
+
+            // Adjacent to the pipe codes on both sides, to catch a range match that
+            // happened to bracket them.
+            for code in [230_u32, 233, 534, 537] {
+                let got = classify(WIN32_ERROR(code).to_hresult());
+                assert!(
+                    matches!(got, Condition::Other(_)),
+                    "code {code} is not a pipe condition this crate maps, got {got:?}"
+                );
+            }
+        }
+
+        /// `ERROR_PIPE_CONNECTED` is a success for an accept, so the table must not
+        /// claim it.
+        ///
+        /// If the table named it, the accept path could not tell it apart from a
+        /// real failure without unwrapping the condition again -- and a client that
+        /// connected between create and accept would be dropped. That is the single
+        /// easiest connection in this API to lose, and the easiest bug to write a
+        /// test that never exercises.
+        #[test]
+        fn a_client_that_connected_early_is_not_classified_as_a_failure() {
+            use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+
+            let got = classify(ERROR_PIPE_CONNECTED.to_hresult());
             assert!(
-                !matches!(recovered, crate::pipe::error::Error::Other(_)),
-                "re-classifying {win32:?} at the pipe surface did not recover a named condition"
+                matches!(got, Condition::Other(_)),
+                "ERROR_PIPE_CONNECTED must not be named here; the accept call site \
+                 converts it to success, and a named condition would hide it. \
+                 Got {got:?}"
             );
+        }
+
+        /// A condition with no platform error beneath it must report no source.
+        ///
+        /// Checked on two types because `source` is now written once per type, so
+        /// this is six opportunities to get it wrong rather than one.
+        #[test]
+        fn conditions_without_a_platform_error_have_no_source() {
+            use std::error::Error as _;
+            assert!(crate::io_ring::error::Error::QueueFull.source().is_none());
+            assert!(
+                crate::runtime::error::Error::TooManyOperations
+                    .source()
+                    .is_none()
+            );
+        }
+
+        /// The canonical inverse must land back on the condition it names.
+        ///
+        /// `canonical` exists so a surface can demote a condition it cannot name
+        /// while attaching a real code, letting a third surface recover it. That
+        /// only works if the inverse is exact: a canonical code that classified as
+        /// anything else would turn a demotion into a silent reclassification, and
+        /// the recovery path would return the wrong condition rather than fail.
+        #[test]
+        fn the_canonical_codes_round_trip() {
+            let cases: [(windows::core::HRESULT, Condition); 5] = [
+                (canonical::QUEUE_FULL, Condition::QueueFull),
+                (canonical::pipe_busy(), Condition::PipeBusy),
+                (canonical::pipe_broken(), Condition::PipeBroken),
+                (canonical::pipe_no_peer(), Condition::PipeNoPeer),
+                (canonical::pipe_listening(), Condition::PipeListening),
+            ];
+
+            for (code, expected) in cases {
+                let got = classify(code);
+                assert_eq!(
+                    std::mem::discriminant(&got),
+                    std::mem::discriminant(&expected),
+                    "canonical code {code:?} classifies as {got:?}, not {expected:?}; \
+                     the inverse and the table have diverged"
+                );
+            }
+        }
+
+        /// SC-17: every view type carries an unrecognised code through Other
+        /// without losing it.
+        ///
+        /// This is the property the whole design rests on. A type that names only
+        /// the conditions its surface can produce is only honest if everything it
+        /// does *not* name survives intact — otherwise the split would be trading
+        /// precision at one surface for lost information at another. Asserting the
+        /// code is recoverable, not merely that some Other was produced, is the
+        /// difference between the two.
+        #[test]
+        fn every_view_carries_an_unrecognised_code_through_other() {
+            // Not in the table, and not plausibly added to it.
+            let hr = windows::core::HRESULT(0x8007_0525_u32 as i32);
+
+            macro_rules! assert_carries {
+                ($ty:ty, $pat:path) => {{
+                    let e: $ty = view::<$ty>(hr);
+                    match e {
+                        $pat(inner) => assert_eq!(
+                            inner.code(),
+                            hr,
+                            concat!(stringify!($ty), " lost the code it could not name")
+                        ),
+                        other => panic!(
+                            concat!(stringify!($ty), " did not demote to Other: {:?}"),
+                            other
+                        ),
+                    }
+                }};
+            }
+
+            assert_carries!(
+                crate::io_ring::error::BuildError,
+                crate::io_ring::error::BuildError::Other
+            );
+            assert_carries!(
+                crate::io_ring::error::Error,
+                crate::io_ring::error::Error::Other
+            );
+            assert_carries!(
+                crate::runtime::error::Error,
+                crate::runtime::error::Error::Other
+            );
+            assert_carries!(crate::file::error::Error, crate::file::error::Error::Other);
+            assert_carries!(crate::pipe::error::Error, crate::pipe::error::Error::Other);
+        }
+
+        /// The four pipe conditions demote on `file::Error` **with the code
+        /// intact**, which is what makes the recovery path of §4.3 possible.
+        ///
+        /// `file::Error` deliberately does not name them. If it demoted them to a
+        /// substituted code — `E_FAIL`, say — a pipe surface handed the same error
+        /// could never recover the condition, and the split would be lossy in
+        /// exactly the way the design claims it is not. Proven here rather than
+        /// asserted, because it is a property of five hand-written methods.
+        #[test]
+        fn file_error_demotes_pipe_conditions_without_substituting_the_code() {
+            use windows::Win32::Foundation::{
+                ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
+            };
+
+            for win32 in [
+                ERROR_PIPE_BUSY,
+                ERROR_BROKEN_PIPE,
+                ERROR_NO_DATA,
+                ERROR_PIPE_LISTENING,
+            ] {
+                let hr = win32.to_hresult();
+                let demoted = view::<crate::file::error::Error>(hr);
+                let carried = match demoted {
+                    crate::file::error::Error::Other(ref e) => e.code(),
+                    ref other => {
+                        panic!("file::Error named a pipe condition it should not: {other:?}")
+                    }
+                };
+                assert_eq!(carried, hr, "file::Error substituted a code for {win32:?}");
+
+                // And the code it carried re-classifies to the condition the pipe
+                // surface names, which is the round trip itself.
+                let recovered = view::<crate::pipe::error::Error>(carried);
+                assert!(
+                    !matches!(recovered, crate::pipe::error::Error::Other(_)),
+                    "re-classifying {win32:?} at the pipe surface did not recover a named condition"
+                );
+            }
         }
     }
 }
+
+pub(crate) use classification::{ConditionView, canonical, view};

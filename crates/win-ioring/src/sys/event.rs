@@ -276,7 +276,7 @@ impl ArmedEvent {
     ///
     /// The wait re-arms itself after every callback, so this is the only
     /// registration the event will ever have.
-    pub(crate) fn new() -> crate::Result<Self> {
+    pub(crate) fn new() -> Result<Self, windows::core::Error> {
         let event = AsyncEvent::new()?;
         let shared = Arc::new(ArmedShared {
             state: Mutex::new(ArmedState {
@@ -338,7 +338,7 @@ impl ArmedEvent {
             // SAFETY: arming failed, so no callback exists to reclaim `raw`, and
             // the early return below means this happens exactly once.
             unsafe { drop(Arc::from_raw(raw)) };
-            return Err(e.into());
+            return Err(e);
         }
 
         Ok(Self {
@@ -362,8 +362,8 @@ impl ArmedEvent {
     /// so a method with only test callers would be dead code in a non-test
     /// build and the crate denies warnings.
     #[cfg(test)]
-    pub(crate) fn signal(&self) -> crate::Result<()> {
-        self.event.signal().map_err(Into::into)
+    pub(crate) fn signal(&self) -> Result<(), windows::core::Error> {
+        self.event.signal()
     }
 
     /// Resolves if a signal is outstanding, consuming it; otherwise records

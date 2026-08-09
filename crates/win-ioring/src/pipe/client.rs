@@ -1,6 +1,7 @@
 //! The client end of a named pipe.
 
 use crate::file::File;
+use crate::pipe::error::Error;
 
 /// Options for connecting to a named pipe.
 ///
@@ -12,7 +13,7 @@ use crate::file::File;
 /// use win_ioring::pipe::ClientOptions;
 ///
 /// let client = ClientOptions::new().read(true).write(true).open("demo")?;
-/// # Ok::<(), win_ioring::Error>(())
+/// # Ok::<(), win_ioring::pipe::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
@@ -61,7 +62,7 @@ impl ClientOptions {
     /// # This does not wait for an instance
     ///
     /// If the server has created instances but all of them are already serving
-    /// clients, this returns [`Error::PipeBusy`](crate::Error::PipeBusy)
+    /// clients, this returns [`Error::Busy`](crate::pipe::error::Error::Busy)
     /// immediately. It does **not** block, and there is no equivalent of Win32's
     /// `WaitNamedPipe`.
     ///
@@ -69,14 +70,15 @@ impl ClientOptions {
     /// runtime-agnostic and single-threaded; a blocking wait would stall the
     /// caller's executor, and a timed retry would need a timer this crate does
     /// not have and should not pick for the caller. Retrying on
-    /// `Error::PipeBusy` — with whatever backoff and whatever timer the caller's
+    /// `Error::Busy` — with whatever backoff and whatever timer the caller's
     /// runtime provides — is the intended pattern.
     ///
     /// If the server has not created the pipe at all, the error is
-    /// [`Error::Os`](crate::Error::Os) carrying `ERROR_FILE_NOT_FOUND`, which is
+    /// [`Error::Other`](crate::pipe::error::Error::Other) carrying
+    /// `ERROR_FILE_NOT_FOUND`, which is
     /// a different condition and deliberately not folded into `PipeBusy`: one
     /// says "come back shortly", the other says "nothing is listening here".
-    pub fn open(&self, name: impl AsRef<str>) -> crate::Result<Client> {
+    pub fn open(&self, name: impl AsRef<str>) -> Result<Client, Error> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
@@ -98,21 +100,38 @@ impl ClientOptions {
 
 /// Maps an open failure onto the crate's error type.
 ///
-/// Routes through [`Error::from_hresult`](crate::Error), which is the same
+/// Routes through the crate's single classification table, which is the same
 /// funnel every ring completion passes through, rather than repeating the code
 /// comparisons here. That matters more than it looks: `ERROR_PIPE_BUSY` from a
 /// failed open and `ERROR_PIPE_BUSY` from a completion must produce the same
 /// variant, and two independent match arms are exactly how that stops being
 /// true after someone edits one of them.
 ///
-/// An `io::Error` with no OS code cannot come from `CreateFileW`, but the type
-/// permits it, so it is reported verbatim rather than being mapped to a pipe
-/// condition it is not.
-fn classify_open_failure(e: &std::io::Error) -> crate::Error {
+/// Under the per-API split this property is now structural rather than merely
+/// observed: there is one table, and `pipe::Error` is a *view* over it, so
+/// there is no second set of arms available to edit.
+///
+/// # The one substituted code in the crate, and why it stays
+///
+/// An `io::Error` with no OS code cannot come from `CreateFileW` — the failure
+/// path builds it from `GetLastError` — but the type permits it. FR-11 forbids
+/// fabricating an `HRESULT`, and this branch does substitute one, so it is
+/// called out rather than hidden:
+///
+/// - No *condition* is fabricated. `E_FAIL` is not in the classification table,
+///   so it can only ever produce `Other`, never a named pipe condition. The
+///   hazard FR-11 exists to prevent — a made-up code being re-classified into a
+///   condition that never occurred — cannot happen here.
+/// - Nothing is lost. The original `io::Error`'s message is carried on the
+///   substituted code, so a caller still sees what actually failed.
+/// - The alternative costs a public slot on `pipe::Error` for a variant that is
+///   unreachable, which is a worse trade than one documented placeholder.
+fn classify_open_failure(e: &std::io::Error) -> Error {
     match e.raw_os_error() {
-        Some(code) => crate::Error::from_hresult(windows::core::HRESULT::from_win32(code as u32)),
-        None => crate::Error::Os(windows::core::Error::from(
+        Some(code) => Error::from(windows::core::HRESULT::from_win32(code as u32)),
+        None => Error::Other(windows::core::Error::new(
             windows::Win32::Foundation::E_FAIL,
+            format!("pipe open failed without an OS error code: {e}"),
         )),
     }
 }
@@ -143,7 +162,7 @@ impl Client {
     /// Equivalent to `ClientOptions::new().open(name)`. See
     /// [`ClientOptions::open`] for what happens when every instance is busy —
     /// this does not wait either.
-    pub fn connect(name: impl AsRef<str>) -> crate::Result<Self> {
+    pub fn connect(name: impl AsRef<str>) -> Result<Self, Error> {
         ClientOptions::new().open(name)
     }
 
@@ -261,7 +280,7 @@ mod tests {
 
         let second = Client::connect(&name);
         assert!(
-            matches!(second, Err(crate::Error::PipeBusy)),
+            matches!(second, Err(Error::Busy)),
             "a second client with no free instance must be refused as busy, \
              got {second:?}"
         );
@@ -298,12 +317,12 @@ mod tests {
         let err = Client::connect(unique("absent"))
             .expect_err("connecting to a pipe nobody created should fail");
         assert!(
-            !matches!(err, crate::Error::PipeBusy),
+            !matches!(err, Error::Busy),
             "a missing pipe must not be reported as busy — a caller would retry \
              forever. Got {err:?}"
         );
         assert!(
-            matches!(err, crate::Error::Os(_)),
+            matches!(err, Error::Other(_)),
             "expected the platform's own error for a missing pipe, got {err:?}"
         );
     }

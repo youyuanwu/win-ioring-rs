@@ -70,7 +70,7 @@
 //!   shape pairs one result with one buffer — it cannot express "here is part of
 //!   a message" as either a success or a failure without losing which it was.
 //! - **No wait-for-availability.** A [`Client`] that finds every instance busy
-//!   reports [`Error::PipeBusy`](crate::Error::PipeBusy) immediately rather than
+//!   reports [`Error::Busy`] immediately rather than
 //!   blocking, which is what a Win32 caller would get from `WaitNamedPipe`.
 //!   Retrying is the caller's to schedule, on the caller's own runtime.
 //! - **No security attributes.** Instances are created with the default
@@ -79,6 +79,11 @@
 //!   not yet accept.
 
 pub mod error;
+
+/// Re-exported so callers write `pipe::Error` rather than
+/// naming the module twice. The module stays public: a caller who wants the
+/// long form still has it.
+pub use error::Error;
 
 mod client;
 mod server;

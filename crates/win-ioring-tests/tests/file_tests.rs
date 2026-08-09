@@ -206,7 +206,7 @@ async fn a_dropped_sequential_future_blocks_then_releases_the_file() {
         let outcome = file.read(&handle, vec![0_u8; 8], 8).await;
         let err = outcome.err().expect("a second sequential read must fail");
         assert!(
-            matches!(err, win_ioring::Error::OperationOutstanding),
+            matches!(err, win_ioring::file::Error::OperationOutstanding),
             "got {err:?}"
         );
 

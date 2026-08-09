@@ -38,18 +38,64 @@ impl fmt::Display for Error {
                 available,
             } => write!(
                 f,
-                "buffer too small: {requested} bytes requested, {available} available"
+                "buffer too small: {requested} bytes requested but only {available} available"
             ),
             Error::UninitializedWriteRange {
                 requested,
                 initialized,
             } => write!(
                 f,
-                "write of {requested} bytes would send uninitialized memory: only \
-                 {initialized} bytes are initialized"
+                "write of {requested} bytes would read past {initialized} initialized bytes"
             ),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Every variant renders as something, and none renders identically to
+    /// another.
+    ///
+    /// Distinctness matters as much as non-emptiness: a caller who cannot tell
+    /// two conditions apart by pattern will reach for the rendered string, and
+    /// two variants sharing one message make that silently wrong.
+    #[test]
+    fn display_is_non_empty_and_distinct_for_every_buf_error_variant() {
+        let variants: Vec<Error> = vec![
+            Error::TooSmall {
+                requested: 10,
+                available: 4,
+            },
+            Error::UninitializedWriteRange {
+                requested: 10,
+                initialized: 4,
+            },
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for v in variants {
+            let rendered = v.to_string();
+            assert!(!rendered.is_empty(), "empty Display for {v:?}");
+            assert!(
+                !seen.contains(&rendered),
+                "two variants of Error render identically: {rendered:?}"
+            );
+            seen.push(rendered);
+        }
+    }
+
+    /// Fails to compile when a variant is added, so the list above cannot
+    /// silently fall behind.
+    ///
+    /// The list is written by hand and nothing else would notice an omission.
+    /// This lives beside the type rather than in a central suite so the error
+    /// lands in front of whoever adds the variant.
+    fn _every_buf_error_variant_is_listed_above(e: &Error) {
+        match e {
+            Error::TooSmall { .. } | Error::UninitializedWriteRange { .. } => {}
+        }
+    }
+}

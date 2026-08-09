@@ -32,6 +32,11 @@
 
 pub mod error;
 
+/// Re-exported so callers write `runtime::Error` rather than
+/// naming the module twice. The module stays public: a caller who wants the
+/// long form still has it.
+pub use error::Error;
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
@@ -41,7 +46,6 @@ use std::rc::{Rc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::buf::{BufResult, IoBuf, IoBufMut, check_read_capacity, check_write_initialized};
-use crate::error::{Error, Result};
 use crate::file::{File, FileState, SequentialGuard};
 use crate::io_ring::IoRing;
 use crate::io_ring::ops::{ReadOp, SqeFlags};
@@ -80,7 +84,7 @@ type Transferred = u32;
 ///
 /// Flush carries no caller buffer, which is why the buffer is optional rather
 /// than something every completion must produce.
-type CompletedOp = (Result<Transferred>, Option<Box<dyn Any>>);
+type CompletedOp = (Result<Transferred, Error>, Option<Box<dyn Any>>);
 
 /// Where a completed operation's result is left for its future to collect.
 ///
@@ -509,7 +513,7 @@ impl DriverInner {
         #[cfg(test)]
         if self.fail_next_submits > 0 {
             self.fail_next_submits -= 1;
-            let injected = Error::Os(windows::core::Error::from(
+            let injected = Error::Other(windows::core::Error::from(
                 windows::Win32::Foundation::E_FAIL,
             ));
             self.note_submit_failure(injected);
@@ -533,7 +537,7 @@ impl DriverInner {
                 self.cancel_abandoned();
             }
             Err(e) => {
-                self.note_submit_failure(e);
+                self.note_submit_failure(e.into());
                 // Leave `pending_submit` set. The entries are still queued and
                 // their buffers must stay retained until the kernel takes them.
             }
@@ -598,7 +602,7 @@ impl DriverInner {
         offset: u32,
         len: u32,
         for_write: bool,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let registration = self
             .buffer_registration
             .as_ref()
@@ -627,7 +631,7 @@ impl DriverInner {
     }
 
     /// Validates a registered file index.
-    fn check_registered_file(&self, index: u32) -> Result<()> {
+    fn check_registered_file(&self, index: u32) -> Result<(), Error> {
         let registration = self
             .file_registration
             .as_ref()
@@ -834,7 +838,7 @@ impl DriverInner {
                 Ok(Some(cqe)) => cqe,
                 Ok(None) => return wakers,
                 Err(e) => {
-                    self.report(e);
+                    self.report(e.into());
                     return wakers;
                 }
             };
@@ -1217,7 +1221,7 @@ impl Driver {
     ///
     /// The ring's completion event is configured here, so the ring must not
     /// already have one.
-    pub fn new(ring: IoRing) -> Result<Self> {
+    pub fn new(ring: IoRing) -> Result<Self, Error> {
         Self::with_error_observer(ring, None)
     }
 
@@ -1225,7 +1229,10 @@ impl Driver {
     ///
     /// Submission failures are the main thing reported this way; see the module
     /// documentation for why they cannot be delivered to a future.
-    pub fn with_error_observer(mut ring: IoRing, observer: Option<ErrorObserver>) -> Result<Self> {
+    pub fn with_error_observer(
+        mut ring: IoRing,
+        observer: Option<ErrorObserver>,
+    ) -> Result<Self, Error> {
         // Allocate everything that can fail *before* handing the ring its
         // completion event. Registering the event first would mean a later
         // failure dropped the event's handle while the ring still referred to
@@ -1237,7 +1244,7 @@ impl Driver {
             Err(e) => {
                 // Nothing else owns the ring yet, and it has no `Drop`.
                 let _ = ring.close();
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -1263,7 +1270,7 @@ impl Driver {
         // no path on which the event is dropped first.
         if let Err(e) = unsafe { ring.set_io_ring_completion_event(completion_wait.handle()) } {
             let _ = ring.close();
-            return Err(e);
+            return Err(e.into());
         }
 
         Ok(Self {
@@ -1870,11 +1877,11 @@ impl Handle {
                 return Err((Error::ShuttingDown, buffer));
             }
             if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_READ) {
-                return Err((e, buffer));
+                return Err((e.into(), buffer));
             }
         }
         if let Err(e) = check_read_capacity(&buffer, len as u64) {
-            return Err((e, buffer));
+            return Err((e.into(), buffer));
         }
 
         let slot = Rc::new(RefCell::new(ResultSlot::new()));
@@ -1894,7 +1901,7 @@ impl Handle {
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
-            Err(_) => return Err((Error::QueueFull, buffer)),
+            Err(_) => return Err((Error::TooManyOperations, buffer)),
         };
 
         // Box the buffer FIRST, then take its address. Taking the pointer from
@@ -1933,7 +1940,7 @@ impl Handle {
         // `data_ptr` stays valid for the whole time the kernel may use it. The
         // file's handle is kept open by the `Rc<FileState>` in the payload.
         if let Err(e) = unsafe { inner.ring.build_read_file(op) } {
-            return Err((e, recover_buffer(&mut inner, token)));
+            return Err((e.into(), recover_buffer(&mut inner, token)));
         }
 
         // The entry is now in the submission queue and cannot be withdrawn.
@@ -2019,14 +2026,14 @@ impl Handle {
                 return Err((Error::ShuttingDown, buffer));
             }
             if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_WRITE) {
-                return Err((e, buffer));
+                return Err((e.into(), buffer));
             }
         }
         // Bound the write by what the caller has actually initialized. Capacity
         // would not do: the tail of a `Vec`'s allocation is uninitialized, and
         // sending it to the kernel would leak whatever happened to be there.
         if let Err(e) = check_write_initialized(&buffer, len as u64) {
-            return Err((e, buffer));
+            return Err((e.into(), buffer));
         }
 
         let slot = Rc::new(RefCell::new(ResultSlot::new()));
@@ -2043,7 +2050,7 @@ impl Handle {
         });
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
-            Err(_) => return Err((Error::QueueFull, buffer)),
+            Err(_) => return Err((Error::TooManyOperations, buffer)),
         };
 
         // Box first, then take the address: a buffer stored inline moves when
@@ -2080,7 +2087,7 @@ impl Handle {
         // `data_ptr` stays valid for as long as the kernel may read it. The
         // file's handle is kept open by the `Rc<FileState>` in the payload.
         if let Err(e) = unsafe { inner.ring.build_write_file(op) } {
-            return Err((e, recover_buffer(&mut inner, token)));
+            return Err((e.into(), recover_buffer(&mut inner, token)));
         }
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
@@ -2169,7 +2176,7 @@ impl Handle {
         file: &File,
         mode: FILE_FLUSH_MODE,
         sqe_flags: SqeFlags,
-    ) -> Result<FlushFuture> {
+    ) -> Result<FlushFuture, Error> {
         {
             let inner = self.strong.borrow();
             if inner.shutdown != ShutdownMode::Running {
@@ -2192,7 +2199,10 @@ impl Handle {
             pending_registration: None,
             _sequential: None,
         });
-        let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
+        let token = inner
+            .slab
+            .insert(payload)
+            .map_err(|_| Error::TooManyOperations)?;
 
         let op = crate::io_ring::ops::FlushOp::builder()
             .with_raw_handle(file.as_raw_handle())
@@ -2213,7 +2223,7 @@ impl Handle {
         // the payload, which lives until this operation's completion.
         if let Err(e) = unsafe { inner.ring.build_flush_file(op) } {
             drop(inner.slab.complete(token));
-            return Err(e);
+            return Err(e.into());
         }
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
@@ -2298,7 +2308,7 @@ impl Handle {
             return Err((Error::BufferCheckedOut { index }, buffers));
         }
         if let Err(e) = inner.ring.ensure_op_supported(IORING_OP_REGISTER_BUFFERS) {
-            return Err((e, buffers));
+            return Err((e.into(), buffers));
         }
 
         // Box each buffer so its address is stable for as long as the platform
@@ -2352,7 +2362,7 @@ impl Handle {
         let token = match inner.slab.insert(payload) {
             Ok(token) => token,
             // Nothing was built, so the payload comes straight back.
-            Err(payload) => return Err((Error::QueueFull, unbox_payload::<B>(payload))),
+            Err(payload) => return Err((Error::TooManyOperations, unbox_payload::<B>(payload))),
         };
 
         // SAFETY: `descriptors_ptr` addresses the descriptor slice's heap
@@ -2379,7 +2389,7 @@ impl Handle {
                 .complete(token)
                 .map(unbox_payload::<B>)
                 .unwrap_or_default();
-            return Err((e, recovered));
+            return Err((e.into(), recovered));
         }
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
@@ -2400,7 +2410,7 @@ impl Handle {
     /// Unlike buffers, this borrows rather than consumes. The driver keeps its
     /// own reference to each handle, so the caller may go on using its
     /// [`File`] values, or drop them, without invalidating the registration.
-    pub async fn register_files(&self, files: &[File]) -> Result<()> {
+    pub async fn register_files(&self, files: &[File]) -> Result<(), Error> {
         let (token, slot) = self.start_register_files(files)?;
         self.nudge_driver();
 
@@ -2418,7 +2428,10 @@ impl Handle {
     /// Split out from [`Handle::register_files`] so the driver borrow cannot
     /// outlive the synchronous part.
     #[allow(clippy::type_complexity)]
-    fn start_register_files(&self, files: &[File]) -> Result<(Token, Rc<RefCell<ResultSlot>>)> {
+    fn start_register_files(
+        &self,
+        files: &[File],
+    ) -> Result<(Token, Rc<RefCell<ResultSlot>>), Error> {
         if files.is_empty() {
             return Err(Error::MissingField { field: "files" });
         }
@@ -2444,7 +2457,10 @@ impl Handle {
             pending_registration: Some(PendingRegistration::Files { files: states }),
             _sequential: None,
         });
-        let token = inner.slab.insert(payload).map_err(|_| Error::QueueFull)?;
+        let token = inner
+            .slab
+            .insert(payload)
+            .map_err(|_| Error::TooManyOperations)?;
 
         // SAFETY: each handle is kept open by the `Rc<FileState>` clone parked
         // in the payload above, which the driver retains until the ring closes.
@@ -2455,7 +2471,7 @@ impl Handle {
                 .build_register_file_handles(&handles, token.as_user_data())
         } {
             drop(inner.slab.complete(token));
-            return Err(e);
+            return Err(e.into());
         }
 
         inner.slab.set_lifecycle(token, Lifecycle::Built);
@@ -2548,7 +2564,7 @@ impl Handle {
                 reject!(Error::ShuttingDown);
             }
             if let Err(e) = inner.ring.ensure_op_supported(op_code) {
-                reject!(e);
+                reject!(e.into());
             }
             // The handle must belong to *this* driver's current registration.
             // Nothing else catches a handle from another driver: registrations
@@ -2600,7 +2616,7 @@ impl Handle {
             // Nothing was built, so the handle comes straight back.
             Err(payload) => {
                 return Err((
-                    Error::QueueFull,
+                    Error::TooManyOperations,
                     unbox_payload_one::<RegisteredBuf>(payload),
                 ));
             }
@@ -2619,7 +2635,7 @@ impl Handle {
             builder.build().map_err(Error::from).and_then(|op| {
                 // SAFETY: the registered buffer and handle are owned by the
                 // driver's registrations, which outlive this operation.
-                unsafe { inner.ring.build_write_file(op) }
+                unsafe { inner.ring.build_write_file(op) }.map_err(Error::from)
             })
         } else {
             let mut builder = crate::io_ring::ops::ReadOp::builder()
@@ -2633,7 +2649,7 @@ impl Handle {
             };
             builder.build().map_err(Error::from).and_then(|op| {
                 // SAFETY: as above.
-                unsafe { inner.ring.build_read_file(op) }
+                unsafe { inner.ring.build_read_file(op) }.map_err(Error::from)
             })
         };
 
@@ -2710,7 +2726,7 @@ impl RegisteredOpFuture {
 }
 
 impl Future for RegisteredOpFuture {
-    type Output = BufResult<Transferred, RegisteredBuf>;
+    type Output = BufResult<Transferred, RegisteredBuf, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -2856,7 +2872,7 @@ struct OpFuture {
 /// There is no "buffer abandoned" case. Teardown drains until every operation
 /// has reported before it releases anything, so a caller always gets its buffer
 /// back.
-struct Resolution(Result<Transferred>, Option<Box<dyn Any>>);
+struct Resolution(Result<Transferred, Error>, Option<Box<dyn Any>>);
 
 impl OpFuture {
     fn pending(
@@ -2953,7 +2969,7 @@ impl Drop for OpFuture {
 }
 
 /// Turns a resolution into a buffer result, recovering the caller's buffer.
-fn into_outcome<B: 'static>(resolution: Resolution) -> BufResult<Transferred, B> {
+fn into_outcome<B: 'static>(resolution: Resolution) -> BufResult<Transferred, B, Error> {
     let Resolution(result, buffer) = resolution;
     let buffer = buffer.expect("a buffer-carrying operation lost its buffer");
     let buffer = *buffer.downcast::<B>().expect("buffer type mismatch");
@@ -3012,7 +3028,7 @@ impl<B: IoBufMut> ReadFuture<B> {
 }
 
 impl<B: IoBufMut> Future for ReadFuture<B> {
-    type Output = BufResult<Transferred, B>;
+    type Output = BufResult<Transferred, B, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -3073,7 +3089,7 @@ impl<B: IoBuf> WriteFuture<B> {
 }
 
 impl<B: IoBuf> Future for WriteFuture<B> {
-    type Output = BufResult<Transferred, B>;
+    type Output = BufResult<Transferred, B, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -3118,7 +3134,7 @@ impl FlushFuture {
 }
 
 impl Future for FlushFuture {
-    type Output = Result<()>;
+    type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
@@ -3147,11 +3163,12 @@ mod tests {
 
     #[test]
     fn a_buffer_result_reports_success_and_failure() {
-        let failed: BufResult<u32, Vec<u8>> = BufResult::new(Err(Error::QueueFull), vec![1]);
+        let failed: BufResult<u32, Vec<u8>, Error> =
+            BufResult::new(Err(Error::TooManyOperations), vec![1]);
         assert!(!failed.is_ok());
-        assert!(matches!(failed.err(), Some(Error::QueueFull)));
+        assert!(matches!(failed.err(), Some(Error::TooManyOperations)));
 
-        let ok: BufResult<u32, Vec<u8>> = BufResult::new(Ok(3), vec![1, 2, 3]);
+        let ok: BufResult<u32, Vec<u8>, Error> = BufResult::new(Ok(3), vec![1, 2, 3]);
         assert!(ok.is_ok());
         assert!(ok.err().is_none());
         let (n, buf) = ok.unwrap();
@@ -3785,7 +3802,7 @@ mod tests {
         };
         let (result, buffer) = outcome.into_parts();
         assert!(
-            matches!(result, Err(Error::NoFileOffset { .. })),
+            matches!(result, Err(crate::file::error::Error::NotSeekable { .. })),
             "a sequential read on a pipe must be refused, not permitted with a \
              meaningless offset; got {result:?}"
         );
@@ -3807,7 +3824,7 @@ mod tests {
         };
         let (result, buffer) = outcome.into_parts();
         assert!(
-            matches!(result, Err(Error::NoFileOffset { .. })),
+            matches!(result, Err(crate::file::error::Error::NotSeekable { .. })),
             "and so must a sequential write; got {result:?}"
         );
         assert_eq!(buffer.len(), 16);
@@ -3913,7 +3930,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(Error::NoFileOffset {
+                Err(crate::file::error::Error::NotSeekable {
                     file_type
                 }) if file_type == FILE_TYPE_CHAR.0
             ),
@@ -4264,9 +4281,16 @@ mod tests {
 
         let (marker, fut) = rejected.expect("the submission queue never filled up");
         let outcome = futures::executor::block_on(fut);
+        // The *ring's* submission queue filled, not the slab. Under the split
+        // these are different conditions with opposite remedies -- submit to
+        // drain, versus complete outstanding operations -- so asserting the
+        // wrong one here would pass while documenting a retry loop that spins.
         assert!(
-            matches!(outcome.err(), Some(Error::QueueFull)),
-            "expected QueueFull, got {:?}",
+            matches!(
+                outcome.err(),
+                Some(Error::Ring(crate::io_ring::error::Error::QueueFull))
+            ),
+            "expected Ring(QueueFull), got {:?}",
             outcome.err()
         );
         let (_, buffer) = outcome.into_parts();

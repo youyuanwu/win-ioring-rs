@@ -109,12 +109,15 @@ struct Allowed {
 /// classifier is the wrong shape for them.
 const ALLOWED: &[Allowed] = &[
     Allowed {
-        file: "error.rs",
+        file: "io_ring/error.rs",
         line: "if err.code() == E_NOTIMPL {",
         sites: 1,
         why: "context-dependent: E_NOTIMPL denotes an unusable host only while \
               creating a ring. Classifying it in the shared table would \
-              reclassify unrelated E_NOTIMPL results from every other call site.",
+              reclassify unrelated E_NOTIMPL results from every other call site. \
+              It moved here from `error.rs` when ring construction got its own \
+              `BuildError`, which is where the condition had always belonged: \
+              it is reachable only while building.",
     },
     Allowed {
         file: "pipe/server.rs",
@@ -162,14 +165,15 @@ const ALLOWED: &[Allowed] = &[
     },
     Allowed {
         file: "pipe/client.rs",
-        line: "Some(code) => crate::Error::from_hresult(windows::core::HRESULT::from_win32(code as u32)),",
+        line: "Some(code) => Error::from(windows::core::HRESULT::from_win32(code as u32)),",
         sites: 1,
         why: "the opposite of a second table: it builds an HRESULT from a raw \
-              OS error and hands it to the shared funnel. Flagged only because \
-              it is a match arm naming HRESULT, and the detector is deliberately \
-              broad. Note the neighbouring E_FAIL substituted when the OS error \
-              is absent — that is a separate open question under FR-11, which \
-              forbids fabricating an HRESULT, and it is not settled by this entry.",
+              OS error and hands it to `From`, which calls `view`, which calls \
+              `classify`. Flagged only because it is a match arm naming HRESULT, \
+              and the detector is deliberately broad. The neighbouring E_FAIL, \
+              substituted when the OS error is absent, remains the crate's one \
+              fabricated code; it is justified at the call site and is not \
+              settled by this entry.",
     },
 ];
 
@@ -274,13 +278,21 @@ fn policed_lines(text: &str) -> Vec<(usize, &str)> {
 
         let starts_classify =
             trimmed.starts_with("pub(crate) fn classify(") || trimmed.starts_with("fn classify(");
+        // The table's inverse. It has to name the same five constants -- that
+        // is what makes it an inverse -- so it cannot be policed by a rule that
+        // counts mentions. What keeps it honest is
+        // `the_canonical_codes_round_trip`, which classifies every canonical
+        // code and asserts it lands on the condition it names. Divergence is
+        // caught by evidence rather than forbidden by spelling.
+        let starts_canonical = trimmed.starts_with("pub(crate) mod canonical {")
+            || trimmed.starts_with("mod canonical {");
         let starts_test_mod = trimmed == "#[cfg(test)]"
             && lines
                 .get(index + 1)
                 .is_some_and(|next| next.trim().starts_with("mod ") && !next.trim().ends_with(';'));
 
-        if starts_classify || starts_test_mod {
-            let open_indent = indent(if starts_classify {
+        if starts_classify || starts_canonical || starts_test_mod {
+            let open_indent = indent(if starts_classify || starts_canonical {
                 line
             } else {
                 lines[index + 1]

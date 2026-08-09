@@ -74,6 +74,58 @@ pub enum Error {
     Other(windows::core::Error),
 }
 
+impl BuildError {
+    /// Classifies a failure from a ring-creation entry point.
+    ///
+    /// `E_NOTIMPL` from these calls means the host has no IoRing at all, which
+    /// is a statement about the host rather than a platform error worth
+    /// carrying verbatim. Everything else goes through the crate's single
+    /// classification table like any other code.
+    pub(crate) fn from_create_failure(err: windows::core::Error) -> Self {
+        use windows::Win32::Foundation::E_NOTIMPL;
+        if err.code() == E_NOTIMPL {
+            BuildError::Unsupported
+        } else {
+            crate::error::view::<BuildError>(err.code())
+        }
+    }
+
+    /// Builds an [`BuildError::UnsupportedVersion`] from platform version values.
+    pub(crate) fn unsupported_version(
+        requested: windows::Win32::Storage::FileSystem::IORING_VERSION,
+        max: windows::Win32::Storage::FileSystem::IORING_VERSION,
+    ) -> Self {
+        BuildError::UnsupportedVersion {
+            requested: requested.0,
+            max_supported: max.0,
+        }
+    }
+}
+
+impl From<windows::core::Error> for BuildError {
+    fn from(value: windows::core::Error) -> Self {
+        crate::error::view::<BuildError>(value.code())
+    }
+}
+
+impl From<windows::core::HRESULT> for BuildError {
+    fn from(value: windows::core::HRESULT) -> Self {
+        crate::error::view::<BuildError>(value)
+    }
+}
+
+impl From<windows::core::Error> for Error {
+    fn from(value: windows::core::Error) -> Self {
+        crate::error::view::<Error>(value.code())
+    }
+}
+
+impl From<windows::core::HRESULT> for Error {
+    fn from(value: windows::core::HRESULT) -> Self {
+        crate::error::view::<Error>(value)
+    }
+}
+
 impl ConditionView for BuildError {
     fn queue_full(hr: windows::core::HRESULT) -> Self {
         BuildError::Other(hr.into())
@@ -129,22 +181,20 @@ impl ConditionView for Error {
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BuildError::Unsupported => write!(f, "this host does not provide an IoRing"),
+            BuildError::Unsupported => write!(f, "IoRing is not usable on this host"),
             BuildError::UnsupportedVersion {
                 requested,
                 max_supported,
             } => write!(
                 f,
-                "IoRing version {requested} requested, but this host supports at \
-                 most {max_supported}"
+                "IoRing version {requested} is not supported; this host supports up to {max_supported}"
             ),
             BuildError::UnsupportedFeature {
                 required,
                 available,
             } => write!(
                 f,
-                "IoRing features {required:#x} required, but this host provides \
-                 {available:#x}"
+                "IoRing feature flags {required:#x} are required but this host reports {available:#x}"
             ),
             BuildError::Other(error) => write!(f, "{error}"),
         }
@@ -155,12 +205,12 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::QueueFull => {
-                write!(f, "the ring's submission queue is full; submit to drain it")
+                write!(f, "the submission queue is full")
             }
             Error::UnsupportedOp { op } => {
-                write!(f, "this host does not support IoRing operation {op}")
+                write!(f, "IoRing operation {op} is not supported on this host")
             }
-            Error::RingClosed => write!(f, "the ring is closed"),
+            Error::RingClosed => write!(f, "the ring has been closed"),
             Error::Other(error) => write!(f, "{error}"),
         }
     }
@@ -187,6 +237,103 @@ impl std::error::Error for Error {
         match self {
             Error::Other(error) => Some(error),
             Error::QueueFull | Error::UnsupportedOp { .. } | Error::RingClosed => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Every variant renders as something, and none renders identically to
+    /// another.
+    ///
+    /// Distinctness matters as much as non-emptiness: a caller who cannot tell
+    /// two conditions apart by pattern will reach for the rendered string, and
+    /// two variants sharing one message make that silently wrong.
+    #[test]
+    fn display_is_non_empty_and_distinct_for_every_io_ring_build_error_variant() {
+        let variants: Vec<BuildError> = vec![
+            BuildError::Unsupported,
+            BuildError::UnsupportedVersion {
+                requested: 9999,
+                max_supported: 400,
+            },
+            BuildError::UnsupportedFeature {
+                required: 2,
+                available: 0,
+            },
+            BuildError::Other(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            )),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for v in variants {
+            let rendered = v.to_string();
+            assert!(!rendered.is_empty(), "empty Display for {v:?}");
+            assert!(
+                !seen.contains(&rendered),
+                "two variants of BuildError render identically: {rendered:?}"
+            );
+            seen.push(rendered);
+        }
+    }
+
+    /// Fails to compile when a variant is added, so the list above cannot
+    /// silently fall behind.
+    ///
+    /// The list is written by hand and nothing else would notice an omission.
+    /// This lives beside the type rather than in a central suite so the error
+    /// lands in front of whoever adds the variant.
+    fn _every_io_ring_build_error_variant_is_listed_above(e: &BuildError) {
+        match e {
+            BuildError::Unsupported
+            | BuildError::UnsupportedVersion { .. }
+            | BuildError::UnsupportedFeature { .. }
+            | BuildError::Other(_) => {}
+        }
+    }
+
+    /// Every variant renders as something, and none renders identically to
+    /// another.
+    ///
+    /// Distinctness matters as much as non-emptiness: a caller who cannot tell
+    /// two conditions apart by pattern will reach for the rendered string, and
+    /// two variants sharing one message make that silently wrong.
+    #[test]
+    fn display_is_non_empty_and_distinct_for_every_io_ring_error_variant() {
+        let variants: Vec<Error> = vec![
+            Error::QueueFull,
+            Error::UnsupportedOp { op: 6 },
+            Error::RingClosed,
+            Error::Other(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            )),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for v in variants {
+            let rendered = v.to_string();
+            assert!(!rendered.is_empty(), "empty Display for {v:?}");
+            assert!(
+                !seen.contains(&rendered),
+                "two variants of Error render identically: {rendered:?}"
+            );
+            seen.push(rendered);
+        }
+    }
+
+    /// Fails to compile when a variant is added, so the list above cannot
+    /// silently fall behind.
+    ///
+    /// The list is written by hand and nothing else would notice an omission.
+    /// This lives beside the type rather than in a central suite so the error
+    /// lands in front of whoever adds the variant.
+    fn _every_io_ring_error_variant_is_listed_above(e: &Error) {
+        match e {
+            Error::QueueFull
+            | Error::UnsupportedOp { .. }
+            | Error::RingClosed
+            | Error::Other(_) => {}
         }
     }
 }

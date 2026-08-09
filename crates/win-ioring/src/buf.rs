@@ -34,7 +34,10 @@
 
 pub mod error;
 
-use crate::error::{Error, Result};
+/// Re-exported so callers write `buf::Error` rather than
+/// naming the module twice. The module stays public: a caller who wants the
+/// long form still has it.
+pub use error::Error;
 
 /// A buffer an operation can read from.
 ///
@@ -259,21 +262,21 @@ unsafe impl<const N: usize> IoBufMut for [u8; N] {
 /// give it back. `BufResult` pairs the operation's result with that buffer, and
 /// does so on both success and failure.
 #[derive(Debug)]
-pub struct BufResult<T, B> {
+pub struct BufResult<T, B, E> {
     /// The operation's result.
-    pub result: Result<T>,
+    pub result: Result<T, E>,
     /// The caller's buffer, returned regardless of the result.
     pub buffer: B,
 }
 
-impl<T, B> BufResult<T, B> {
+impl<T, B, E> BufResult<T, B, E> {
     /// Pairs a result with the buffer it used.
-    pub fn new(result: Result<T>, buffer: B) -> Self {
+    pub fn new(result: Result<T, E>, buffer: B) -> Self {
         Self { result, buffer }
     }
 
     /// Splits into the result and the buffer.
-    pub fn into_parts(self) -> (Result<T>, B) {
+    pub fn into_parts(self) -> (Result<T, E>, B) {
         (self.result, self.buffer)
     }
 
@@ -283,12 +286,12 @@ impl<T, B> BufResult<T, B> {
     }
 
     /// Returns the error, if the operation failed.
-    pub fn err(&self) -> Option<&Error> {
+    pub fn err(&self) -> Option<&E> {
         self.result.as_ref().err()
     }
 
     /// Maps the success value, leaving the buffer untouched.
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> BufResult<U, B> {
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> BufResult<U, B, E> {
         BufResult {
             result: self.result.map(f),
             buffer: self.buffer,
@@ -300,7 +303,10 @@ impl<T, B> BufResult<T, B> {
     /// # Panics
     ///
     /// Panics if the operation failed.
-    pub fn expect(self, msg: &str) -> (T, B) {
+    pub fn expect(self, msg: &str) -> (T, B)
+    where
+        E: std::fmt::Display,
+    {
         match self.result {
             Ok(v) => (v, self.buffer),
             Err(e) => panic!("{msg}: {e}"),
@@ -312,7 +318,10 @@ impl<T, B> BufResult<T, B> {
     /// # Panics
     ///
     /// Panics if the operation failed.
-    pub fn unwrap(self) -> (T, B) {
+    pub fn unwrap(self) -> (T, B)
+    where
+        E: std::fmt::Display,
+    {
         self.expect("operation failed")
     }
 }
@@ -324,11 +333,11 @@ impl<T, B> BufResult<T, B> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::BufferTooSmall`] if `requested` exceeds the capacity.
-pub fn check_read_capacity<B: IoBufMut>(buffer: &B, requested: u64) -> Result<()> {
+/// Returns [`Error::TooSmall`] if `requested` exceeds the capacity.
+pub fn check_read_capacity<B: IoBufMut>(buffer: &B, requested: u64) -> Result<(), Error> {
     let available = buffer.buf_capacity() as u64;
     if requested > available {
-        Err(Error::BufferTooSmall {
+        Err(Error::TooSmall {
             requested,
             available,
         })
@@ -348,7 +357,7 @@ pub fn check_read_capacity<B: IoBufMut>(buffer: &B, requested: u64) -> Result<()
 ///
 /// Returns [`Error::UninitializedWriteRange`] if `requested` exceeds the
 /// initialized length.
-pub fn check_write_initialized<B: IoBuf>(buffer: &B, requested: u64) -> Result<()> {
+pub fn check_write_initialized<B: IoBuf>(buffer: &B, requested: u64) -> Result<(), Error> {
     let initialized = buffer.buf_len() as u64;
     if requested > initialized {
         Err(Error::UninitializedWriteRange {
@@ -433,7 +442,7 @@ mod tests {
         let err = check_read_capacity(&v, (v.capacity() + 1) as u64)
             .err()
             .unwrap();
-        assert!(matches!(err, Error::BufferTooSmall { .. }));
+        assert!(matches!(err, Error::TooSmall { .. }));
         check_read_capacity(&v, 4).unwrap();
     }
 
@@ -483,22 +492,28 @@ mod tests {
 
     #[test]
     fn buf_result_returns_the_buffer_on_success_and_failure() {
-        let ok: BufResult<usize, Vec<u8>> = BufResult::new(Ok(3), vec![1, 2, 3]);
+        let ok: BufResult<usize, Vec<u8>, Error> = BufResult::new(Ok(3), vec![1, 2, 3]);
         assert!(ok.is_ok());
         let (r, b) = ok.into_parts();
         assert_eq!(r.unwrap(), 3);
         assert_eq!(b, vec![1, 2, 3]);
 
-        let err: BufResult<usize, Vec<u8>> = BufResult::new(Err(Error::QueueFull), vec![9]);
+        let err: BufResult<usize, Vec<u8>, Error> = BufResult::new(
+            Err(Error::TooSmall {
+                requested: 9,
+                available: 1,
+            }),
+            vec![9],
+        );
         assert!(!err.is_ok());
         let (r, b) = err.into_parts();
-        assert!(matches!(r.unwrap_err(), Error::QueueFull));
+        assert!(matches!(r.unwrap_err(), Error::TooSmall { .. }));
         assert_eq!(b, vec![9], "buffer must come back even on failure");
     }
 
     #[test]
     fn buf_result_map_preserves_the_buffer() {
-        let r: BufResult<usize, Vec<u8>> = BufResult::new(Ok(2), vec![4, 5]);
+        let r: BufResult<usize, Vec<u8>, Error> = BufResult::new(Ok(2), vec![4, 5]);
         let mapped = r.map(|n| n * 10);
         assert_eq!(mapped.result.unwrap(), 20);
         assert_eq!(mapped.buffer, vec![4, 5]);

@@ -52,6 +52,17 @@ pub enum Error {
     ///
     /// Complete outstanding operations; submitting more cannot help.
     TooManyOperations,
+    /// A driver-surface condition that this surface does not name.
+    ///
+    /// Registered I/O and shutdown produce conditions that no file or pipe
+    /// operation can surface. They are carried here rather than flattened into
+    /// [`Error::Other`] with an invented code, because inventing a code is the
+    /// one thing the classification design forbids: a made-up code can be
+    /// re-classified into a condition that never occurred.
+    ///
+    /// Boxed so this type stays small - it is returned from the measured read
+    /// and write paths.
+    Driver(Box<crate::runtime::error::Error>),
     /// A platform error this type does not name, carried verbatim.
     Other(windows::core::Error),
 }
@@ -85,18 +96,18 @@ impl ConditionView for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Busy => write!(f, "all pipe instances are busy"),
-            Error::Broken => write!(f, "the pipe's peer closed its end"),
+            Error::Busy => write!(f, "every pipe instance is already serving a client"),
+            Error::Broken => write!(f, "the peer closed its end of the pipe"),
             Error::NoPeer => write!(f, "the pipe has no peer connected"),
-            Error::Listening => write!(f, "the pipe is listening and not yet connected"),
+            Error::Listening => write!(f, "the pipe instance is still waiting for a client"),
             Error::AcceptOutstanding => {
-                write!(f, "an accept is already in flight on this server")
+                write!(f, "an accept is already outstanding on this server")
             }
             Error::Ring(error) => write!(f, "{error}"),
             Error::Buf(error) => write!(f, "{error}"),
             Error::ShuttingDown => write!(f, "the runtime is shutting down"),
             Error::MissingField { field } => {
-                write!(f, "the operation is missing a required field: {field}")
+                write!(f, "required field `{field}` was not set")
             }
             Error::AbandonedAtShutdown => {
                 write!(f, "the operation was abandoned when the runtime shut down")
@@ -106,6 +117,7 @@ impl fmt::Display for Error {
                 "the driver is tracking as many operations as it can; complete \
                  outstanding operations rather than submitting more"
             ),
+            Error::Driver(error) => write!(f, "{error}"),
             Error::Other(error) => write!(f, "{error}"),
         }
     }
@@ -116,6 +128,7 @@ impl std::error::Error for Error {
         match self {
             Error::Ring(error) => Some(error),
             Error::Buf(error) => Some(error),
+            Error::Driver(error) => Some(error.as_ref()),
             Error::Other(error) => Some(error),
             Error::Busy
             | Error::Broken
@@ -126,6 +139,151 @@ impl std::error::Error for Error {
             | Error::MissingField { .. }
             | Error::AbandonedAtShutdown
             | Error::TooManyOperations => None,
+        }
+    }
+}
+
+impl From<crate::io_ring::error::Error> for Error {
+    fn from(value: crate::io_ring::error::Error) -> Self {
+        Error::Ring(value)
+    }
+}
+
+impl From<crate::buf::error::Error> for Error {
+    fn from(value: crate::buf::error::Error) -> Self {
+        Error::Buf(value)
+    }
+}
+
+impl From<crate::io_ring::ops::MissingField> for Error {
+    /// Widens a builder's missing-field report into this surface's error.
+    ///
+    /// The operation builders can fail in exactly one way, so they say so with
+    /// their own single-condition type; this surface reports the same condition
+    /// alongside everything else it can produce.
+    fn from(value: crate::io_ring::ops::MissingField) -> Self {
+        Error::MissingField { field: value.field }
+    }
+}
+
+impl From<windows::core::Error> for Error {
+    fn from(value: windows::core::Error) -> Self {
+        crate::error::view::<Error>(value.code())
+    }
+}
+
+impl From<windows::core::HRESULT> for Error {
+    fn from(value: windows::core::HRESULT) -> Self {
+        crate::error::view::<Error>(value)
+    }
+}
+
+impl From<crate::runtime::error::Error> for Error {
+    /// Narrows a driver error onto the pipe surface.
+    ///
+    /// This is the direction the design exists for: all four pipe conditions are
+    /// *named* here, so a completion the driver classified arrives with its
+    /// meaning intact rather than as an opaque code the caller has to decode.
+    fn from(value: crate::runtime::error::Error) -> Self {
+        use crate::runtime::error::Error as R;
+
+        match value {
+            R::Ring(e) => Error::Ring(e),
+            R::Buf(e) => Error::Buf(e),
+            R::ShuttingDown => Error::ShuttingDown,
+            R::AbandonedAtShutdown => Error::AbandonedAtShutdown,
+            R::MissingField { field } => Error::MissingField { field },
+            R::TooManyOperations => Error::TooManyOperations,
+            R::PipeBusy => Error::Busy,
+            R::PipeBroken => Error::Broken,
+            R::PipeNoPeer => Error::NoPeer,
+            R::PipeListening => Error::Listening,
+            R::Other(e) => crate::error::view::<Error>(e.code()),
+            // Driver-only, and unreachable from a pipe completion. Named
+            // individually rather than caught by a wildcard: a wildcard would
+            // silently box a *new* condition this surface *can* produce, which
+            // is the one failure this design exists to prevent. Adding a
+            // `runtime::Error` variant must fail to compile here.
+            // Driver-only, and unreachable from a pipe completion. Named
+            // individually rather than caught by a wildcard: a wildcard would
+            // silently box a *new* condition this surface *can* produce, which
+            // is the one failure this design exists to prevent. Adding a
+            // `runtime::Error` variant must fail to compile here.
+            other @ (R::ShutdownStalled { .. }
+            | R::InvalidRegisteredIndex { .. }
+            | R::RegisteredRangeOutOfBounds { .. }
+            | R::BufferCheckedOut { .. }
+            | R::RegistrationSuperseded
+            | R::RegistrationPending) => Error::Driver(Box::new(other)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Every variant renders as something, and none renders identically to
+    /// another.
+    ///
+    /// Distinctness matters as much as non-emptiness: a caller who cannot tell
+    /// two conditions apart by pattern will reach for the rendered string, and
+    /// two variants sharing one message make that silently wrong.
+    #[test]
+    fn display_is_non_empty_and_distinct_for_every_pipe_error_variant() {
+        let variants: Vec<Error> = vec![
+            Error::Busy,
+            Error::Broken,
+            Error::NoPeer,
+            Error::Listening,
+            Error::AcceptOutstanding,
+            Error::Ring(crate::io_ring::error::Error::QueueFull),
+            Error::Buf(crate::buf::error::Error::TooSmall {
+                requested: 10,
+                available: 4,
+            }),
+            Error::ShuttingDown,
+            Error::MissingField { field: "handle" },
+            Error::AbandonedAtShutdown,
+            Error::TooManyOperations,
+            Error::Driver(Box::new(crate::runtime::error::Error::RegistrationPending)),
+            Error::Other(windows::core::Error::from(
+                windows::Win32::Foundation::E_FAIL,
+            )),
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for v in variants {
+            let rendered = v.to_string();
+            assert!(!rendered.is_empty(), "empty Display for {v:?}");
+            assert!(
+                !seen.contains(&rendered),
+                "two variants of Error render identically: {rendered:?}"
+            );
+            seen.push(rendered);
+        }
+    }
+
+    /// Fails to compile when a variant is added, so the list above cannot
+    /// silently fall behind.
+    ///
+    /// The list is written by hand and nothing else would notice an omission.
+    /// This lives beside the type rather than in a central suite so the error
+    /// lands in front of whoever adds the variant.
+    fn _every_pipe_error_variant_is_listed_above(e: &Error) {
+        match e {
+            Error::Busy
+            | Error::Broken
+            | Error::NoPeer
+            | Error::Listening
+            | Error::AcceptOutstanding
+            | Error::Ring(_)
+            | Error::Buf(_)
+            | Error::ShuttingDown
+            | Error::MissingField { .. }
+            | Error::AbandonedAtShutdown
+            | Error::TooManyOperations
+            | Error::Driver(_)
+            | Error::Other(_) => {}
         }
     }
 }
