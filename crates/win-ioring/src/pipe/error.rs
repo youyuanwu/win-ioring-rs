@@ -67,6 +67,36 @@ pub enum Error {
     Other(windows::core::Error),
 }
 
+impl Error {
+    /// The platform error this value carries, or `None` if it carries none.
+    ///
+    /// `None` does not mean "no platform error was involved" — a condition that
+    /// was named during classification reports `None` because the variant holds
+    /// no code. See [the module docs](crate::error#recovering-the-platform-error)
+    /// for the contract and the ten variants this affects.
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub fn os_error(&self) -> Option<&windows::core::Error> {
+        match self {
+            Error::Ring(error) => error.os_error(),
+            Error::Buf(error) => error.os_error(),
+            Error::Driver(error) => error.os_error(),
+            Error::Other(error) => Some(error),
+            // The four named pipe conditions are classified from a code and
+            // report `None`; the same code reaching a file error is demoted to
+            // `Other` and reports `Some`.
+            Error::Busy
+            | Error::Broken
+            | Error::NoPeer
+            | Error::Listening
+            | Error::AcceptOutstanding
+            | Error::ShuttingDown
+            | Error::MissingField { .. }
+            | Error::AbandonedAtShutdown
+            | Error::TooManyOperations => None,
+        }
+    }
+}
+
 impl ConditionView for Error {
     fn queue_full(_hr: windows::core::HRESULT) -> Self {
         Error::Ring(crate::io_ring::error::Error::QueueFull)

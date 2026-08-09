@@ -31,6 +31,65 @@
 //! closed by construction. `docs/errors-and-the-funnel.md` records how this
 //! design relates to the funnel argument that preceded it.
 //!
+//! # Recovering the platform error
+//!
+//! Every public error type has an inherent
+//! `os_error(&self) -> Option<&windows::core::Error>`. It answers one question:
+//! **does this value carry a platform error?** It does not answer "what code did
+//! this come from", and the difference is the whole of its contract.
+//!
+//! `Some` means the value holds a `windows::core::Error` — an `Other` variant, or
+//! a nested type whose own `os_error` says so. `None` means it does not, either
+//! because the crate detected the condition itself or because classification
+//! *named* the condition and dropped the code.
+//!
+//! ## The direction that is exact, and the one that is not
+//!
+//! `HRESULT` -> error -> `os_error()` round-trips exactly for anything carried in
+//! an `Other`. The reverse does not exist, and deliberately: there is no
+//! infallible `to_hresult()`, because supplying one would mean inventing codes
+//! for conditions the platform never reported. That is the one thing this
+//! design forbids — see [`crate::file::Error::Driver`] — since a made-up code
+//! can be re-classified into a condition that never occurred. `os_error`
+//! returns `None` instead of guessing.
+//!
+//! ## Naming a condition discards its code; demoting one preserves it
+//!
+//! This is the surprising part, and it follows from the demotion rule above
+//! rather than from anything `os_error` does. A view that *names* a condition
+//! stores no code, because the variant has nowhere to put one. A view that
+//! cannot name it demotes to `Other`, which carries the code.
+//!
+//! So one `ERROR_PIPE_BUSY` reaches two surfaces and answers differently:
+//!
+//! ```text
+//! pipe::Error::Busy          -> os_error() == None    // named, code dropped
+//! file::Error::Other(0x..E7) -> os_error() == Some(..) // demoted, code kept
+//! ```
+//!
+//! Neither is lossy in the way that matters: the pipe surface already told you
+//! it was busy, and the file surface kept the code because it could not.
+//!
+//! ## The variants that were classified but report `None`
+//!
+//! Ten named variants are reached from a platform code yet carry none, because
+//! their view discards the `HRESULT` when it names the condition:
+//!
+//! - [`crate::io_ring::Error::QueueFull`] — also produced by slab exhaustion,
+//!   which has no code at all, so it could not carry one consistently even in
+//!   principle
+//! - [`crate::pipe::Error::Busy`], [`Broken`](crate::pipe::Error::Broken),
+//!   [`NoPeer`](crate::pipe::Error::NoPeer),
+//!   [`Listening`](crate::pipe::Error::Listening)
+//! - [`crate::runtime::Error::PipeBusy`],
+//!   [`PipeBroken`](crate::runtime::Error::PipeBroken),
+//!   [`PipeNoPeer`](crate::runtime::Error::PipeNoPeer),
+//!   [`PipeListening`](crate::runtime::Error::PipeListening)
+//! - [`crate::io_ring::BuildError::Unsupported`], which is `E_NOTIMPL` named
+//!
+//! [`crate::buf::Error`] reports `None` for every variant: both of its
+//! conditions are counted by the crate, and neither has ever seen an `HRESULT`.
+//!
 //! # Platform availability
 //!
 //! This crate binds the Windows IoRing API through statically imported symbols
@@ -1000,5 +1059,203 @@ mod conversion_tests {
                 "{label} dropped the code it could not name, leaving nothing to recover"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod os_error_tests {
+    //! `os_error()` on each of the six public error types.
+    //!
+    //! These live in the crate for the same reason as `conversion_tests`: every
+    //! error enum is `#[non_exhaustive]`, so its variants cannot be constructed
+    //! from an integration test.
+    //!
+    //! The property under test is **what a value carries**, not what produced
+    //! it. The two are deliberately different, and the test that matters most is
+    //! `the_same_code_answers_differently_on_two_surfaces` \u2014 one `HRESULT`
+    //! reaching two views, `Some` on the one that had to demote it and `None` on
+    //! the one that could name it.
+    //!
+    //! Exhaustiveness is not tested here because it is not testable here, and
+    //! does not need to be: a missing arm is `E0004` under plain `cargo build`,
+    //! and the wildcard that would silence `E0004` is itself a hard error from
+    //! `#[deny(clippy::wildcard_enum_match_arm)]` on each accessor. Two doors,
+    //! both shut at compile time.
+    //!
+    //! Both were opened deliberately to confirm they shut. Adding a variant to
+    //! `pipe::Error` produced `E0004` inside `os_error` specifically \u2014 not only
+    //! in `Display` and `source` \u2014 and replacing that accessor's named arms
+    //! with `_ => None` produced `error: wildcard matches known variants`. See
+    //! `docs/testing.md` for why a guard of this shape is preferred here to one
+    //! that reads the source.
+
+    use crate::buf::error::Error as BufError;
+    use crate::file::error::Error as FileError;
+    use crate::io_ring::error::BuildError;
+    use crate::io_ring::error::Error as RingError;
+    use crate::pipe::error::Error as PipeError;
+    use crate::runtime::error::Error as RuntimeError;
+
+    /// A code no surface names, so every view demotes it into `Other`.
+    const UNNAMEABLE: windows::core::HRESULT = windows::core::HRESULT(0x8000_FFFFu32 as i32);
+
+    /// `ERROR_BROKEN_PIPE`: the pipe surface names it, the file surface cannot.
+    const PIPE_BROKEN: windows::core::HRESULT = windows::core::HRESULT(0x8007_006Du32 as i32);
+
+    fn carried(hr: windows::core::HRESULT) -> windows::core::Error {
+        windows::core::Error::from_hresult(hr)
+    }
+
+    #[test]
+    fn an_unnamed_code_is_recoverable_from_every_view() {
+        assert_eq!(
+            super::view::<BuildError>(UNNAMEABLE)
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            super::view::<RingError>(UNNAMEABLE)
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            super::view::<FileError>(UNNAMEABLE)
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            super::view::<PipeError>(UNNAMEABLE)
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            super::view::<RuntimeError>(UNNAMEABLE)
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+    }
+
+    #[test]
+    fn the_same_code_answers_differently_on_two_surfaces() {
+        // The file surface cannot name a pipe condition, so it demotes to
+        // `Other` and the code survives.
+        let on_a_file = super::view::<FileError>(PIPE_BROKEN);
+        assert!(matches!(on_a_file, FileError::Other(_)));
+        assert_eq!(on_a_file.os_error().map(|e| e.code()), Some(PIPE_BROKEN));
+
+        // The pipe surface names it, which is the more useful answer and the
+        // one that drops the code.
+        let on_a_pipe = super::view::<PipeError>(PIPE_BROKEN);
+        assert!(matches!(on_a_pipe, PipeError::Broken));
+        assert_eq!(on_a_pipe.os_error(), None);
+    }
+
+    #[test]
+    fn a_named_condition_reports_none_on_every_surface_that_names_it() {
+        assert_eq!(super::view::<PipeError>(PIPE_BROKEN).os_error(), None);
+        assert_eq!(super::view::<RuntimeError>(PIPE_BROKEN).os_error(), None);
+        // `QueueFull` is named by the ring view and wrapped by the rest. The
+        // code comes from the platform crate rather than this module's
+        // `canonical` inverse, which deliberately has no entry for it: no view
+        // ever needs to reconstruct it, because none demotes it.
+        let queue_full =
+            super::view::<RingError>(windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL);
+        assert!(matches!(queue_full, RingError::QueueFull));
+        assert_eq!(queue_full.os_error(), None);
+    }
+
+    #[test]
+    fn nesting_is_traversed_to_the_error_the_inner_type_carries() {
+        assert_eq!(
+            FileError::Ring(RingError::Other(carried(UNNAMEABLE)))
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            PipeError::Ring(RingError::Other(carried(UNNAMEABLE)))
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            RuntimeError::Ring(RingError::Other(carried(UNNAMEABLE)))
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        // Through the box, which is the nesting most likely to be got wrong.
+        assert_eq!(
+            FileError::Driver(Box::new(RuntimeError::Other(carried(UNNAMEABLE))))
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        assert_eq!(
+            PipeError::Driver(Box::new(RuntimeError::Other(carried(UNNAMEABLE))))
+                .os_error()
+                .map(|e| e.code()),
+            Some(UNNAMEABLE)
+        );
+        // Nesting that carries nothing must still answer `None` rather than
+        // stopping at the outer variant and guessing.
+        assert_eq!(FileError::Ring(RingError::QueueFull).os_error(), None);
+        assert_eq!(
+            FileError::Driver(Box::new(RuntimeError::RegistrationPending)).os_error(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_condition_this_crate_detected_itself_carries_nothing() {
+        assert_eq!(RuntimeError::RegistrationPending.os_error(), None);
+        assert_eq!(
+            RuntimeError::ShutdownStalled { outstanding: 3 }.os_error(),
+            None
+        );
+        assert_eq!(FileError::NotSeekable { file_type: 3 }.os_error(), None);
+        assert_eq!(RingError::RingClosed.os_error(), None);
+        assert_eq!(
+            BuildError::UnsupportedVersion {
+                requested: 2,
+                max_supported: 1
+            }
+            .os_error(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_buffer_error_never_carries_a_platform_error() {
+        assert_eq!(
+            BufError::TooSmall {
+                requested: 8,
+                available: 4
+            }
+            .os_error(),
+            None
+        );
+        assert_eq!(
+            BufError::UninitializedWriteRange {
+                requested: 8,
+                initialized: 4
+            }
+            .os_error(),
+            None
+        );
+        // And through a surface that wraps it.
+        assert_eq!(
+            FileError::Buf(BufError::TooSmall {
+                requested: 8,
+                available: 4
+            })
+            .os_error(),
+            None
+        );
     }
 }

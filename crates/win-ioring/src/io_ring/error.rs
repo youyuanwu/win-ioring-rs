@@ -50,6 +50,26 @@ pub enum BuildError {
     Other(windows::core::Error),
 }
 
+impl BuildError {
+    /// The platform error this value carries, or `None` if it carries none.
+    ///
+    /// `None` does not mean "no platform error was involved" — a condition that
+    /// was named during classification reports `None` because the variant holds
+    /// no code. See [the module docs](crate::error#recovering-the-platform-error)
+    /// for the contract and the ten variants this affects.
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub fn os_error(&self) -> Option<&windows::core::Error> {
+        match self {
+            BuildError::Other(error) => Some(error),
+            // `Unsupported` is `E_NOTIMPL` named, so it is platform-derived and
+            // still reports `None`: naming a condition discards its code.
+            BuildError::Unsupported
+            | BuildError::UnsupportedVersion { .. }
+            | BuildError::UnsupportedFeature { .. } => None,
+        }
+    }
+}
+
 /// An error produced by a ring that already exists — submission or completion.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -72,6 +92,25 @@ pub enum Error {
     RingClosed,
     /// A platform error this type does not name, carried verbatim.
     Other(windows::core::Error),
+}
+
+impl Error {
+    /// The platform error this value carries, or `None` if it carries none.
+    ///
+    /// `None` does not mean "no platform error was involved" — a condition that
+    /// was named during classification reports `None` because the variant holds
+    /// no code. See [the module docs](crate::error#recovering-the-platform-error)
+    /// for the contract and the ten variants this affects.
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub fn os_error(&self) -> Option<&windows::core::Error> {
+        match self {
+            Error::Other(error) => Some(error),
+            // `QueueFull` is reached both from `IORING_E_SUBMISSION_QUEUE_FULL`
+            // and from slab exhaustion, which has no code at all. It could not
+            // carry one consistently, so it carries none.
+            Error::QueueFull | Error::UnsupportedOp { .. } | Error::RingClosed => None,
+        }
+    }
 }
 
 impl BuildError {

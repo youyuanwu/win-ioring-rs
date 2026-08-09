@@ -30,6 +30,24 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// The platform error this value carries, or `None` if it carries none.
+    ///
+    /// `None` does not mean "no platform error was involved" — a condition that
+    /// was named during classification reports `None` because the variant holds
+    /// no code. See [the module docs](crate::error#recovering-the-platform-error)
+    /// for the contract and the ten variants this affects.
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub fn os_error(&self) -> Option<&windows::core::Error> {
+        match self {
+            // Both conditions are counted by this crate; neither has an
+            // `HRESULT` behind it. Named exhaustively anyway so that a variant
+            // added later must decide rather than inherit `None`.
+            Error::TooSmall { .. } | Error::UninitializedWriteRange { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
