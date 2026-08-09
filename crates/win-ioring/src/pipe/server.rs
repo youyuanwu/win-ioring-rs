@@ -25,9 +25,12 @@
 //! deliberately not trusted in the other, because one is a synchronous return
 //! this code just observed and the other is an inference about kernel state.
 
+use crate::buf::{IoBuf, IoBufMut};
 use crate::file::File;
 use crate::pipe::error::Error;
+use crate::pipe::io::{PipeRead, PipeWrite};
 use crate::runtime::AbortOnUnwind;
+use crate::runtime::Handle;
 use crate::sys::{ArmedEvent, Registration};
 use windows::Win32::Foundation::{
     ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_CONNECTED, HANDLE,
@@ -555,6 +558,44 @@ impl Server {
             AcceptState::Connected => Ok(&self.file),
             AcceptState::Fresh | AcceptState::Idle => Err(Error::Listening),
             AcceptState::Accepting(_) => Err(Error::AcceptOutstanding),
+        }
+    }
+
+    /// Reads up to `len` bytes into `buffer`, reporting failures as [`Error`].
+    ///
+    /// Refused with [`Error::Listening`] or [`Error::AcceptOutstanding`] if no
+    /// client is connected yet. The refusal is delivered by the returned future
+    /// rather than by a `Result` around it, so `buffer` comes back either way —
+    /// the same contract every other operation in this crate keeps.
+    ///
+    /// The offset is ignored and there is no sequential counterpart; see
+    /// [`Client::read_at`](crate::pipe::Client::read_at) for why.
+    pub fn read_at<B: IoBufMut>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeRead<B> {
+        match self.file() {
+            Ok(file) => PipeRead::issue(handle, file, buffer, len, offset),
+            Err(e) => PipeRead::rejected(e, buffer),
+        }
+    }
+
+    /// Writes `len` bytes from `buffer`, reporting failures as [`Error`].
+    ///
+    /// Refused exactly as [`read_at`](Self::read_at) is.
+    pub fn write_at<B: IoBuf>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeWrite<B> {
+        match self.file() {
+            Ok(file) => PipeWrite::issue(handle, file, buffer, len, offset),
+            Err(e) => PipeWrite::rejected(e, buffer),
         }
     }
 

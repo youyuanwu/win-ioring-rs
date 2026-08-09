@@ -60,6 +60,9 @@ pub struct FileState {
     /// sequential operation's future releases that access while the kernel is
     /// still working, so a second operation could otherwise start against a
     /// cursor position the first is about to consume.
+    /// Unused on the pipe path: the pipe surface issues positional I/O only, so
+    /// a pipe's `File` never reaches the guard that sets this, nor the cursor
+    /// below.
     sequential_outstanding: Cell<bool>,
     /// What `GetFileType` said about this handle, cached after the first
     /// sequential use.

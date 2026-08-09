@@ -196,3 +196,129 @@ async fn a_pipe_read_succeeds_through_a_registered_file_handle() {
     })
     .await;
 }
+
+/// SC-22: bytes move both ways through the **pipe surface's own** methods, and
+/// a failure from them is a `pipe::Error`.
+///
+/// This is not a restatement of `a_server_accepts_a_client_and_bytes_move_both_ways`.
+/// That test moves bytes with `handle.write(server.file(), ..)` — through the
+/// driver, against the `File` a pipe holds — and would pass unchanged if
+/// `Client` and `Server` had no I/O methods at all. That was in fact the state
+/// of the crate before this work: the pipe surface had no way to read or write,
+/// so a `pipe::Error` had nothing to be returned from.
+///
+/// The error type is pinned by an explicit binding rather than left to
+/// inference, so a later change routing these through the file surface fails
+/// here instead of silently widening what a pipe can report.
+#[tokio::test(flavor = "current_thread")]
+async fn the_pipe_surface_moves_bytes_in_both_directions_itself() {
+    with_driver(|handle| async move {
+        let name = unique("surface-io");
+        let mut server = ServerOptions::new().create(&name).unwrap();
+        let mut accept = Box::pin(server.accept());
+        assert!(futures::poll!(accept.as_mut()).is_pending());
+        let client = ClientOptions::new().open(&name).unwrap();
+        accept.await.unwrap();
+
+        // Client -> server, both halves through the pipe types.
+        let (written, _) = client
+            .write_at(&handle, b"client-says".to_vec(), 11, 0)
+            .await
+            .into_parts();
+        assert_eq!(written.unwrap(), 11);
+
+        let (read, buffer) = server
+            .read_at(&handle, vec![0_u8; 11], 11, 0)
+            .await
+            .into_parts();
+        let read: u32 = read.unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(&buffer, b"client-says");
+
+        // Server -> client, the other direction over the same connection.
+        let (written, _) = server
+            .write_at(&handle, b"server-says".to_vec(), 11, 0)
+            .await
+            .into_parts();
+        assert_eq!(written.unwrap(), 11);
+
+        let (read, buffer) = client
+            .read_at(&handle, vec![0_u8; 11], 11, 0)
+            .await
+            .into_parts();
+        assert_eq!(read.unwrap(), 11);
+        assert_eq!(&buffer, b"server-says");
+    })
+    .await;
+}
+
+/// SC-22: the pipe surface's failures are `pipe::Error` values, named.
+///
+/// Reading a server that has never accepted is refused with `Listening`. The
+/// binding is annotated, so this fails to compile — not merely to assert — if
+/// these methods are ever rewired to report a different type.
+#[tokio::test(flavor = "current_thread")]
+async fn reading_a_server_with_no_client_is_refused_as_a_pipe_error() {
+    with_driver(|handle| async move {
+        let name = unique("refused");
+        let server = ServerOptions::new().create(&name).unwrap();
+
+        let (result, buffer) = server
+            .read_at(&handle, vec![0_u8; 8], 8, 0)
+            .await
+            .into_parts();
+        let error: win_ioring::pipe::Error = result.unwrap_err();
+        assert!(
+            matches!(error, win_ioring::pipe::Error::Listening),
+            "a server with no client is listening, got {error:?}"
+        );
+
+        // The buffer comes back even though the operation never reached the
+        // kernel. That is the contract every other operation in this crate
+        // keeps, and a refusal delivered as `Result<Future, Error>` would have
+        // eaten it.
+        assert_eq!(
+            buffer.len(),
+            8,
+            "a refused operation must still return the caller's buffer"
+        );
+    })
+    .await;
+}
+
+/// SC-22: a refused operation has no identifier, because it never reached the
+/// kernel to be given one.
+///
+/// Worth pinning separately: `operation_id` is what a caller cancels through, and
+/// a refused operation reporting some other operation's identifier would cancel
+/// the wrong work.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_pipe_operation_has_no_identifier() {
+    with_driver(|handle| async move {
+        let name = unique("no-id");
+        let server = ServerOptions::new().create(&name).unwrap();
+
+        let refused = server.read_at(&handle, vec![0_u8; 8], 8, 0);
+        assert!(
+            refused.operation_id().is_none(),
+            "a refused operation never reached the kernel and has no identifier"
+        );
+        drop(refused);
+
+        let mut server = server;
+        let mut accept = Box::pin(server.accept());
+        assert!(futures::poll!(accept.as_mut()).is_pending());
+        let _client = ClientOptions::new().open(&name).unwrap();
+        accept.await.unwrap();
+
+        // The contrast that stops the assertion above being vacuous: an
+        // operation that *did* reach the kernel has one.
+        let issued = server.read_at(&handle, vec![0_u8; 8], 8, 0);
+        assert!(
+            issued.operation_id().is_some(),
+            "an issued operation must have an identifier, or the check above \
+             would pass for the wrong reason"
+        );
+    })
+    .await;
+}

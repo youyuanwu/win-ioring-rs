@@ -1,7 +1,10 @@
 //! The client end of a named pipe.
 
+use super::io::{PipeRead, PipeWrite};
+use crate::buf::{IoBuf, IoBufMut};
 use crate::file::File;
 use crate::pipe::error::Error;
+use crate::runtime::Handle;
 
 /// Options for connecting to a named pipe.
 ///
@@ -169,6 +172,44 @@ impl Client {
     /// The underlying file, for reads, writes and flushes through the ring.
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    /// Reads up to `len` bytes into `buffer`, reporting failures as [`Error`].
+    ///
+    /// # The offset is ignored
+    ///
+    /// A pipe has no position, and the platform discards this argument. It is
+    /// present because this is the same entry point the file surface uses and
+    /// splitting the signature would gain nothing; pass `0` unless you have a
+    /// reason not to.
+    ///
+    /// There is deliberately **no** sequential (`read`/`write`) pipe method. The
+    /// cursor those maintain would be a fiction on a pipe: the platform ignores
+    /// the offset, so a sequential read would report the cursor advancing past
+    /// bytes it never positioned for. Refusing to offer it is the same choice
+    /// this crate already makes by refusing `File::read` on a pipe.
+    pub fn read_at<B: IoBufMut>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeRead<B> {
+        PipeRead::issue(handle, &self.file, buffer, len, offset)
+    }
+
+    /// Writes `len` bytes from `buffer`, reporting failures as [`Error`].
+    ///
+    /// The offset is ignored, and there is no sequential counterpart. See
+    /// [`read_at`](Self::read_at) for both.
+    pub fn write_at<B: IoBuf>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeWrite<B> {
+        PipeWrite::issue(handle, &self.file, buffer, len, offset)
     }
 
     /// Consumes the client and returns the file it wraps.

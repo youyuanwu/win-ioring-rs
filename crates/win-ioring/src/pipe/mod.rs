@@ -86,9 +86,11 @@ pub mod error;
 pub use error::Error;
 
 mod client;
+mod io;
 mod server;
 
 pub use client::{Client, ClientOptions};
+pub use io::{PipeRead, PipeWrite};
 pub use server::{Accept, Server, ServerOptions};
 
 /// The prefix every pipe path carries on the local machine.
