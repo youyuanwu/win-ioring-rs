@@ -106,7 +106,7 @@ across `File` clones are unsupported.
 Sequential exclusivity is meant to be enforced at compile time by `&mut self`,
 and a `compile_fail` doc-test asserts it. Two clones give two independent `&mut`
 paths to one `FileState`. The runtime guard catches it with
-`Error::OperationOutstanding`, so it degrades gracefully — the compile-time check
+`file::Error::OperationOutstanding`, so it degrades gracefully — the compile-time check
 is per-value, the runtime check is per-file. Worth a sentence in the `File::clone`
 rustdoc.
 
@@ -206,30 +206,33 @@ in two ways rather than one, or correct the string. It is listed here rather tha
 fixed inside the Criterion migration because it changes what is measured, and
 that migration's whole premise is that what is measured did not change.
 
-### `io_ring::BuildError` was costed and declined
+### `io_ring::BuildError` was costed, declined, then done
 
-Carving a `BuildError` for `IoRingBuilder::build`, `IoRing::create` and
-`query_io_ring_capabilities` would narrow those three from 25 reachable variants
-to 4 — `Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`, `Os`.
+**Superseded.** The per-API error work carved exactly this type. `BuildError`
+now covers `IoRingBuilder::build`, `IoRing::create` and
+`query_io_ring_capabilities` with the four variants proposed here —
+`Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`, and `Other` in place
+of `Os`.
 
-Declined because the gain and the cost are the same fact. The gain is that
-`build()` could no longer return `PipeBroken`; the cost is that
-`Error::from_create_failure` would stop delegating to `Error::from_hresult`, so a
-creation failure carrying any of that table's **five** codes — including
-`IORING_E_SUBMISSION_QUEUE_FULL` → `QueueFull`, not only the pipe codes — would
-become `Os`. Neither `CreateIoRing` nor `QueryIoRingCapabilities` realistically
-emits any of them, which means the defect being fixed is documentary and the
-regression introduced is theoretical. Paying a breaking change for that is not
-obviously right in either direction, so it was left alone.
+The cost that justified declining it did not materialise, and the reason is
+worth keeping. The objection was that `from_create_failure` would stop
+delegating to the shared classifier, so a creation failure carrying one of the
+table's five codes would flatten to `Os`. Under the design that shipped it still
+delegates — `crate::error::view::<BuildError>(err.code())` at
+`crates/win-ioring/src/io_ring/error.rs:88` — because each per-API type is a
+*view* over the one classification table rather than a private table of its own.
+A code the view does not name lands in `Other` carrying its `HRESULT`, so
+nothing is flattened.
 
-If taken later: `from_create_failure` has exactly two callers, both inside the
-proposed surface, so the change is contained. Pin all five rows, not just the
-pipe ones.
+That is a general point about this entry's reasoning rather than a lucky escape:
+the cost was real for a design where each API classifies independently, and it
+was the shared-table mechanism that removed it. See
+`docs/errors-and-the-funnel.md`.
 
 ### `runtime::RegistryError` was costed and declined
 
 Carving a `RegistryError` for `RegisteredBuffers::check_out` and
-`RegisteredBuf::fill` would narrow them from 25 variants to 6: `ShuttingDown`,
+`RegisteredBuf::fill` would narrow them from the 17 variants of `runtime::Error` to 6: `ShuttingDown`,
 `RegistrationPending`, `RegistrationSuperseded`, `InvalidRegisteredIndex`,
 `BufferCheckedOut`, `BufferTooSmall`.
 
@@ -248,19 +251,26 @@ error types — so the reasoning that bundled these two with it no longer applie
 and they would need re-costing on their own merits. See
 `docs/errors-and-the-funnel.md`.
 
-### `source()` chains only through `Error::Os`
+### `source()` chaining is now partial rather than absent
 
-`std::error::Error::source` returns `Some` only for `Error::Os`; every other
-variant is a leaf, including the ones that wrap a condition with a cause worth
-naming. `ops::MissingField` matches this deliberately.
+**Partly resolved, and the remainder re-costed.** The entry used to read
+"`source()` returns `Some` only for `Error::Os`". `Os` no longer exists. Each of
+the six per-API types now chains through every variant that genuinely wraps
+another error — `Ring`, `Buf`, `Other`, and on `file::Error` and `pipe::Error`
+also `Driver` — because those variants hold the wrapped value and had nowhere
+else to put it.
 
-Adding chaining would be an improvement and is a behaviour change: code that
-walks the source chain would start seeing links that were not there. It was left
-out of the error-type work deliberately rather than bundled into it, on the
-grounds that improvements should not ride along inside a refactor where nobody is
-looking for them. Cost if taken: an audit of all 25 variants for what their cause
-actually is, plus a decision about whether `Display` should then stop repeating
-what the source already says.
+What remains undone is the original point: the variants that name a *condition*
+are still leaves, even where the condition has a cause worth naming.
+`ops::MissingField` matches this deliberately.
+
+This was not an improvement smuggled into a refactor. The chaining that appeared
+is a consequence of the wrapping variants existing at all, not a separate
+decision; the audit that was declined is still declined. Cost if taken: an audit
+of all 50 variants across the six types for what their cause actually is — up
+from 25 across one type, so the change got more expensive, not less — plus a
+decision about whether `Display` should then stop repeating what the source
+already says.
 
 ### SQE flags are not available on every path
 
@@ -280,7 +290,7 @@ Two specific hazards follow, both accepted rather than solved:
 - **An operation that never completes hangs the shutdown.** Cancellation is
   best-effort, so an operation the platform will not abandon has no exit. The
   alternative — giving up and freeing memory the kernel may still write into —
-  is a use-after-free, so hanging is the lesser failure. `Error::ShutdownStalled`
+  is a use-after-free, so hanging is the lesser failure. `runtime::Error::ShutdownStalled`
   exists so the caller can at least see it happening.
 - **Registrations cannot be cancelled at all.** A cancellation must name the file
   its target named, and a registration names none, so one in flight can only be
@@ -605,7 +615,7 @@ and it is paid in every debug `cargo test` run.
 - `cqe.Information as Transferred` is an unchecked `usize` → `u32` truncation.
   Safe today because every submission path bounds the length by a `u32` argument,
   but a `debug_assert!` would document and enforce that invariant for free.
-- `AsyncEvent::wait_sync` maps `WAIT_TIMEOUT` to `Error::from_thread()`, which
+- `AsyncEvent::wait_sync` maps `WAIT_TIMEOUT` to `windows::core::Error::from_thread()`, which
   reports whatever unrelated error happens to be in thread-local storage.
   `WAIT_TIMEOUT` is a return value, not a last-error condition. Both match arms
   are also identical, so the explicit `WAIT_TIMEOUT` arm looks like it

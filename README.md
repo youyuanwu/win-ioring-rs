@@ -20,9 +20,11 @@ need to support older Windows, load a separate module dynamically.
 
 Because of that, this crate has no error meaning "this host has no IoRing". It
 reports only the shortfalls a host *with* IoRing can still have, each as its own
-variant you can match on: `Error::UnsupportedVersion` for a ring version below
-what you asked for, `Error::UnsupportedFeature` for a missing feature flag, and
-`Error::UnsupportedOp` for an operation the host does not implement.
+variant you can match on, and the type tells you when you will find out:
+`io_ring::BuildError::UnsupportedVersion` for a ring version below what you asked
+for and `io_ring::BuildError::UnsupportedFeature` for a missing feature flag,
+both at construction; `io_ring::Error::UnsupportedOp` for an operation the host
+does not implement, which you cannot learn until you submit one.
 
 ## Runtime agnostic
 

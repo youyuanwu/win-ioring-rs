@@ -14,7 +14,7 @@ at 0.62.2. Where a value is host-specific it says so.
 IoRing fails to load the *process*.
 
 There is therefore no such thing as a graceful "this host does not support
-IoRing" error, and the crate does not pretend to offer one. `Error::Unsupported*`
+IoRing" error, and the crate does not pretend to offer one. `io_ring::BuildError::Unsupported*` and `io_ring::Error::UnsupportedOp`
 covers only the shortfalls a host *with* IoRing can still have: a version below
 what was asked for, a missing feature flag, or an unimplemented operation.
 
