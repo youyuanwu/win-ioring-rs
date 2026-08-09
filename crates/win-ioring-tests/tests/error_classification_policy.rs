@@ -1,20 +1,27 @@
-//! FR-1, FR-10, FR-11, FR-16: error classification has exactly one home.
+//! FR-1, FR-10, FR-11, FR-16: error classification has exactly one home per code.
 //!
 //! The crate's own voice, in `pipe/client.rs`, warns that `ERROR_PIPE_BUSY`
 //! from a failed open and `ERROR_PIPE_BUSY` from a completion must produce the
 //! same condition, and that "two independent match arms are exactly how that
 //! stops being true after someone edits one of them". Per-API error types make
-//! that hazard sharper, not softer: five error types that each classify codes
+//! that hazard sharper, not softer: six error types that each classify codes
 //! independently would diverge the first time one of them was edited.
 //!
-//! The design's answer is that `error::classify` is the only function mapping
-//! an `HRESULT` to a condition, and every error type is an exhaustive view over
-//! its result. Those are claims about source text, so they are checked here
+//! The design's answer is that `error::pipe_table` and `error::ring_table` are
+//! the only places a code is compared, that their code sets are **disjoint**, and
+//! that every other type reaches a condition by delegating rather than by
+//! comparing. Those are claims about source text, so they are checked here
 //! against source text. `dependency_policy.rs` is the nearest precedent for a
 //! test that reads the repository rather than running it — but it parses
 //! manifests, and this reads `.rs` files, so the machinery is new.
 //!
-//! # Three guards, deliberately independent
+//! Disjointness is not checked here. It is a property of *values*, not of source
+//! text, so it is asserted in `error.rs` by
+//! `the_two_tables_name_disjoint_codes`, which reads the two tables themselves.
+//! That split is deliberate: a value check cannot be evaded by choosing different
+//! syntax, and belongs where it can read the data.
+//!
+//! # Guards, deliberately independent
 //!
 //! An earlier version of this file had one guard per claim, and a review broke
 //! four of five with code that compiles and is idiomatic in this crate: a
@@ -24,29 +31,39 @@
 //! bypass was narrow, and each defeated the whole file, because the guards
 //! shared assumptions.
 //!
-//! So there are now three, and they fail independently:
+//! So they fail independently:
 //!
 //! 1. [`the_table_constants_have_one_home`] — the five Win32 constants that
-//!    *are* the table may appear only in `classify`. A second table has to name
-//!    them, whatever syntax it uses to compare them.
-//! 2. [`error_classification_has_one_home`] — no line outside `classify` may
-//!    decide anything from a platform error code, with the exceptions
-//!    enumerated and justified here.
-//! 3. [`every_match_on_a_condition_is_an_armed_view`] — every `match` on a
-//!    `Condition`, wherever it lives and whatever its function is called, must
-//!    arm both wildcard lints and must not use a wildcard.
+//!    *are* the tables may appear only in `pipe_table` and `ring_table`. A third
+//!    table has to name them, whatever syntax it uses to compare them.
+//! 2. [`error_classification_has_one_home`] — no line outside those two
+//!    functions may decide anything from a platform error code, with the
+//!    exceptions enumerated and justified here.
+//! 3. [`condition_is_not_part_of_the_public_api`] — the condition types and the
+//!    tables stay `pub(crate)`, and the two tables keep the exact names guard 1
+//!    and 2 exempt.
+//!
+//! The exemption in guards 1 and 2 is keyed on the names `pipe_table` and
+//! `ring_table`, never on `fn from(`. The tables are consulted from `From`
+//! implementations, and exempting that name would unpolice most of the crate's
+//! conversion surface; holding the tables in two distinctly named functions is
+//! what keeps the exemption narrow enough to be worth having.
 //!
 //! # What this cannot catch
 //!
 //! Stated rather than glossed, because a policy test that implies more coverage
-//! than it has is worse than none. A second table built from bare numeric
+//! than it has is worse than none. A third table built from bare numeric
 //! literals — `&[(231u32, Error::PipeBusy), …]` — names no constant and makes
-//! no comparison this file recognises. Guard 3 still forces any *view* to be
-//! exhaustive and armed, so such a table could not silently disagree with a
-//! view; but it could disagree with `classify`. That residue is why the
-//! allowlist below carries reasons rather than just names: the reasons are what
-//! a reader checks when this file says a change is fine.
-
+//! no comparison this file recognises. It would also be invisible to the
+//! disjointness check, which reads the two real tables and cannot know about a
+//! third. That residue is why the allowlist below carries reasons rather than
+//! just names: the reasons are what a reader checks when this file says a change
+//! is fine.
+//!
+//! A guard that formerly stood here policed the `ConditionView` trait. It went
+//! with the trait, and the note at the foot of this file records why — including
+//! the correction that the trait bought *totality*, not *singularity*, and that
+//! these guards were always what prevented a second table.
 use std::path::{Path, PathBuf};
 
 /// The source root of the crate under test.
@@ -276,8 +293,16 @@ fn policed_lines(text: &str) -> Vec<(usize, &str)> {
         let line = lines[index];
         let trimmed = line.trim();
 
-        let starts_classify =
-            trimmed.starts_with("pub(crate) fn classify(") || trimmed.starts_with("fn classify(");
+        // The two classification tables, exempted **by their own names**.
+        //
+        // Not by `fn from(`. The tables are consulted from `From` implementations,
+        // and exempting that name would unpolice every `From` in the crate -- which
+        // is most of the conversion surface. Holding the tables in two distinctly
+        // named functions is what keeps the exemption this narrow.
+        let starts_classify = ["pipe_table", "ring_table"].iter().any(|name| {
+            trimmed.starts_with(&format!("pub(crate) fn {name}("))
+                || trimmed.starts_with(&format!("fn {name}("))
+        });
         let starts_test_mod = trimmed == "#[cfg(test)]"
             && lines
                 .get(index + 1)
@@ -404,10 +429,12 @@ fn the_table_constants_have_one_home() {
     assert!(
         offenders.is_empty(),
         "these production sites name a classification-table constant outside \
-         `error::classify`:\n{}\n\nThese five constants are the table. A second \
-         place that names one is a second table, and two tables are how \
-         ERROR_PIPE_BUSY from an open and from a completion stop meaning the \
-         same thing. Route the code through `classify` instead.",
+         `error::pipe_table` and `error::ring_table`:\n{}\n\nThese five \
+         constants are the tables. A third place that names one is a third \
+         table, and multiple tables are how ERROR_PIPE_BUSY from an open and \
+         from a completion stop meaning the same thing. Add the code to one of \
+         the two tables instead, and note that `the_two_tables_name_disjoint_codes` \
+         requires it to appear in exactly one.",
         offenders.join("\n")
     );
 }
@@ -487,14 +514,14 @@ fn every_allowlisted_site_still_exists_exactly_as_often_as_recorded() {
     }
 }
 
-/// The derivation behind the design's headline cost: `Condition` adds no public
-/// variant slots.
+/// The derivation behind the design's headline cost: the condition types add no
+/// public variant slots.
 ///
-/// The per-API split was costed at 46 to 48 public variants across six types.
-/// That figure counts only types callers can name. `Condition` is `pub(crate)`,
-/// appears in no public signature, and is not re-exported, so it contributes
-/// zero. Checked rather than asserted, because it is a claim about the design's
-/// cost and an unchecked number in this work has a poor record.
+/// The per-API split ships 46 public variants across six types. That figure
+/// counts only types callers can name. `PipeCondition` and `RingCondition` are
+/// `pub(crate)`, appear in no public signature, and are not re-exported, so they
+/// contribute zero. Checked rather than asserted, because it is a claim about the
+/// design's cost and an unchecked number in this work has a poor record.
 #[test]
 fn condition_is_not_part_of_the_public_api() {
     let error_rs =
@@ -505,16 +532,29 @@ fn condition_is_not_part_of_the_public_api() {
          makes a second match on a condition unrepresentable rather than merely \
          discouraged: no other module can name the type."
     );
-    assert!(
-        error_rs.contains("\n    enum Condition {"),
-        "Condition is no longer private to the classification module; the public \
-         variant count in the design's costing assumed it contributed nothing, \
-         and a nameable Condition can be matched a second time"
-    );
-    assert!(
-        error_rs.contains("\n    fn classify("),
-        "classify is no longer private to the classification module"
-    );
+    for item in [
+        "\n    pub(crate) enum PipeCondition {",
+        "\n    pub(crate) enum RingCondition {",
+    ] {
+        assert!(
+            error_rs.contains(item),
+            "{item:?} is missing or is no longer `pub(crate)`; the public variant \
+             count in the design's costing assumes the condition types contribute \
+             nothing"
+        );
+    }
+    for table in [
+        "\n    pub(crate) fn pipe_table(",
+        "\n    pub(crate) fn ring_table(",
+    ] {
+        assert!(
+            error_rs.contains(table),
+            "{table:?} is missing. The two tables are exempted from \
+             `error_classification_has_one_home` by these exact names, so renaming \
+             one silently un-exempts it -- or, worse, leaves the exemption \
+             matching nothing while the table moves somewhere unpoliced."
+        );
+    }
     assert!(
         !error_rs.contains("pub use classification"),
         "the classification module's contents are re-exported, which undoes the \
@@ -525,7 +565,11 @@ fn condition_is_not_part_of_the_public_api() {
         let text = std::fs::read_to_string(&path).expect("source file is readable");
         for (index, line) in text.lines().enumerate() {
             let trimmed = line.trim();
-            if !trimmed.contains("Condition") && !trimmed.contains("classify") {
+            if !trimmed.contains("Condition")
+                && !trimmed.contains("classify")
+                && !trimmed.contains("pipe_table")
+                && !trimmed.contains("ring_table")
+            {
                 continue;
             }
             // `pub` followed by any function form: `pub fn`, `pub const fn`,
@@ -536,7 +580,8 @@ fn condition_is_not_part_of_the_public_api() {
             let exported = trimmed.starts_with("pub use");
             assert!(
                 !(public_fn || exported),
-                "{rel}:{}: Condition or classify reached the public API: {trimmed}",
+                "{rel}:{}: a condition type or classifier reached the public API: \
+                 {trimmed}",
                 index + 1
             );
         }
@@ -544,369 +589,20 @@ fn condition_is_not_part_of_the_public_api() {
 }
 
 // ---------------------------------------------------------------------------
-// The mechanism guard: E0046 and its two residual hazards.
+// Retired: the view-trait mechanism guards.
 //
-// Adding a variant to a source enum is caught by the compiler in two steps —
-// E0004 on the dispatch, then E0046 on every view that has not implemented the
-// new method. Both are hard `rustc` errors and neither can be silenced by an
-// attribute, so nothing here needs to re-check them; `compile_fail` twins in
-// `error_view_exhaustiveness.rs` pin that they fire.
+// This section policed a `ConditionView` trait -- one method per condition,
+// implemented by five error types and dispatched by a single `view` function --
+// against the two edits that would stop `E0046` firing: a default method body,
+// and a dispatch arm calling the wrong method. Both guards, their `E0046`
+// compile-twin, and `error_view_exhaustiveness.rs` went when the trait did.
 //
-// What the compiler cannot see are the two edits that stop it firing at all.
-// This is where those are pinned.
+// The trait was replaced by two tables consulted from `From` implementations.
+// The reason is recorded in the `classification` module docs, and the part worth
+// repeating here is the part this file got wrong: **the trait bought totality,
+// not singularity.** It forced every view to account for every condition. It
+// never prevented a second table -- a view method received the raw `HRESULT` and
+// could always have compared it -- so the guards above, not the trait, were
+// always what stopped a second table. They still are, which is why they stayed
+// and these did not.
 // ---------------------------------------------------------------------------
-
-/// How many view traits the crate is known to have.
-///
-/// # Why one, when the spec anticipated four
-///
-/// Spec §3.4 lists six conversion rows and estimated a trait for each family.
-/// Implemented, only one row needs a trait, and the derivation is worth keeping
-/// because the number looks too low:
-///
-/// - **Rows 1–3** (`io_ring::Error`, `buf::Error`, `ops::MissingField` into the
-///   surface types) carry the source value *whole* — `Error::Ring(value)` and
-///   friends. Adding a variant to the source needs no edit at any destination,
-///   so there is no per-variant mapping that can go stale and nothing for a
-///   trait to guard. A trait here would be machinery protecting nothing.
-/// - **Rows 4–5** (`runtime::Error` into the two boundary types) *are*
-///   per-variant, and are guarded by two compiler errors rather than a trait: a
-///   new variant is E0004 because every variant is named, and the wildcard that
-///   would silence E0004 is itself an error under
-///   `#[deny(clippy::wildcard_enum_match_arm)]` at both impls. Those are the
-///   same two doors E0046 shuts, for one attribute instead of a seventeen-method
-///   trait implemented twice.
-/// - **Row 6** (a condition into every view) is the one that needs
-///   `ConditionView`, because it is the only row where several destinations map
-///   the *same* source variant independently — which is the divergence the whole
-///   design exists to prevent.
-///
-/// So the count is one because only one row has independent per-variant mapping
-/// across multiple destinations. If a second such row ever appears, this
-/// constant must rise with it.
-///
-/// Row 3 has a narrower hazard of its own — `MissingField` is a struct, so
-/// *widening* it would silently drop the new field at three destinations. That
-/// is pinned by destructuring rather than by a trait: the conversions bind
-/// `let MissingField { field } = value`, which is E0027 the moment a field is
-/// added. Verified by adding one.
-///
-/// Discovered traits are counted against this rather than being looked up by
-/// name, so a fifth trait cannot arrive un-covered: it either fails this
-/// assertion or is deliberately recorded here. A hand-written list of trait
-/// names would have the opposite property — the guard would keep passing while
-/// covering less than the mechanism it exists to protect.
-const VIEW_TRAITS: usize = 1;
-
-/// How many dispatch functions the crate is known to have — one per view trait.
-const DISPATCH_FUNCTIONS: usize = 1;
-
-/// `QueueFull` -> `queue_full`.
-fn snake_case(variant: &str) -> String {
-    let mut out = String::new();
-    for (position, character) in variant.char_indices() {
-        if character.is_uppercase() {
-            if position != 0 {
-                out.push('_');
-            }
-            out.extend(character.to_lowercase());
-        } else {
-            out.push(character);
-        }
-    }
-    out
-}
-
-/// The lines of the body of the item declared at `start`, by brace depth.
-fn item_body<'a>(lines: &[&'a str], start: usize) -> Vec<&'a str> {
-    let mut depth = 0usize;
-    let mut out = Vec::new();
-    for line in &lines[start..] {
-        let opened = line.matches('{').count();
-        let closed = line.matches('}').count();
-        if depth > 0 {
-            out.push(*line);
-        }
-        depth = depth + opened - closed.min(depth + opened);
-        if depth == 0 && (opened > 0 || !out.is_empty()) {
-            break;
-        }
-    }
-    out.pop();
-    out
-}
-
-/// No method of any view trait may have a default body.
-///
-/// A default body is the first of two ways to disarm `E0046`. It makes the
-/// method optional, so a view that has never heard of a condition compiles and
-/// silently answers for it. Nothing else in the mechanism notices: the trait
-/// still exists, the dispatch is still exhaustive, and every lint is still
-/// armed.
-#[test]
-fn no_view_trait_method_has_a_default_body() {
-    let mut traits_found = 0usize;
-    let mut offenders = Vec::new();
-
-    for (rel, path) in source_files() {
-        let text = std::fs::read_to_string(&path).expect("source file is readable");
-        let lines: Vec<&str> = text.lines().collect();
-
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix("pub(crate) trait ") else {
-                continue;
-            };
-            let name = rest
-                .split(|c: char| !c.is_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or("");
-            if !name.ends_with("View") {
-                continue;
-            }
-            traits_found += 1;
-
-            for (offset, method) in item_body(&lines, index).iter().enumerate() {
-                let method = method.trim();
-                if !method.starts_with("fn ") {
-                    continue;
-                }
-                // A signature may wrap across lines, so read forward to
-                // whichever of `;` or `{` terminates it. Judging the first line
-                // alone would report every wrapped signature as a default body,
-                // and the fix for that false positive would be to relax the
-                // check — which is how a guard stops guarding.
-                let body = item_body(&lines, index);
-                let mut declaration = String::new();
-                for line in &body[offset..] {
-                    declaration.push_str(line.trim());
-                    if line.trim_end().ends_with(';') || line.contains('{') {
-                        break;
-                    }
-                    declaration.push(' ');
-                }
-                if !declaration.ends_with(';') {
-                    offenders.push(format!("{rel}: trait {name}: {declaration}"));
-                }
-            }
-        }
-    }
-
-    assert!(
-        offenders.is_empty(),
-        "a view trait method has a default body, which makes it optional and \
-         lets a stale view compile — the exact silent demotion E0046 exists to \
-         prevent:\n  {}",
-        offenders.join("\n  ")
-    );
-
-    assert_eq!(
-        traits_found, VIEW_TRAITS,
-        "expected {VIEW_TRAITS} view trait(s), found {traits_found}. If you \
-         added one, raise VIEW_TRAITS; if you removed one, lower it. If you \
-         changed neither, this guard has stopped recognising a trait that still \
-         exists, and is no longer covering the whole mechanism."
-    );
-}
-
-/// Every dispatch arm must call the method named for the variant it matches,
-/// and every trait method must be called by exactly one arm.
-///
-/// This is the second way to disarm `E0046`, and it was found by mutating this
-/// design after adopting it. Writing
-///
-/// ```ignore
-/// Condition::NewlyAdded => V::other(hr),
-/// ```
-///
-/// satisfies E0004 without adding a trait method, so E0046 never fires and
-/// every view in the crate silently demotes the new condition. Clippy reports
-/// nothing, because the arm names its variant and no wildcard is involved.
-///
-/// The bijection is what catches it: `other` would then be called twice. Name
-/// correspondence alone would also catch it, but the bijection additionally
-/// catches a method that no arm reaches, which is the same fault seen from the
-/// other end.
-#[test]
-fn every_dispatch_arm_calls_the_method_named_for_its_variant() {
-    let mut dispatches = 0usize;
-
-    for (rel, path) in source_files() {
-        let text = std::fs::read_to_string(&path).expect("source file is readable");
-        let lines: Vec<&str> = text.lines().collect();
-
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            if !trimmed.contains("fn ") || !trimmed.contains("View>") {
-                continue;
-            }
-            let Some(bound) = trimmed.split_once("<V: ") else {
-                continue;
-            };
-            let trait_name = bound.1.split('>').next().unwrap_or("");
-            if !trait_name.ends_with("View") {
-                continue;
-            }
-            dispatches += 1;
-
-            let mut called = Vec::new();
-            for arm in item_body(&lines, index) {
-                let arm = arm.trim();
-                let Some((pattern, action)) = arm.split_once("=>") else {
-                    continue;
-                };
-                let Some((_, variant)) = pattern.trim().rsplit_once("::") else {
-                    continue;
-                };
-                let variant = variant
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .next()
-                    .unwrap_or("");
-                let method = action
-                    .trim()
-                    .strip_prefix("V::")
-                    .and_then(|rest| rest.split('(').next())
-                    .unwrap_or("");
-
-                assert_eq!(
-                    method,
-                    snake_case(variant),
-                    "in {rel}, the dispatch for {trait_name} routes {variant} to \
-                     `{method}`, which is not the method named for it. Routing a \
-                     variant to another variant's method satisfies E0004 without \
-                     adding a trait method, so E0046 never fires and every view \
-                     silently demotes it."
-                );
-                called.push(method.to_string());
-            }
-
-            let mut unique = called.clone();
-            unique.sort();
-            unique.dedup();
-            assert_eq!(
-                called.len(),
-                unique.len(),
-                "in {rel}, the dispatch for {trait_name} calls a method from more \
-                 than one arm, so two conditions are indistinguishable to every \
-                 view"
-            );
-
-            let declaration = lines
-                .iter()
-                .position(|l| {
-                    l.trim_start()
-                        .starts_with(&format!("pub(crate) trait {trait_name}"))
-                })
-                .expect("the dispatch's trait is declared in the same file");
-            let methods = item_body(&lines, declaration)
-                .iter()
-                .filter(|l| l.trim().starts_with("fn "))
-                .count();
-            assert_eq!(
-                called.len(),
-                methods,
-                "in {rel}, {trait_name} has {methods} method(s) but its dispatch \
-                 reaches {} of them; a method no arm calls is a condition no \
-                 view will ever be asked about",
-                called.len()
-            );
-        }
-    }
-
-    assert_eq!(
-        dispatches, DISPATCH_FUNCTIONS,
-        "expected {DISPATCH_FUNCTIONS} dispatch function(s), found {dispatches}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// E0046 itself.
-//
-// The two tests above pin the crate-specific preconditions — no default bodies,
-// and a dispatch that reaches each method exactly once. With those held, the
-// remaining claim is a property of `rustc`: a trait method with no default body
-// is required, and an impl that omits it does not compile.
-//
-// That claim cannot be pinned against the real trait. `ConditionView` is private
-// to `error::classification`, so no doctest and no external test crate can name
-// it, and making it public to test it would hand the crate a public trait with
-// one method per condition — which is precisely the public cost the design
-// exists to avoid. Testing it in a replica is the honest alternative, and the
-// scope of what that covers is stated here rather than implied.
-// ---------------------------------------------------------------------------
-
-/// The shape of a view trait, reduced to what `E0046` acts on.
-const REPLICA: &str = r#"
-trait ConditionView: Sized {
-    fn pipe_broken(hr: u32) -> Self;
-    fn other(hr: u32) -> Self;
-    // ADDED: a new condition has just been named.
-    fn pipe_listening(hr: u32) -> Self;
-}
-
-enum FileError { Broken(u32), Other(u32), Listening(u32) }
-
-impl ConditionView for FileError {
-    fn pipe_broken(hr: u32) -> Self { FileError::Broken(hr) }
-    fn other(hr: u32) -> Self { FileError::Other(hr) }
-"#;
-
-/// The view has **not** been updated for the new method.
-const STALE: &str = "}\n";
-
-/// The view **has** been updated. Identical in every other respect.
-const UPDATED: &str = "    fn pipe_listening(hr: u32) -> Self { FileError::Listening(hr) }\n}\n";
-
-/// Adding a method to a view trait fails to compile every view that has not
-/// implemented it, and the failure is `E0046`.
-///
-/// The two halves share `REPLICA` verbatim and differ only in whether the impl
-/// provides the new method. That is what makes the failing half non-vacuous: if
-/// the shared setup ever stopped compiling for an unrelated reason — a rename,
-/// a syntax error, an edition change — the *passing* half would fail too, and
-/// this test would report that rather than quietly reporting success. A
-/// `compile_fail` doctest without such a sibling reports `ok` when it fails for
-/// the wrong reason, and this crate has shipped one that did exactly that.
-///
-/// The error code is asserted for the same reason: "it did not compile" is not
-/// evidence that the mechanism fired.
-#[test]
-fn omitting_a_view_trait_method_is_e0046() {
-    let dir = std::env::temp_dir().join(format!("win-ioring-e0046-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch directory is creatable");
-
-    let compile = |name: &str, tail: &str| {
-        let source = dir.join(format!("{name}.rs"));
-        std::fs::write(&source, format!("{REPLICA}{tail}")).expect("snippet is writable");
-        std::process::Command::new("rustc")
-            .args(["--crate-type", "lib", "--edition", "2021", "--out-dir"])
-            .arg(&dir)
-            .arg(&source)
-            .output()
-            .expect("rustc runs")
-    };
-
-    let updated = compile("updated", UPDATED);
-    assert!(
-        updated.status.success(),
-        "the sibling that implements the new method must compile, or the failing \
-         half below proves nothing:\n{}",
-        String::from_utf8_lossy(&updated.stderr)
-    );
-
-    let stale = compile("stale", STALE);
-    assert!(
-        !stale.status.success(),
-        "a view that has not implemented the new method compiled, so E0046 is \
-         not protecting the mechanism"
-    );
-    let stderr = String::from_utf8_lossy(&stale.stderr);
-    assert!(
-        stderr.contains("E0046"),
-        "the stale view failed to compile, but not with E0046 — so this test is \
-         passing for the wrong reason, which is the failure mode it exists to \
-         rule out:\n{stderr}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}

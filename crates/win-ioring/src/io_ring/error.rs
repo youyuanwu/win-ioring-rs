@@ -15,8 +15,6 @@
 
 use std::fmt;
 
-use crate::error::ConditionView;
-
 /// An error produced while constructing an [`IoRing`](crate::io_ring::IoRing).
 ///
 /// Every named variant here is a statement about the *host*, not about the
@@ -125,7 +123,7 @@ impl BuildError {
         if err.code() == E_NOTIMPL {
             BuildError::Unsupported
         } else {
-            crate::error::view::<BuildError>(err.code())
+            BuildError::from(err.code())
         }
     }
 
@@ -143,77 +141,34 @@ impl BuildError {
 
 impl From<windows::core::Error> for BuildError {
     fn from(value: windows::core::Error) -> Self {
-        crate::error::view::<BuildError>(value.code())
+        BuildError::from(value.code())
     }
 }
 
 impl From<windows::core::HRESULT> for BuildError {
     fn from(value: windows::core::HRESULT) -> Self {
-        crate::error::view::<BuildError>(value)
+        // The build surface names no condition from a code. `Unsupported` comes
+        // from `from_create_failure`, which reads `E_NOTIMPL` from ring-creation
+        // entry points only -- see the `classification` module docs.
+        BuildError::Other(value.into())
     }
 }
 
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
-        crate::error::view::<Error>(value.code())
+        Error::from(value.code())
     }
 }
 
 impl From<windows::core::HRESULT> for Error {
     fn from(value: windows::core::HRESULT) -> Self {
-        crate::error::view::<Error>(value)
-    }
-}
-
-impl ConditionView for BuildError {
-    fn queue_full(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-
-    fn pipe_busy(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-
-    fn pipe_broken(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-
-    fn pipe_no_peer(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-
-    fn pipe_listening(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        BuildError::Other(hr.into())
-    }
-}
-
-impl ConditionView for Error {
-    fn queue_full(_hr: windows::core::HRESULT) -> Self {
-        Error::QueueFull
-    }
-
-    fn pipe_busy(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_broken(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_no_peer(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_listening(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
+        // One of the crate's two classification tables. Every other surface
+        // reaches a ring condition by delegating here, never by comparing the
+        // code itself.
+        match crate::error::classify_ring(value) {
+            Some(crate::error::RingCondition::QueueFull) => Error::QueueFull,
+            None => Error::Other(value.into()),
+        }
     }
 }
 

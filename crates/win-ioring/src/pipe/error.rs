@@ -16,8 +16,6 @@
 
 use std::fmt;
 
-use crate::error::ConditionView;
-
 /// An error produced by an operation on a pipe.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -94,32 +92,6 @@ impl Error {
             | Error::AbandonedAtShutdown
             | Error::TooManyOperations => None,
         }
-    }
-}
-
-impl ConditionView for Error {
-    fn queue_full(_hr: windows::core::HRESULT) -> Self {
-        Error::Ring(crate::io_ring::error::Error::QueueFull)
-    }
-
-    fn pipe_busy(_hr: windows::core::HRESULT) -> Self {
-        Error::Busy
-    }
-
-    fn pipe_broken(_hr: windows::core::HRESULT) -> Self {
-        Error::Broken
-    }
-
-    fn pipe_no_peer(_hr: windows::core::HRESULT) -> Self {
-        Error::NoPeer
-    }
-
-    fn pipe_listening(_hr: windows::core::HRESULT) -> Self {
-        Error::Listening
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
     }
 }
 
@@ -204,13 +176,27 @@ impl From<crate::io_ring::ops::MissingField> for Error {
 
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
-        crate::error::view::<Error>(value.code())
+        Error::from(value.code())
     }
 }
 
 impl From<windows::core::HRESULT> for Error {
     fn from(value: windows::core::HRESULT) -> Self {
-        crate::error::view::<Error>(value)
+        // One of the crate's two classification tables, and the only type that
+        // names a pipe condition. Anything the pipe table does not name delegates
+        // to the ring surface exactly as `file::Error` does.
+        match crate::error::classify_pipe(value) {
+            Some(crate::error::PipeCondition::Busy) => Error::Busy,
+            Some(crate::error::PipeCondition::Broken) => Error::Broken,
+            Some(crate::error::PipeCondition::NoPeer) => Error::NoPeer,
+            Some(crate::error::PipeCondition::Listening) => Error::Listening,
+            None => match crate::io_ring::error::Error::from(value) {
+                crate::io_ring::error::Error::Other(e) => Error::Other(e),
+                named @ (crate::io_ring::error::Error::QueueFull
+                | crate::io_ring::error::Error::UnsupportedOp { .. }
+                | crate::io_ring::error::Error::RingClosed) => Error::Ring(named),
+            },
+        }
     }
 }
 
@@ -248,7 +234,7 @@ impl From<crate::runtime::error::Error> for Error {
             R::MissingField { field } => Error::MissingField { field },
             R::TooManyOperations => Error::TooManyOperations,
             // Every pipe condition arrives here, not in an arm of its own.
-            R::Other(e) => crate::error::view::<Error>(e.code()),
+            R::Other(e) => Error::from(e.code()),
             // Driver-only, and unreachable from a pipe completion. Named
             // individually rather than caught by a wildcard: a wildcard would
             // silently box a *new* condition this surface *can* produce, which

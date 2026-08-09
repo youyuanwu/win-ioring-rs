@@ -751,7 +751,7 @@ syntactic form a construct can take — and the next round would have drawn thre
 more. A guard that must anticipate every spelling of a construct is playing a
 game it cannot win.
 
-The replacement is a trait with one method per condition and no default bodies,
+The replacement was a trait with one method per condition and no default bodies,
 so a missing case is `E0046` under plain `cargo build`, and un-`allow`able. Its
 residual hazard is bounded: a default body, at a named set of sites, enumerated
 by a test that fails if the set grows. That is a difference in *kind*, not
@@ -772,6 +772,38 @@ Two riders, both learned the hard way:
   exhaustive match is defeated by adding a wildcard, and a comment saying "do not
   add a wildcard here" is not a guard. `#[deny(clippy::wildcard_enum_match_arm)]`
   is.
+- **Say which property the guard actually guarantees, or it gets credited with
+  more than it does.** This is the sharper version of the lesson, and it was
+  learned by getting it wrong. The trait above was described, here and in the
+  crate, as making a second classification table *unrepresentable*. It did not.
+  It made a **missing case** unrepresentable -- it bought **totality**, that every
+  view accounts for every condition. It never bought **singularity**: each view
+  method received the raw `HRESULT` and could always have compared it, so a
+  second table was exactly as writable with the trait as without. The thing
+  actually preventing a second table was, throughout, the source-text guard in
+  `error_classification_policy.rs`.
+
+  The cost of the confusion was two review rounds spent defending the trait
+  against removal on the strength of a guarantee it was not providing. When it
+  was finally prototyped, the mechanism turned out to be five implementations of
+  thirty methods expressing five code comparisons, and it was retired. Naming the
+  property would have surfaced that far sooner: *totality* is easy to test
+  against a proposal, whereas "makes the bad state unrepresentable" is a slogan
+  that fits any guard you are fond of.
+
+- **A value check beats a text check, where one is available.** The successor
+  design has two classification tables instead of one, which is safe only while
+  their code sets stay disjoint. That is asserted by reading the two tables and
+  intersecting them -- data, not source text. There is no way to spell a code
+  that makes set intersection miss it, which is precisely what the nine defeated
+  scanners lacked. Where a property can be checked against values, the unbounded
+  syntax problem does not arise at all.
+
+  The rider on *that*: such a check is only as good as its source. If the tables
+  were hand-written `if` chains and the test compared two hand-written lists, the
+  test would pass while proving nothing the moment a chain and its list diverged.
+  The tables are arrays, and the classifiers and the test read the same arrays,
+  so a code cannot exist in a classifier and be invisible to the check.
 
 ### A mutation must fail for the reason under test
 

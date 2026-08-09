@@ -9,8 +9,6 @@
 
 use std::fmt;
 
-use crate::error::ConditionView;
-
 /// An error produced by an operation on a [`File`](crate::file::File).
 #[derive(Debug)]
 #[non_exhaustive]
@@ -82,37 +80,6 @@ impl Error {
             | Error::TooManyOperations
             | Error::NotSeekable { .. } => None,
         }
-    }
-}
-
-impl ConditionView for Error {
-    fn queue_full(_hr: windows::core::HRESULT) -> Self {
-        Error::Ring(crate::io_ring::error::Error::QueueFull)
-    }
-
-    // The four pipe conditions are not named by this type. They demote to
-    // `Other` carrying the original code, which is what lets a surface that
-    // does name them recover the condition by re-classifying. Fabricating a
-    // stand-in code here would break that, which is why every method receives
-    // the real `HRESULT`.
-    fn pipe_busy(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_broken(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_no_peer(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_listening(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
     }
 }
 
@@ -199,13 +166,23 @@ impl From<crate::io_ring::ops::MissingField> for Error {
 
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
-        crate::error::view::<Error>(value.code())
+        Error::from(value.code())
     }
 }
 
 impl From<windows::core::HRESULT> for Error {
     fn from(value: windows::core::HRESULT) -> Self {
-        crate::error::view::<Error>(value)
+        // Delegation, not a second table. This type compares no code: it wraps
+        // whatever the ring surface recognised and demotes everything else,
+        // carrying the original code so a surface that *can* name the condition
+        // recovers it by re-classifying. Arms are spelled out rather than bound by
+        // a wildcard so that a new `io_ring::Error` variant is `E0004` here.
+        match crate::io_ring::error::Error::from(value) {
+            crate::io_ring::error::Error::Other(e) => Error::Other(e),
+            named @ (crate::io_ring::error::Error::QueueFull
+            | crate::io_ring::error::Error::UnsupportedOp { .. }
+            | crate::io_ring::error::Error::RingClosed) => Error::Ring(named),
+        }
     }
 }
 
@@ -238,7 +215,7 @@ impl From<crate::runtime::error::Error> for Error {
             R::AbandonedAtShutdown => Error::AbandonedAtShutdown,
             R::MissingField { field } => Error::MissingField { field },
             R::TooManyOperations => Error::TooManyOperations,
-            R::Other(e) => crate::error::view::<Error>(e.code()),
+            R::Other(e) => Error::from(e.code()),
             // Driver-only, and unreachable from a file completion. Named
             // individually rather than caught by a wildcard: a wildcard would
             // silently box a *new* condition this surface *can* produce, which

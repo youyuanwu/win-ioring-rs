@@ -103,7 +103,7 @@ impl ClientOptions {
 
 /// Maps an open failure onto the crate's error type.
 ///
-/// Routes through the crate's single classification table, which is the same
+/// Routes through the crate's pipe classification table, which is the same
 /// funnel every ring completion passes through, rather than repeating the code
 /// comparisons here. That matters more than it looks: `ERROR_PIPE_BUSY` from a
 /// failed open and `ERROR_PIPE_BUSY` from a completion must produce the same

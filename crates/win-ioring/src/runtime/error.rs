@@ -13,8 +13,6 @@
 
 use std::fmt;
 
-use crate::error::ConditionView;
-
 /// An error produced by the driver surface, including registered I/O.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -98,46 +96,6 @@ impl Error {
             | Error::RegistrationSuperseded
             | Error::RegistrationPending => None,
         }
-    }
-}
-
-impl ConditionView for Error {
-    fn queue_full(_hr: windows::core::HRESULT) -> Self {
-        Error::Ring(crate::io_ring::error::Error::QueueFull)
-    }
-
-    // Only `pipe::Error` names a pipe condition; every other view demotes it to
-    // `Other` carrying the code.
-    //
-    // This type is reached through `Handle::read`/`write`/`flush`, which take a
-    // `&File`, and through `read_registered`/`write_registered`, which take a
-    // `FileTarget`. Neither can know whether the handle is a pipe:
-    // `Client::file()` and `Server::file()` hand out a `&File`, and
-    // `FileTarget::Registered` carries only a slot index. A type that cannot
-    // know must not claim to know, so naming would be a guess dressed as a fact.
-    //
-    // Nothing is lost. The code rides in `Other`, and a caller who *does* know
-    // it is a pipe converts to `pipe::Error`, whose `From` re-classifies it and
-    // names it. That is the recovery path, and it is why these take `hr` rather
-    // than discarding it.
-    fn pipe_busy(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_broken(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_no_peer(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn pipe_listening(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
-    }
-
-    fn other(hr: windows::core::HRESULT) -> Self {
-        Error::Other(hr.into())
     }
 }
 
@@ -250,13 +208,23 @@ impl From<crate::io_ring::ops::MissingField> for Error {
 
 impl From<windows::core::Error> for Error {
     fn from(value: windows::core::Error) -> Self {
-        crate::error::view::<Error>(value.code())
+        Error::from(value.code())
     }
 }
 
 impl From<windows::core::HRESULT> for Error {
     fn from(value: windows::core::HRESULT) -> Self {
-        crate::error::view::<Error>(value)
+        // Delegation, not a second table. This type compares no code: it wraps
+        // whatever the ring surface recognised and demotes everything else,
+        // carrying the original code so a surface that *can* name the condition
+        // recovers it by re-classifying. Arms are spelled out rather than bound by
+        // a wildcard so that a new `io_ring::Error` variant is `E0004` here.
+        match crate::io_ring::error::Error::from(value) {
+            crate::io_ring::error::Error::Other(e) => Error::Other(e),
+            named @ (crate::io_ring::error::Error::QueueFull
+            | crate::io_ring::error::Error::UnsupportedOp { .. }
+            | crate::io_ring::error::Error::RingClosed) => Error::Ring(named),
+        }
     }
 }
 

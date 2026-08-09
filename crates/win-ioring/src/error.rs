@@ -1,7 +1,9 @@
-//! The crate's one classification table, and the views over it.
+//! The crate's classification tables.
 //!
-//! This module owns the single mapping from an `HRESULT` to a condition. It
-//! exposes no error type of its own: each public surface has its own, naming
+//! This module owns the crate's only mappings from an `HRESULT` to a condition:
+//! one table for the four pipe codes and one for the single ring code, with
+//! **disjoint** code sets, so every code is still compared in exactly one place.
+//! It exposes no error type of its own: each public surface has its own, naming
 //! only the conditions that surface can produce, with everything else carried
 //! verbatim in that type's `Other` variant.
 //!
@@ -14,10 +16,12 @@
 //! | files | [`crate::file::Error`] |
 //! | pipes | [`crate::pipe::Error`] |
 //!
-//! The point of the arrangement is that the classification happens **once**,
-//! here, and each type is a *view* over the result rather than an independent
-//! classifier. Two surfaces cannot disagree about what `ERROR_PIPE_BUSY` means,
-//! because neither of them decides.
+//! The point of the arrangement is that a given code is classified in exactly
+//! **one** place. `pipe::Error` reads the pipe table; `io_ring::Error` reads the
+//! ring table; `file::Error` and `runtime::Error` compare nothing at all and
+//! delegate to the ring surface, wrapping what it recognised and demoting the
+//! rest. Two surfaces cannot disagree about what `ERROR_PIPE_BUSY` means,
+//! because only one of them decides.
 //!
 //! A condition one surface names and another does not is demoted to `Other`
 //! **carrying the code it arrived with**. So a pipe condition that passes
@@ -100,240 +104,233 @@
 //! and [`crate::io_ring::BuildError::UnsupportedFeature`] therefore describe
 //! hosts where the API set loads but does not provide what this crate needs.
 
-/// The classification table and the views over it.
-///
-/// [Condition] and [classify] are private to this module and are not
-/// re-exported. That is the point: a second match on a condition is not
-/// forbidden elsewhere in the crate, it is **unrepresentable**, because no other
-/// module can name the type. The only way out is [`view`], which classifies and
-/// dispatches in one step.
-///
-/// This replaces a source-scanning test that tried to recognise every match on a
-/// condition and decide whether it was armed. That test was defeated nine times
-/// across three review rounds, always by a syntactic form it had not
-/// anticipated. Privacy does not have to anticipate anything.
 mod classification {
-    /// A platform error condition, named once so that every error type agrees.
+    //! The crate's classification tables.
+    //!
+    //! # Two tables, and why that is still one home per code
+    //!
+    //! A code is compared in exactly one place. [`pipe_table`] holds the four codes
+    //! the pipe surface names; [`ring_table`] holds the one code the ring surface
+    //! names. The sets are **disjoint**, and `the_two_tables_name_disjoint_codes`
+    //! asserts it by reading the tables themselves rather than a restatement of
+    //! them -- so a code cannot be added to a classifier without the test seeing it.
+    //!
+    //! That disjointness is load-bearing. Two tables are safe only while no code
+    //! appears in both: if `ERROR_BROKEN_PIPE` were added to the ring table,
+    //! `pipe::Error` would still name it (it consults its own table first) while
+    //! `file::Error` would receive whatever the ring table said, and the two would
+    //! disagree about one code. That is precisely the hazard `pipe/client.rs` warns
+    //! about in the crate's own voice.
+    //!
+    //! Every other type *delegates*: `file::Error` and `runtime::Error` wrap
+    //! whatever the ring table recognised and demote everything else;
+    //! `io_ring::BuildError` names nothing from a code at all. So no surface
+    //! outside these two functions compares a code, and
+    //! `error_classification_has_one_home` enforces that against the source text.
+    //!
+    //! # Visibility of the condition types
+    //!
+    //! The condition types are `pub(crate)`, because the `From` implementations that
+    //! consult the tables live in the modules that own each error type. They are not
+    //! publicly re-exported, so they add no public variant slots -- but they *are*
+    //! nameable crate-wide, and it is worth being exact about what that costs.
+    //!
+    //! It does not weaken the one-code-one-home property. That property concerns the
+    //! mapping from a **code** to a condition, which happens only in [`pipe_table`]
+    //! and [`ring_table`] and is policed by `error_classification_has_one_home`.
+    //!
+    //! It does mean a second mapping from a *condition* to some type's variants is
+    //! representable. It always was: the `ConditionView` trait this replaced was
+    //! itself `pub(crate)` and implementable by any type. So this is unchanged, and
+    //! the earlier claim that a second match was "unrepresentable" was too strong
+    //! even then -- a view method received the raw `HRESULT` and could always have
+    //! compared it.
+    //!
+    //! This replaces a source-scanning test that tried to recognise every match on a
+    //! condition and decide whether it was armed. That test was defeated nine times
+    //! across three review rounds, always by a syntactic form it had not
+    //! anticipated. Privacy does not have to anticipate anything.
+    //!
+    //! # What this replaced, and what that mechanism actually bought
+    //!
+    //! This was a `Condition` enum with a `ConditionView` trait -- one method per
+    //! condition, implemented by five error types, dispatched by a single `view`
+    //! function. Adding a condition was `E0004` at the dispatch and `E0046` at every
+    //! view, under plain `cargo build`.
+    //!
+    //! It was adopted for good reason, defended twice against proposals to remove
+    //! it, and retired when a prototype showed its load-bearing justification did
+    //! not hold. The justification had been that four views must *recognise*
+    //! `IORING_E_SUBMISSION_QUEUE_FULL`, so one table did work no `From`
+    //! implementation could absorb. They do not recognise it -- they **wrap** what
+    //! the ring surface recognised, which delegation absorbs exactly. Five impls of
+    //! thirty methods were expressing five code comparisons and three wrapping
+    //! rules, and two of the five impls (`file` and `runtime`) were textually
+    //! identical while a third (`BuildError`) named nothing.
+    //!
+    //! The lesson worth keeping is narrower than the one first drawn, and getting it
+    //! wrong is how the mechanism was over-credited: **the trait bought totality,
+    //! not singularity.** It forced every view to *account for* every condition. It
+    //! never prevented a second table -- a view method received the raw `HRESULT`
+    //! and could always have compared it. Preventing a second table was, and
+    //! remains, the job of `error_classification_has_one_home`. Retiring the trait
+    //! surrendered `E0046`, and `E0046`'s benefit did not survive attack: a type
+    //! that cannot name a condition must demote it, and demotion is what an
+    //! unrecognised code already does.
+    //!
+    //! # Scope
+    //!
+    //! These tables cover *platform-derived* conditions only. Conditions the crate
+    //! detects itself -- a shutting-down runtime, a builder field never set -- are
+    //! produced at the call site that knows about them and never pass through here.
+    //!
+    //! `BuildError::Unsupported` is not in either table: it comes from
+    //! `from_create_failure`, which reads `E_NOTIMPL` from ring-creation entry
+    //! points only. Classifying it here would reclassify every unrelated
+    //! `E_NOTIMPL` in the crate.
+
+    /// A pipe condition this crate names.
     ///
-    /// This is the crate's **single classification table**. [`classify`] is the only
-    /// function in the crate that maps an `HRESULT` to a condition, and every public
-    /// error type is a *view* over this enum rather than a second table.
-    ///
-    /// # Why one table
-    ///
-    /// `pipe::Client`'s open path and the ring completion funnel both observe
-    /// `ERROR_PIPE_BUSY`, and both must produce the same condition. Two independent
-    /// match arms are exactly how that stops being true after someone edits one of
-    /// them, which is the hazard `pipe/client.rs` warns about in the crate's own
-    /// voice. A view cannot diverge from the table it reads, so the hazard is
-    /// removed structurally rather than discouraged in a comment.
-    ///
-    /// Each view is a trait implementation with one method per variant and no
-    /// default bodies ([`ConditionView`]), so adding a variant here fails to compile
-    /// every view that has not been updated — with `E0046`, under plain
-    /// `cargo build`, and not by way of any lint or test.
-    /// [`view_convention`] records why the views are traits rather than matches, and
-    /// that is not incidental: the match-and-lint design it replaced was defeated
-    /// nine times.
-    ///
-    /// # Scope
-    ///
-    /// This enum covers *platform-derived* conditions only — those a caller learns
-    /// about by receiving an `HRESULT`. Conditions the crate detects itself, such as
-    /// a shutting-down runtime or a builder field that was never set, are produced
-    /// directly at the call site that knows about them and never pass through here.
-    ///
-    /// It is deliberately `pub(crate)`. It appears in no public signature and is not
-    /// re-exported, so it contributes **no** public variant slots to the crate's API
-    /// surface; see `condition_is_not_part_of_the_public_api` for the check that
-    /// keeps that true.
+    /// `pub(crate)`, in no public signature, contributing no public variant slots;
+    /// `condition_is_not_part_of_the_public_api` checks that this stays true.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Condition {
-        /// The ring's submission queue has no room for another entry.
-        QueueFull,
+    pub(crate) enum PipeCondition {
         /// All instances of the named pipe are busy.
-        PipeBusy,
+        Busy,
         /// The pipe's peer closed its end.
-        PipeBroken,
+        Broken,
         /// The pipe has no peer connected.
-        PipeNoPeer,
+        NoPeer,
         /// The pipe is listening and has not yet been connected to.
-        PipeListening,
-        /// A platform error this crate does not name.
-        ///
-        /// The `HRESULT` is carried so that a view handed only a `Condition` can
-        /// still construct a platform error without a second condition-to-code
-        /// table of its own.
-        ///
-        /// It is **not** what lets a pipe's error survive a trip through a type that
-        /// has no name for it. `classify` is deterministic, so `Other(hr)`
-        /// reclassifies to `Other(hr)` forever and no named condition can be
-        /// recovered from this payload. That recovery runs through the *error
-        /// type's* `Other`, which carries the `HRESULT` the classifier was given —
-        /// see `view_convention`.
-        Other(windows::core::HRESULT),
+        Listening,
     }
 
-    /// Maps a platform `HRESULT` to the condition it denotes.
+    /// A ring condition this crate names.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RingCondition {
+        /// The ring's submission queue has no room for another entry.
+        QueueFull,
+    }
+
+    /// The codes the pipe surface names, and what each one means.
     ///
-    /// This is the only function in the crate that matches on an `HRESULT` to
-    /// produce an error condition. `error_classification_has_one_home` enforces
-    /// that by inspecting the crate's own source text, and carries the allowlist of
-    /// the sites which compare codes for other reasons.
+    /// This array **is** the table. [`classify_pipe`] consults it and
+    /// `the_two_tables_name_disjoint_codes` reads it, so a code added here is
+    /// visible to both and a code added to neither cannot be classified. A
+    /// hand-written `if` chain beside a hand-written test list is the shape this
+    /// avoids: the list can stay at four while the chain grows to five, and the
+    /// test then passes while proving nothing.
     ///
-    /// Codes are matched **exactly**, never by facility or range. This classifier
-    /// sees every ring completion in the crate, so a range match would reclassify
-    /// errors from files and sockets that happen to fall inside it — a much larger
-    /// blast radius than the pipe surface that motivated the pipe codes.
+    /// Codes are matched **exactly**, never by facility or range. These classifiers
+    /// see every ring completion in the crate, so a range match would reclassify
+    /// errors from files and sockets that happen to fall inside it.
     ///
     /// `ERROR_PIPE_CONNECTED` is deliberately absent. It reports that a client
     /// arrived before the accept was issued, which is a **success** for the accept
     /// and is converted at that call site; classifying it here would turn the most
-    /// easily lost connection in the API into an error at the one place with no
-    /// context to recognise it.
-    fn classify(hr: windows::core::HRESULT) -> Condition {
+    /// easily lost connection in the API into an error.
+    pub(crate) fn pipe_table() -> &'static [(windows::core::HRESULT, PipeCondition)] {
         use windows::Win32::Foundation::{
             ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_LISTENING,
-            IORING_E_SUBMISSION_QUEUE_FULL,
         };
-        if hr == IORING_E_SUBMISSION_QUEUE_FULL {
-            Condition::QueueFull
-        } else if hr == ERROR_PIPE_BUSY.to_hresult() {
-            Condition::PipeBusy
-        } else if hr == ERROR_BROKEN_PIPE.to_hresult() {
-            Condition::PipeBroken
-        } else if hr == ERROR_NO_DATA.to_hresult() {
-            Condition::PipeNoPeer
-        } else if hr == ERROR_PIPE_LISTENING.to_hresult() {
-            Condition::PipeListening
-        } else {
-            Condition::Other(hr)
-        }
+        const TABLE: &[(windows::core::HRESULT, PipeCondition)] = &[
+            (ERROR_PIPE_BUSY.to_hresult(), PipeCondition::Busy),
+            (ERROR_BROKEN_PIPE.to_hresult(), PipeCondition::Broken),
+            (ERROR_NO_DATA.to_hresult(), PipeCondition::NoPeer),
+            (ERROR_PIPE_LISTENING.to_hresult(), PipeCondition::Listening),
+        ];
+        TABLE
     }
 
-    /// How views over [`Condition`] are written, and why they are traits.
+    /// The codes the ring surface names.
     ///
-    /// A view is a trait with **one method per condition and no default bodies**,
-    /// dispatched by [`view`], which holds the crate's only `match` on
-    /// [`Condition`]. Adding a condition is caught in two steps, both hard `rustc`
-    /// errors that no attribute can silence:
-    ///
-    /// 1. `E0004` — the dispatch `match` is no longer exhaustive. There is no way
-    ///    to satisfy it without deciding what the new condition means.
-    /// 2. `E0046` — once the trait gains the corresponding method, every view that
-    ///    has not implemented it fails to compile.
-    ///
-    /// Neither step depends on Clippy running, on a lint being armed, or on a test.
-    /// A view contains no `match`, so a wildcard is not *forbidden* in a view — it
-    /// is unrepresentable.
-    ///
-    /// # Why not a hand-written match with a lint
-    ///
-    /// That was the previous design, and it was defeated **nine times across three
-    /// review rounds** by code that compiled, was idiomatic in this crate, and left
-    /// both Clippy and the policing test silent. The defeats were not nine bugs;
-    /// they were nine samples from one unbounded class — *get a `match` past a text
-    /// scanner*:
-    ///
-    /// - `let mapped = match condition { … }` rather than a line beginning `match `;
-    /// - `#![allow(…)]` as the first line of the function body, which overrides an
-    ///   outer `#[deny]` and which a scanner looking for `#[` does not see;
-    /// - a second classification table keyed on `std::io::ErrorKind`, naming no
-    ///   platform identifier at all — and diverging for real, since std maps
-    ///   `ERROR_NO_DATA` to `BrokenPipe` where [`classify`] maps it to `PipeNoPeer`.
-    ///
-    /// Two facts about Clippy made that design weaker than it looked, and both were
-    /// found by mutating a view and watching for a complaint that never came.
-    /// Neither wildcard lint fires inside a `macro_rules!` expansion, so generating
-    /// the views — the obvious way to guarantee the attribute was present —
-    /// guaranteed only that it was present, not that it did anything. And
-    /// `wildcard_enum_match_arm` alone does not fire when the wildcard covers
-    /// exactly *one* remaining variant; that belongs to
-    /// `match_wildcard_for_single_variants`, a different lint in a different group,
-    /// and the single-variant case is the realistic mistake — a view naming every
-    /// condition but the one its author forgot.
-    ///
-    /// Both lints are still denied, on the dispatch, where a wildcard is still
-    /// expressible. They are no longer the guarantee; they are a second line.
-    ///
-    /// # The two residual hazards
-    ///
-    /// Both are bounded, both live at a named site, and both are pinned by
-    /// `error_classification_policy.rs` with a mutation twin.
-    ///
-    /// **A default body** on a trait method restores exactly the silent demotion
-    /// this design removes: the method stops being required by `E0046`, and a stale
-    /// view compiles.
-    ///
-    /// **A dispatch arm routing a new condition to an existing method** — writing
-    /// `Condition::New => V::other(hr)` — satisfies `E0004` without ever adding a
-    /// method, so `E0046` never fires and every view silently demotes the new
-    /// condition. This was found by mutation, against this design, after it was
-    /// adopted; Clippy reports nothing, because the arm names its variant and no
-    /// wildcard is involved. The guard is name-correspondence: arm *i* must call
-    /// the method whose name is the snake_case of the variant it matches, which is
-    /// total over the arms and fails on exactly this edit.
-    mod view_convention {}
-
-    /// A view over [`Condition`], as one method per condition.
-    ///
-    /// Implementing this is how an error type says which conditions it names. There
-    /// are **no default bodies**: a type that has not accounted for every condition
-    /// does not compile, with `E0046`, under plain `cargo build`. See
-    /// [`view_convention`] for why this is a trait and not a `match`.
-    ///
-    /// Every method receives the originating `HRESULT` alongside its condition, so a
-    /// view that cannot name a condition can still carry the code forward rather
-    /// than fabricating a stand-in. [`view`] classifies and dispatches in one step,
-    /// which is what guarantees the code and the condition it is paired with always
-    /// describe the same failure.
-    pub(crate) trait ConditionView: Sized {
-        /// The submission or completion queue had no room.
-        fn queue_full(hr: windows::core::HRESULT) -> Self;
-        /// All pipe instances are busy.
-        fn pipe_busy(hr: windows::core::HRESULT) -> Self;
-        /// The pipe was broken by the peer.
-        fn pipe_broken(hr: windows::core::HRESULT) -> Self;
-        /// The pipe has no peer connected.
-        fn pipe_no_peer(hr: windows::core::HRESULT) -> Self;
-        /// The pipe is listening and not yet connected.
-        fn pipe_listening(hr: windows::core::HRESULT) -> Self;
-        /// A code the table does not classify, or a condition this view does not
-        /// name. The `HRESULT` is passed through unchanged so it can be
-        /// re-classified at a boundary that does name it.
-        ///
-        /// Named for its variant rather than for its meaning — `other`, not
-        /// `unnamed` — so that every dispatch arm's method name is exactly the
-        /// snake_case of the variant it matches, with no exceptions. The
-        /// correspondence guard in `error_classification_policy.rs` needs no
-        /// allowlist as a result, and an allowlist is a place for a future
-        /// mis-routing to hide.
-        fn other(hr: windows::core::HRESULT) -> Self;
+    /// See [`pipe_table`] for why this is an array rather than a chain of
+    /// comparisons.
+    pub(crate) fn ring_table() -> &'static [(windows::core::HRESULT, RingCondition)] {
+        use windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL;
+        const TABLE: &[(windows::core::HRESULT, RingCondition)] =
+            &[(IORING_E_SUBMISSION_QUEUE_FULL, RingCondition::QueueFull)];
+        TABLE
     }
 
-    /// Classifies `hr` and dispatches it to `V`'s view.
+    /// Maps a code to the pipe condition it denotes, if any.
     ///
-    /// This function holds the crate's only `match` on [`Condition`]. Because it
-    /// classifies and dispatches together, no caller can pair a condition with an
-    /// `HRESULT` that did not produce it.
-    #[deny(
-        clippy::wildcard_enum_match_arm,
-        clippy::match_wildcard_for_single_variants
-    )]
-    pub(crate) fn view<V: ConditionView>(hr: windows::core::HRESULT) -> V {
-        match classify(hr) {
-            Condition::QueueFull => V::queue_full(hr),
-            Condition::PipeBusy => V::pipe_busy(hr),
-            Condition::PipeBroken => V::pipe_broken(hr),
-            Condition::PipeNoPeer => V::pipe_no_peer(hr),
-            Condition::PipeListening => V::pipe_listening(hr),
-            Condition::Other(_) => V::other(hr),
-        }
+    /// `None` means "not a pipe condition", which every caller turns into a demotion
+    /// carrying the original code.
+    pub(crate) fn classify_pipe(hr: windows::core::HRESULT) -> Option<PipeCondition> {
+        pipe_table()
+            .iter()
+            .find(|(code, _)| *code == hr)
+            .map(|(_, condition)| *condition)
+    }
+
+    /// Maps a code to the ring condition it denotes, if any.
+    pub(crate) fn classify_ring(hr: windows::core::HRESULT) -> Option<RingCondition> {
+        ring_table()
+            .iter()
+            .find(|(code, _)| *code == hr)
+            .map(|(_, condition)| *condition)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The two tables must never name the same code.
+        ///
+        /// This is what makes two classification tables as safe as one. Every code
+        /// is compared in exactly one place *because the sets are disjoint*; if a
+        /// code appeared in both, `pipe::Error` would name it from the pipe table
+        /// while `file::Error` and `runtime::Error` -- which delegate to the ring
+        /// surface -- would take the ring table's answer, and one code would mean
+        /// two things. That is the divergence hazard `pipe/client.rs` warns about,
+        /// reintroduced by the back door.
+        ///
+        /// # Why this reads the tables rather than a list of codes
+        ///
+        /// A guard that compared two hand-written lists would pass while proving
+        /// nothing: add a code to a classifier, forget its list, and the assertion
+        /// still compares the stale lists and still succeeds. This reads
+        /// `pipe_table` and `ring_table` themselves -- the same arrays the
+        /// classifiers consult -- so a code cannot exist in a classifier and be
+        /// invisible here.
+        ///
+        /// It is a *value* check, not a text scan. There is no way to spell a code
+        /// that makes set intersection miss it, which is the property the crate's
+        /// nine defeated source-scanning guards lacked.
+        #[test]
+        fn the_two_tables_name_disjoint_codes() {
+            let pipe: Vec<windows::core::HRESULT> =
+                super::pipe_table().iter().map(|(hr, _)| *hr).collect();
+            let ring: Vec<windows::core::HRESULT> =
+                super::ring_table().iter().map(|(hr, _)| *hr).collect();
+
+            let shared: Vec<_> = pipe.iter().filter(|hr| ring.contains(hr)).collect();
+            assert!(
+                shared.is_empty(),
+                "these codes are named by both classification tables: {shared:?}. \
+                 Two tables are safe only while they are disjoint: a shared code is \
+                 named by `pipe::Error` from the pipe table and by `file::Error` \
+                 through delegation to the ring table, and the two answers can \
+                 differ. Put the code in exactly one table."
+            );
+
+            // A table that named the same code twice would also make one of the two
+            // entries unreachable, since both classifiers stop at the first match.
+            for (table, name) in [(&pipe, "pipe"), (&ring, "ring")] {
+                let mut seen = Vec::new();
+                for hr in table.iter() {
+                    assert!(
+                        !seen.contains(&hr),
+                        "the {name} table names {hr:?} twice; the second entry is \
+                         unreachable"
+                    );
+                    seen.push(hr);
+                }
+            }
+
+            assert!(!pipe.is_empty() && !ring.is_empty(), "a table went empty");
+        }
 
         /// A code the table does not name must arrive as `Other`, carrying that
         /// exact code.
@@ -344,8 +341,8 @@ mod classification {
         #[test]
         fn an_unnamed_code_is_carried_verbatim() {
             let os = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
-            let condition = classify(os.code());
-            assert!(matches!(condition, Condition::Other(_)));
+            assert_eq!(classify_pipe(os.code()), None);
+            assert_eq!(classify_ring(os.code()), None);
 
             let err: crate::runtime::error::Error = os.clone().into();
             match err {
@@ -374,22 +371,22 @@ mod classification {
             };
 
             let cases = [
-                (ERROR_PIPE_BUSY, Condition::PipeBusy),
-                (ERROR_BROKEN_PIPE, Condition::PipeBroken),
-                (ERROR_NO_DATA, Condition::PipeNoPeer),
-                (ERROR_PIPE_LISTENING, Condition::PipeListening),
+                (ERROR_PIPE_BUSY, PipeCondition::Busy),
+                (ERROR_BROKEN_PIPE, PipeCondition::Broken),
+                (ERROR_NO_DATA, PipeCondition::NoPeer),
+                (ERROR_PIPE_LISTENING, PipeCondition::Listening),
             ];
 
             let mut seen: Vec<String> = Vec::new();
             for (code, expected) in cases {
-                let got = classify(code.to_hresult());
+                let got = classify_pipe(code.to_hresult()).expect("the table names this code");
                 assert_eq!(
                     std::mem::discriminant(&got),
                     std::mem::discriminant(&expected),
                     "{code:?} classified as {got:?}, expected {expected:?}"
                 );
                 // And the surface that names all four must render them apart.
-                let rendered = view::<crate::pipe::error::Error>(code.to_hresult()).to_string();
+                let rendered = crate::pipe::error::Error::from(code.to_hresult()).to_string();
                 assert!(
                     !seen.contains(&rendered),
                     "two pipe conditions render identically: {rendered:?}"
@@ -401,9 +398,10 @@ mod classification {
         /// The classifier matches exact codes, and must leave everything else
         /// unnamed.
         ///
-        /// `classify` is the single table every surface reads, so widening it from
-        /// exact codes to a facility or a range would silently reclassify file and
-        /// socket errors that have nothing to do with pipes -- and now it would do
+        /// The tables are what every surface reads, directly or by delegation, so
+        /// widening one from exact codes to a facility or a range would silently
+        /// reclassify file and socket errors that have nothing to do with pipes --
+        /// and it would do
         /// so at *six* types at once. The two codes below are not hypothetical:
         /// they are what the existing `Other` assertions in `runtime_tests.rs`
         /// actually observe -- end-of-file on a read past the end, and the refusal
@@ -416,20 +414,24 @@ mod classification {
 
             // 509 is what the cached-I/O write-through refusal reports.
             for code in [ERROR_HANDLE_EOF, WIN32_ERROR(509)] {
-                let got = classify(code.to_hresult());
+                let hr = code.to_hresult();
                 assert!(
-                    matches!(got, Condition::Other(_)),
-                    "{code:?} must stay unnamed, got {got:?}"
+                    classify_pipe(hr).is_none() && classify_ring(hr).is_none(),
+                    "{code:?} must stay unnamed, got {:?}/{:?}",
+                    classify_pipe(hr),
+                    classify_ring(hr)
                 );
             }
 
             // Adjacent to the pipe codes on both sides, to catch a range match that
             // happened to bracket them.
             for code in [230_u32, 233, 534, 537] {
-                let got = classify(WIN32_ERROR(code).to_hresult());
+                let hr = WIN32_ERROR(code).to_hresult();
                 assert!(
-                    matches!(got, Condition::Other(_)),
-                    "code {code} is not a pipe condition this crate maps, got {got:?}"
+                    classify_pipe(hr).is_none() && classify_ring(hr).is_none(),
+                    "code {code} is not a condition this crate maps, got {:?}/{:?}",
+                    classify_pipe(hr),
+                    classify_ring(hr)
                 );
             }
         }
@@ -446,9 +448,9 @@ mod classification {
         fn a_client_that_connected_early_is_not_classified_as_a_failure() {
             use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
 
-            let got = classify(ERROR_PIPE_CONNECTED.to_hresult());
+            let got = classify_pipe(ERROR_PIPE_CONNECTED.to_hresult());
             assert!(
-                matches!(got, Condition::Other(_)),
+                got.is_none(),
                 "ERROR_PIPE_CONNECTED must not be named here; the accept call site \
                  converts it to success, and a named condition would hide it. \
                  Got {got:?}"
@@ -507,32 +509,29 @@ mod classification {
             /// pipe surface must call it.
             ///
             /// Returning `None` is a claim, so each one carries its justification.
-            fn expected(c: Condition) -> Option<(windows::core::HRESULT, &'static str)> {
+            fn expected(c: PipeCondition) -> Option<(windows::core::HRESULT, &'static str)> {
                 match c {
-                    // Produced by the ring's submission path, not by a completion.
-                    // Every surface that can see it names it, so it never demotes.
-                    Condition::QueueFull => None,
-                    Condition::PipeBusy => Some((ERROR_PIPE_BUSY.to_hresult(), "Busy")),
-                    Condition::PipeBroken => Some((ERROR_BROKEN_PIPE.to_hresult(), "Broken")),
-                    Condition::PipeNoPeer => Some((ERROR_NO_DATA.to_hresult(), "NoPeer")),
-                    Condition::PipeListening => {
+                    PipeCondition::Busy => Some((ERROR_PIPE_BUSY.to_hresult(), "Busy")),
+                    PipeCondition::Broken => Some((ERROR_BROKEN_PIPE.to_hresult(), "Broken")),
+                    PipeCondition::NoPeer => Some((ERROR_NO_DATA.to_hresult(), "NoPeer")),
+                    PipeCondition::Listening => {
                         Some((ERROR_PIPE_LISTENING.to_hresult(), "Listening"))
                     }
-                    // Not a condition but the absence of one. It has no canonical code
-                    // by construction, and `classify` is deterministic, so it
-                    // reclassifies to itself forever.
-                    Condition::Other(_) => None,
                 }
             }
 
-            let all = [
-                Condition::QueueFull,
-                Condition::PipeBusy,
-                Condition::PipeBroken,
-                Condition::PipeNoPeer,
-                Condition::PipeListening,
-                Condition::Other(windows::core::HRESULT(0x1234)),
-            ];
+            // Driven from the table rather than from a list beside it. The previous
+            // version enumerated the conditions by hand, which is a list that stays
+            // at four while the table grows to five; reading `pipe_table` means a new
+            // entry is exercised the moment it is added, and `expected` is an
+            // exhaustive match so it is also `E0004` until someone says what the new
+            // condition round-trips to.
+            let all: Vec<PipeCondition> = super::pipe_table().iter().map(|(_, c)| *c).collect();
+            assert_eq!(
+                all.len(),
+                super::pipe_table().len(),
+                "every table entry must be exercised"
+            );
 
             let mut checked = 0;
             for condition in all {
@@ -624,7 +623,7 @@ mod classification {
 
             macro_rules! assert_carries {
                 ($ty:ty, $pat:path) => {{
-                    let e: $ty = view::<$ty>(hr);
+                    let e: $ty = <$ty>::from(hr);
                     match e {
                         $pat(inner) => assert_eq!(
                             inner.code(),
@@ -676,7 +675,7 @@ mod classification {
                 ERROR_PIPE_LISTENING,
             ] {
                 let hr = win32.to_hresult();
-                let demoted = view::<crate::file::error::Error>(hr);
+                let demoted = crate::file::error::Error::from(hr);
                 let carried = match demoted {
                     crate::file::error::Error::Other(ref e) => e.code(),
                     ref other => {
@@ -687,7 +686,7 @@ mod classification {
 
                 // And the code it carried re-classifies to the condition the pipe
                 // surface names, which is the round trip itself.
-                let recovered = view::<crate::pipe::error::Error>(carried);
+                let recovered = crate::pipe::error::Error::from(carried);
                 assert!(
                     !matches!(recovered, crate::pipe::error::Error::Other(_)),
                     "re-classifying {win32:?} at the pipe surface did not recover a named condition"
@@ -697,7 +696,7 @@ mod classification {
     }
 }
 
-pub(crate) use classification::{ConditionView, view};
+pub(crate) use classification::{PipeCondition, RingCondition, classify_pipe, classify_ring};
 
 #[cfg(test)]
 mod conversion_tests {
@@ -971,7 +970,7 @@ mod conversion_tests {
                 "the driver must carry the code it could not name, or the pipe                  surface has nothing to recover from"
             ),
             other => panic!(
-                "the driver names a pipe condition again: got {other:?}. Only                  `pipe::Error` may name one — see the `ConditionView` impl in                  `runtime/error.rs` for why."
+                "the driver names a pipe condition again: got {other:?}. Only                  `pipe::Error` may name one — see `impl From<HRESULT>` in                  `runtime/error.rs` for why."
             ),
         }
     }
@@ -1055,33 +1054,23 @@ mod os_error_tests {
     #[test]
     fn an_unnamed_code_is_recoverable_from_every_view() {
         assert_eq!(
-            super::view::<BuildError>(UNNAMEABLE)
-                .os_error()
-                .map(|e| e.code()),
+            BuildError::from(UNNAMEABLE).os_error().map(|e| e.code()),
             Some(UNNAMEABLE)
         );
         assert_eq!(
-            super::view::<RingError>(UNNAMEABLE)
-                .os_error()
-                .map(|e| e.code()),
+            RingError::from(UNNAMEABLE).os_error().map(|e| e.code()),
             Some(UNNAMEABLE)
         );
         assert_eq!(
-            super::view::<FileError>(UNNAMEABLE)
-                .os_error()
-                .map(|e| e.code()),
+            FileError::from(UNNAMEABLE).os_error().map(|e| e.code()),
             Some(UNNAMEABLE)
         );
         assert_eq!(
-            super::view::<PipeError>(UNNAMEABLE)
-                .os_error()
-                .map(|e| e.code()),
+            PipeError::from(UNNAMEABLE).os_error().map(|e| e.code()),
             Some(UNNAMEABLE)
         );
         assert_eq!(
-            super::view::<RuntimeError>(UNNAMEABLE)
-                .os_error()
-                .map(|e| e.code()),
+            RuntimeError::from(UNNAMEABLE).os_error().map(|e| e.code()),
             Some(UNNAMEABLE)
         );
     }
@@ -1090,32 +1079,30 @@ mod os_error_tests {
     fn the_same_code_answers_differently_on_two_surfaces() {
         // The file surface cannot name a pipe condition, so it demotes to
         // `Other` and the code survives.
-        let on_a_file = super::view::<FileError>(PIPE_BROKEN);
+        let on_a_file = FileError::from(PIPE_BROKEN);
         assert!(matches!(on_a_file, FileError::Other(_)));
         assert_eq!(on_a_file.os_error().map(|e| e.code()), Some(PIPE_BROKEN));
 
         // The pipe surface names it, which is the more useful answer and the
         // one that drops the code.
-        let on_a_pipe = super::view::<PipeError>(PIPE_BROKEN);
+        let on_a_pipe = PipeError::from(PIPE_BROKEN);
         assert!(matches!(on_a_pipe, PipeError::Broken));
         assert_eq!(on_a_pipe.os_error(), None);
     }
 
     #[test]
     fn a_named_condition_reports_none_on_every_surface_that_names_it() {
-        assert_eq!(super::view::<PipeError>(PIPE_BROKEN).os_error(), None);
+        assert_eq!(PipeError::from(PIPE_BROKEN).os_error(), None);
         // The driver demotes rather than names, so it reports `Some` here. That
         // is the whole difference the accessor exposes, and asserting it beside
         // the pipe surface is what keeps the two readings visibly distinct.
         assert_eq!(
-            super::view::<RuntimeError>(PIPE_BROKEN)
-                .os_error()
-                .map(|e| e.code()),
+            RuntimeError::from(PIPE_BROKEN).os_error().map(|e| e.code()),
             Some(PIPE_BROKEN)
         );
         // `QueueFull` is named by the ring view and wrapped by the rest.
         let queue_full =
-            super::view::<RingError>(windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL);
+            RingError::from(windows::Win32::Foundation::IORING_E_SUBMISSION_QUEUE_FULL);
         assert!(matches!(queue_full, RingError::QueueFull));
         assert_eq!(queue_full.os_error(), None);
     }

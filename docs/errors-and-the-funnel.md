@@ -102,23 +102,55 @@ The crate's own words, in `pipe::client`:
 This is the sharpest objection to per-API error types, and it is correct. Per-API
 *classifiers* would reintroduce exactly this hazard.
 
-The design's answer is not to note the risk but to remove the possibility. There
-is one classification table, private to `error.rs`, mapping an `HRESULT` to a
-`Condition`. Each per-API type is a **view** over that table, expressed as a
-trait with one method per condition and *no default bodies*, so a new condition
-is `E0046` at every view that has not handled it. `Condition` and `classify` are
-private to their module, so a second table cannot be written against them at all.
+The design's answer is not to note the risk but to remove the possibility. A
+given code is compared in exactly **one** place. `error::pipe_table` holds the
+four pipe codes; `error::ring_table` holds the one ring code; their code sets are
+**disjoint**, asserted by `the_two_tables_name_disjoint_codes` reading the tables
+themselves. `pipe::Error` consults the pipe table, `io_ring::Error` the ring
+table, and `file::Error` and `runtime::Error` compare nothing at all -- they
+delegate to the ring surface, wrap what it recognised, and demote the rest
+carrying the code. `error_classification_has_one_home` polices the source text so
+no third comparison site appears.
 
-Two doors were found and shut during implementation:
+### The mechanism this replaced, and the lesson that outlived it
+
+The original design was a `Condition` enum with a `ConditionView` trait: one
+method per condition, implemented by five error types, dispatched by a single
+`view` function, so a new condition was `E0004` at the dispatch and `E0046` at
+every view. It was adopted for good reason and defended twice against proposals
+to remove it.
+
+It was retired when a prototype showed its load-bearing justification did not
+hold. That justification was that four views must *recognise*
+`IORING_E_SUBMISSION_QUEUE_FULL`, so one table did work no `From` implementation
+could absorb. They do not recognise it -- they **wrap** what the ring surface
+recognised, which delegation absorbs exactly. Five implementations of thirty
+methods were expressing five code comparisons and three wrapping rules; two of
+the five were textually identical and a third named nothing.
+
+The lesson worth keeping is narrower than the one first drawn, and getting it
+wrong is how the mechanism was over-credited for two rounds: **the trait bought
+totality, not singularity.** It forced every view to *account for* every
+condition. It never prevented a second table -- a view method received the raw
+`HRESULT` and could always have compared it. Preventing a second table was, and
+remains, the job of the source-text guards. Retiring the trait surrendered
+`E0046`, and `E0046`'s benefit did not survive attack: a type that cannot name a
+condition must demote it, and demotion is already what an unrecognised code does.
+
+One door was found and shut during the original implementation, and it still
+stands:
 
 - A wildcard arm in a boundary conversion would silently route a *new* condition
-  into the driver-only sink. `#[deny(clippy::wildcard_enum_match_arm)]` now makes
+  into the driver-only sink. `#[deny(clippy::wildcard_enum_match_arm)]` makes
   that arm a compile error. A comment forbidding it was the previous guard, and
   a comment is not a guard.
-- A new condition can be routed to an *existing* view method, which E0046 cannot
-  see because no method is missing. This is the residual hazard, and it is
-  recorded rather than solved: rerouting an arm looks like ordinary maintenance,
-  which is exactly why it deserves naming.
+
+The residual hazard recorded against the trait -- a new condition routed to an
+*existing* view method, which `E0046` cannot see -- no longer applies, because
+there are no view methods. Its successor is smaller and named here: a code added
+to the wrong table. `the_two_tables_name_disjoint_codes` catches the case where
+it is added to both; nothing catches a pipe code filed only in the ring table,
+beyond the round-trip tests that exercise every table entry.
 
 ## What this document got wrong
 
