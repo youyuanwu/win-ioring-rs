@@ -224,7 +224,7 @@ async fn readme_test_async() {
 // layer (write, flush, cancel).
 // ---------------------------------------------------------------------------
 
-use crate::error::Error;
+use crate::io_ring::error::{BuildError, Error};
 use crate::io_ring::ops::{CancelOp, FlushOp, WriteOp};
 use windows::Win32::Storage::FileSystem::{
     FILE_FLUSH_DEFAULT, FILE_WRITE_FLAGS_NONE, IORING_FEATURE_SET_COMPLETION_EVENT,
@@ -284,7 +284,7 @@ fn requesting_a_version_above_the_ceiling_is_a_distinct_error() {
         .err()
         .unwrap();
     match err {
-        Error::UnsupportedVersion {
+        BuildError::UnsupportedVersion {
             requested,
             max_supported,
         } => {
@@ -304,7 +304,7 @@ fn requiring_an_absent_feature_is_a_distinct_error() {
         .build()
         .err()
         .unwrap();
-    assert!(matches!(err, Error::UnsupportedFeature { .. }));
+    assert!(matches!(err, BuildError::UnsupportedFeature { .. }));
 }
 
 /// The driver depends on completion-event signalling, so requiring it must
@@ -613,34 +613,32 @@ fn all_fourteen_entry_points_have_wrappers() {
     };
 
     // Associated-function pointers, one per platform entry point.
-    let _create: fn(IORING_VERSION, u32, u32) -> crate::Result<IoRing> = IoRing::create;
-    let _close: fn(&mut IoRing) -> crate::Result<()> = IoRing::close;
-    let _submit: fn(&mut IoRing, usize, usize) -> crate::Result<u32> = IoRing::submit;
-    let _pop: fn(
-        &mut IoRing,
-    ) -> crate::Result<Option<windows::Win32::Storage::FileSystem::IORING_CQE>> =
+    //
+    // Two distinct error types appear below, and that is the point: building
+    // a ring can fail in ways an operation on one cannot, so construction
+    // answers with `BuildError` and operations answer with `Error`. A change
+    // that collapsed them back into a single type would fail here.
+    type Op<T> = Result<T, crate::io_ring::error::Error>;
+    type Build<T> = Result<T, crate::io_ring::error::BuildError>;
+    let _create: fn(IORING_VERSION, u32, u32) -> Build<IoRing> = IoRing::create;
+    let _close: fn(&mut IoRing) -> Op<()> = IoRing::close;
+    let _submit: fn(&mut IoRing, usize, usize) -> Op<u32> = IoRing::submit;
+    let _pop: fn(&mut IoRing) -> Op<Option<windows::Win32::Storage::FileSystem::IORING_CQE>> =
         IoRing::pop_completion;
-    let _caps: fn() -> crate::Result<crate::io_ring::Capabilities> =
-        IoRing::query_io_ring_capabilities;
-    let _info: fn(&IoRing) -> crate::Result<crate::io_ring::RingInfo> = IoRing::info;
+    let _caps: fn() -> Build<crate::io_ring::Capabilities> = IoRing::query_io_ring_capabilities;
+    let _info: fn(&IoRing) -> Op<crate::io_ring::RingInfo> = IoRing::info;
     let _is_supported: fn(&IoRing, windows::Win32::Storage::FileSystem::IORING_OP_CODE) -> bool =
         IoRing::is_op_supported;
-    let _set_event: unsafe fn(
-        &mut IoRing,
-        windows::Win32::Foundation::HANDLE,
-    ) -> crate::Result<()> = IoRing::set_io_ring_completion_event;
-    let _read: unsafe fn(&mut IoRing, ReadOp) -> crate::Result<()> = IoRing::build_read_file;
-    let _write: unsafe fn(&mut IoRing, WriteOp) -> crate::Result<()> = IoRing::build_write_file;
-    let _flush: unsafe fn(&mut IoRing, FlushOp) -> crate::Result<()> = IoRing::build_flush_file;
-    let _cancel: unsafe fn(&mut IoRing, CancelOp) -> crate::Result<()> =
-        IoRing::build_cancel_request;
-    let _reg_bufs: unsafe fn(&mut IoRing, &[BufferInfo], usize) -> crate::Result<()> =
+    let _set_event: unsafe fn(&mut IoRing, windows::Win32::Foundation::HANDLE) -> Op<()> =
+        IoRing::set_io_ring_completion_event;
+    let _read: unsafe fn(&mut IoRing, ReadOp) -> Op<()> = IoRing::build_read_file;
+    let _write: unsafe fn(&mut IoRing, WriteOp) -> Op<()> = IoRing::build_write_file;
+    let _flush: unsafe fn(&mut IoRing, FlushOp) -> Op<()> = IoRing::build_flush_file;
+    let _cancel: unsafe fn(&mut IoRing, CancelOp) -> Op<()> = IoRing::build_cancel_request;
+    let _reg_bufs: unsafe fn(&mut IoRing, &[BufferInfo], usize) -> Op<()> =
         IoRing::build_register_buffers;
-    let _reg_files: unsafe fn(
-        &mut IoRing,
-        &[windows::Win32::Foundation::HANDLE],
-        usize,
-    ) -> crate::Result<()> = IoRing::build_register_file_handles;
+    let _reg_files: unsafe fn(&mut IoRing, &[windows::Win32::Foundation::HANDLE], usize) -> Op<()> =
+        IoRing::build_register_file_handles;
 }
 
 /// A full submission queue must surface as the dedicated `QueueFull` variant,
@@ -737,7 +735,7 @@ fn bad_queue_size_is_not_reported_as_unsupported() {
         .err()
         .expect("an absurd queue size should fail");
     assert!(
-        !matches!(err, Error::Unsupported),
+        !matches!(err, BuildError::Unsupported),
         "argument failure must not be reported as an unsupported host: {err:?}"
     );
 }

@@ -20,9 +20,11 @@ need to support older Windows, load a separate module dynamically.
 
 Because of that, this crate has no error meaning "this host has no IoRing". It
 reports only the shortfalls a host *with* IoRing can still have, each as its own
-variant you can match on: `Error::UnsupportedVersion` for a ring version below
-what you asked for, `Error::UnsupportedFeature` for a missing feature flag, and
-`Error::UnsupportedOp` for an operation the host does not implement.
+variant you can match on, and the type tells you when you will find out:
+`io_ring::BuildError::UnsupportedVersion` for a ring version below what you asked
+for and `io_ring::BuildError::UnsupportedFeature` for a missing feature flag,
+both at construction; `io_ring::Error::UnsupportedOp` for an operation the host
+does not implement, which you cannot learn until you submit one.
 
 ## Runtime agnostic
 
@@ -122,8 +124,29 @@ Two limits are worth knowing before you reach them. Message-mode pipes are not
 supported: `BufResult` pairs one result with one buffer, and a truncated message
 is neither. And the cursor-based `File::read` / `File::write` refuse a pipe
 outright, because a pipe ignores the file offset they supply and would otherwise
-return success with bytes from somewhere you never asked for. Use the positional
-`Handle::read` / `Handle::write`, which the pipe types use themselves.
+return success with bytes from somewhere you never asked for. Use
+`pipe::Client::read_at` / `write_at`, which are positional and supply no cursor.
+
+### Which type a pipe failure arrives as
+
+A pipe can be read through more than one entry point, and only one of them knows
+it is holding a pipe:
+
+| You call | You get | `ERROR_BROKEN_PIPE` arrives as |
+|---|---|---|
+| `Client::read_at` / `Server`'s equivalent | `pipe::Error` | `Broken` |
+| `File::read_at` on the `&File` a pipe holds | `file::Error` | `Other(code)` |
+| `Handle::read` / `read_registered` | `runtime::Error` | `Other(code)` |
+
+**Only `pipe::Error` names a pipe condition.** The others cannot: `Handle::read`
+takes a `&File`, `read_registered` takes a registration index, and neither can
+say whether the handle behind it is a pipe. Rather than guess, they carry the
+platform's code in `Other`, reachable with `os_error()` — and
+`pipe::Error::from` re-classifies it if you want the name.
+
+So prefer the pipe surface when you have one. Registered I/O has no pipe wrapper
+yet, so that path always demotes; see
+[pending-work.md](docs/pending-work.md).
 
 ## Cancellation and shutdown
 

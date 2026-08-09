@@ -118,7 +118,7 @@ async fn rejected_reads_return_the_buffer() {
             let (err, buffer) = result.into_parts();
             assert!(matches!(
                 err.unwrap_err(),
-                win_ioring::Error::BufferTooSmall { .. }
+                win_ioring::runtime::Error::Buf(win_ioring::buf::Error::TooSmall { .. })
             ));
             assert_eq!(buffer.capacity(), 4, "the caller's buffer came back");
 
@@ -149,7 +149,7 @@ async fn submitting_after_shutdown_errors() {
             let outcome = handle.read(&file, vec![0_u8; 64], 20, 0).await;
             assert!(matches!(
                 outcome.err(),
-                Some(win_ioring::Error::ShuttingDown)
+                Some(win_ioring::runtime::Error::ShuttingDown)
             ));
         })
         .await;
@@ -423,7 +423,7 @@ async fn shutdown_with_work_in_flight_settles() {
             let outcome = handle.read(&file, vec![0_u8; 64], 20, 0).await;
             assert!(matches!(
                 outcome.err(),
-                Some(win_ioring::Error::ShuttingDown)
+                Some(win_ioring::runtime::Error::ShuttingDown)
             ));
         })
         .await;
@@ -523,10 +523,12 @@ async fn writes_past_initialized_bytes_are_rejected() {
             let result = outcome;
             let (err, buffer) = result.into_parts();
             match err.unwrap_err() {
-                win_ioring::Error::UninitializedWriteRange {
-                    requested,
-                    initialized,
-                } => {
+                win_ioring::runtime::Error::Buf(
+                    win_ioring::buf::Error::UninitializedWriteRange {
+                        requested,
+                        initialized,
+                    },
+                ) => {
                     assert_eq!(requested, 32);
                     assert_eq!(initialized, 3);
                 }
@@ -583,7 +585,7 @@ async fn write_flags_reach_the_platform() {
             let (err, buffer) = result.into_parts();
             let err = err.expect_err("write-through on cached I/O should be refused");
             assert!(
-                matches!(err, win_ioring::Error::Os(_)),
+                matches!(err, win_ioring::runtime::Error::Other(_)),
                 "expected the platform's own error, got {err:?}"
             );
             assert_eq!(
@@ -663,11 +665,14 @@ async fn write_and_flush_after_shutdown_error() {
             let outcome = handle.write(&out, b"data".to_vec(), 4, 0).await;
             let result = outcome;
             let (err, buffer) = result.into_parts();
-            assert!(matches!(err.unwrap_err(), win_ioring::Error::ShuttingDown));
+            assert!(matches!(
+                err.unwrap_err(),
+                win_ioring::runtime::Error::ShuttingDown
+            ));
             assert_eq!(buffer, b"data", "the buffer came back");
 
             let err = handle.flush(&out).await.unwrap_err();
-            assert!(matches!(err, win_ioring::Error::ShuttingDown));
+            assert!(matches!(err, win_ioring::runtime::Error::ShuttingDown));
 
             drop(out);
             let _ = std::fs::remove_file(&path);
@@ -754,7 +759,7 @@ async fn read_transfer_accounting_covers_partial_and_empty() {
             let (result, buffer) = outcome.into_parts();
             let err = result.expect_err("reading past the end should report EOF");
             assert!(
-                matches!(err, win_ioring::Error::Os(_)),
+                matches!(err, win_ioring::runtime::Error::Other(_)),
                 "expected the platform's EOF error, got {err:?}"
             );
             assert_eq!(buffer.capacity(), 32, "the buffer came back");
@@ -937,7 +942,10 @@ async fn registering_buffers_takes_ownership_and_returns_them_on_failure() {
                     // that routed this through the builders' type would be a
                     // behaviour change, and this is what catches it.
                     assert!(
-                        matches!(e, win_ioring::Error::MissingField { field: "buffers" }),
+                        matches!(
+                            e,
+                            win_ioring::runtime::Error::MissingField { field: "buffers" }
+                        ),
                         "expected a missing-field report for `buffers`, got {e:?}"
                     );
                 }
@@ -991,7 +999,10 @@ async fn registered_writes_are_bounded_by_the_initialized_prefix() {
                 .into_parts();
             let err = result.expect_err("writing uninitialized registered bytes must be refused");
             assert!(
-                matches!(err, win_ioring::Error::RegisteredRangeOutOfBounds { .. }),
+                matches!(
+                    err,
+                    win_ioring::runtime::Error::RegisteredRangeOutOfBounds { .. }
+                ),
                 "got {err:?}"
             );
 
@@ -1019,7 +1030,7 @@ async fn registered_writes_are_bounded_by_the_initialized_prefix() {
                 .into_parts();
             assert!(matches!(
                 result.expect_err("writing past the prefix must be refused"),
-                win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                win_ioring::runtime::Error::RegisteredRangeOutOfBounds { .. }
             ));
 
             drop(handle_buf);
@@ -1205,7 +1216,7 @@ async fn the_watermark_only_covers_a_contiguous_initialized_prefix() {
             assert!(
                 matches!(
                     result.expect_err("a gap before the read must keep the prefix at zero"),
-                    win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                    win_ioring::runtime::Error::RegisteredRangeOutOfBounds { .. }
                 ),
                 "a gap before the read must keep the prefix at zero"
             );
@@ -1229,7 +1240,7 @@ async fn the_watermark_only_covers_a_contiguous_initialized_prefix() {
             assert!(
                 matches!(
                     result.expect_err("the prefix must track the transfer, not the request"),
-                    win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                    win_ioring::runtime::Error::RegisteredRangeOutOfBounds { .. }
                 ),
                 "the prefix must track the transfer, not the request"
             );
@@ -1273,7 +1284,7 @@ async fn out_of_range_registered_indices_are_rejected() {
                 collection
                     .check_out(5)
                     .expect_err("index five does not exist"),
-                win_ioring::Error::InvalidRegisteredIndex { index: 5 }
+                win_ioring::runtime::Error::InvalidRegisteredIndex { index: 5 }
             ));
 
             // Offset plus length past the registered extent, refused by the
@@ -1285,7 +1296,7 @@ async fn out_of_range_registered_indices_are_rejected() {
                 .into_parts();
             assert!(matches!(
                 result.expect_err("range exceeds the registered extent"),
-                win_ioring::Error::RegisteredRangeOutOfBounds { .. }
+                win_ioring::runtime::Error::RegisteredRangeOutOfBounds { .. }
             ));
 
             // A registered file index with no file registration.
@@ -1295,7 +1306,7 @@ async fn out_of_range_registered_indices_are_rejected() {
                 .into_parts();
             assert!(matches!(
                 result.expect_err("no file registration exists"),
-                win_ioring::Error::InvalidRegisteredIndex { index: 0 }
+                win_ioring::runtime::Error::InvalidRegisteredIndex { index: 0 }
             ));
 
             drop(buffer);

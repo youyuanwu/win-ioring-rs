@@ -1,6 +1,10 @@
 //! The client end of a named pipe.
 
+use super::io::{PipeRead, PipeWrite};
+use crate::buf::{IoBuf, IoBufMut};
 use crate::file::File;
+use crate::pipe::error::Error;
+use crate::runtime::Handle;
 
 /// Options for connecting to a named pipe.
 ///
@@ -12,7 +16,7 @@ use crate::file::File;
 /// use win_ioring::pipe::ClientOptions;
 ///
 /// let client = ClientOptions::new().read(true).write(true).open("demo")?;
-/// # Ok::<(), win_ioring::Error>(())
+/// # Ok::<(), win_ioring::pipe::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
@@ -61,7 +65,7 @@ impl ClientOptions {
     /// # This does not wait for an instance
     ///
     /// If the server has created instances but all of them are already serving
-    /// clients, this returns [`Error::PipeBusy`](crate::Error::PipeBusy)
+    /// clients, this returns [`Error::Busy`](crate::pipe::error::Error::Busy)
     /// immediately. It does **not** block, and there is no equivalent of Win32's
     /// `WaitNamedPipe`.
     ///
@@ -69,14 +73,15 @@ impl ClientOptions {
     /// runtime-agnostic and single-threaded; a blocking wait would stall the
     /// caller's executor, and a timed retry would need a timer this crate does
     /// not have and should not pick for the caller. Retrying on
-    /// `Error::PipeBusy` — with whatever backoff and whatever timer the caller's
+    /// `Error::Busy` — with whatever backoff and whatever timer the caller's
     /// runtime provides — is the intended pattern.
     ///
     /// If the server has not created the pipe at all, the error is
-    /// [`Error::Os`](crate::Error::Os) carrying `ERROR_FILE_NOT_FOUND`, which is
+    /// [`Error::Other`](crate::pipe::error::Error::Other) carrying
+    /// `ERROR_FILE_NOT_FOUND`, which is
     /// a different condition and deliberately not folded into `PipeBusy`: one
     /// says "come back shortly", the other says "nothing is listening here".
-    pub fn open(&self, name: impl AsRef<str>) -> crate::Result<Client> {
+    pub fn open(&self, name: impl AsRef<str>) -> Result<Client, Error> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
@@ -98,21 +103,38 @@ impl ClientOptions {
 
 /// Maps an open failure onto the crate's error type.
 ///
-/// Routes through [`Error::from_hresult`](crate::Error), which is the same
+/// Routes through the crate's pipe classification table, which is the same
 /// funnel every ring completion passes through, rather than repeating the code
 /// comparisons here. That matters more than it looks: `ERROR_PIPE_BUSY` from a
 /// failed open and `ERROR_PIPE_BUSY` from a completion must produce the same
 /// variant, and two independent match arms are exactly how that stops being
 /// true after someone edits one of them.
 ///
-/// An `io::Error` with no OS code cannot come from `CreateFileW`, but the type
-/// permits it, so it is reported verbatim rather than being mapped to a pipe
-/// condition it is not.
-fn classify_open_failure(e: &std::io::Error) -> crate::Error {
+/// Under the per-API split this property is now structural rather than merely
+/// observed: there is one table, and `pipe::Error` is a *view* over it, so
+/// there is no second set of arms available to edit.
+///
+/// # The one substituted code in the crate, and why it stays
+///
+/// An `io::Error` with no OS code cannot come from `CreateFileW` — the failure
+/// path builds it from `GetLastError` — but the type permits it. FR-11 forbids
+/// fabricating an `HRESULT`, and this branch does substitute one, so it is
+/// called out rather than hidden:
+///
+/// - No *condition* is fabricated. `E_FAIL` is not in the classification table,
+///   so it can only ever produce `Other`, never a named pipe condition. The
+///   hazard FR-11 exists to prevent — a made-up code being re-classified into a
+///   condition that never occurred — cannot happen here.
+/// - Nothing is lost. The original `io::Error`'s message is carried on the
+///   substituted code, so a caller still sees what actually failed.
+/// - The alternative costs a public slot on `pipe::Error` for a variant that is
+///   unreachable, which is a worse trade than one documented placeholder.
+fn classify_open_failure(e: &std::io::Error) -> Error {
     match e.raw_os_error() {
-        Some(code) => crate::Error::from_hresult(windows::core::HRESULT::from_win32(code as u32)),
-        None => crate::Error::Os(windows::core::Error::from(
+        Some(code) => Error::from(windows::core::HRESULT::from_win32(code as u32)),
+        None => Error::Other(windows::core::Error::new(
             windows::Win32::Foundation::E_FAIL,
+            format!("pipe open failed without an OS error code: {e}"),
         )),
     }
 }
@@ -143,29 +165,76 @@ impl Client {
     /// Equivalent to `ClientOptions::new().open(name)`. See
     /// [`ClientOptions::open`] for what happens when every instance is busy —
     /// this does not wait either.
-    pub fn connect(name: impl AsRef<str>) -> crate::Result<Self> {
+    pub fn connect(name: impl AsRef<str>) -> Result<Self, Error> {
         ClientOptions::new().open(name)
     }
 
     /// The underlying file, for reads, writes and flushes through the ring.
+    ///
+    /// # What this replaces
+    ///
+    /// This type used to `Deref` to [`File`] and to offer `into_file`. Both are
+    /// gone, because a pipe's reads and writes are not a file's: they fail in
+    /// ways a file cannot ([`Error::Broken`], [`Error::NoPeer`]) and they now
+    /// report [`Error`] rather than [`file::Error`](crate::file::Error).
+    ///
+    /// - For pipe I/O, use [`Client::read_at`] and [`Client::write_at`], which
+    ///   return this module's error type. Under `Deref` these calls silently
+    ///   resolved to [`File`]'s and handed back a file's error for a pipe's
+    ///   failure.
+    /// - For the deliberate case where a pipe is *wanted* as a byte stream --
+    ///   passing it to code that takes a [`File`] and does not care what is
+    ///   behind it -- this method still gives you one. What it gives you is a
+    ///   `&File`, and that is the difference that matters: [`File::read`] and
+    ///   [`File::write`] take `&mut self`, so a borrow cannot reach the
+    ///   *sequential* methods. Those track a cursor, a pipe has no seekable
+    ///   position, and the result was
+    ///   [`file::Error::NotSeekable`](crate::file::Error::NotSeekable) -- a file
+    ///   condition with no pipe counterpart, reached only because `into_file`
+    ///   handed out ownership. Removing it is what closes that route.
+    ///
+    /// A caller who genuinely needs an owned [`File`] should open the path as a
+    /// file rather than open it as a pipe and discard the distinction.
     pub fn file(&self) -> &File {
         &self.file
     }
 
-    /// Consumes the client and returns the file it wraps.
+    /// Reads up to `len` bytes into `buffer`, reporting failures as [`Error`].
     ///
-    /// The pipe stays open; only this wrapper goes away. Useful when the pipe's
-    /// identity as a pipe stops mattering and it is just a byte stream.
-    pub fn into_file(self) -> File {
-        self.file
+    /// # The offset is ignored
+    ///
+    /// A pipe has no position, and the platform discards this argument. It is
+    /// present because this is the same entry point the file surface uses and
+    /// splitting the signature would gain nothing; pass `0` unless you have a
+    /// reason not to.
+    ///
+    /// There is deliberately **no** sequential (`read`/`write`) pipe method. The
+    /// cursor those maintain would be a fiction on a pipe: the platform ignores
+    /// the offset, so a sequential read would report the cursor advancing past
+    /// bytes it never positioned for. Refusing to offer it is the same choice
+    /// this crate already makes by refusing `File::read` on a pipe.
+    pub fn read_at<B: IoBufMut>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeRead<B> {
+        PipeRead::issue(handle, &self.file, buffer, len, offset)
     }
-}
 
-impl std::ops::Deref for Client {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.file
+    /// Writes `len` bytes from `buffer`, reporting failures as [`Error`].
+    ///
+    /// The offset is ignored, and there is no sequential counterpart. See
+    /// [`read_at`](Self::read_at) for both.
+    pub fn write_at<B: IoBuf>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeWrite<B> {
+        PipeWrite::issue(handle, &self.file, buffer, len, offset)
     }
 }
 
@@ -261,7 +330,7 @@ mod tests {
 
         let second = Client::connect(&name);
         assert!(
-            matches!(second, Err(crate::Error::PipeBusy)),
+            matches!(second, Err(Error::Busy)),
             "a second client with no free instance must be refused as busy, \
              got {second:?}"
         );
@@ -298,12 +367,12 @@ mod tests {
         let err = Client::connect(unique("absent"))
             .expect_err("connecting to a pipe nobody created should fail");
         assert!(
-            !matches!(err, crate::Error::PipeBusy),
+            !matches!(err, Error::Busy),
             "a missing pipe must not be reported as busy — a caller would retry \
              forever. Got {err:?}"
         );
         assert!(
-            matches!(err, crate::Error::Os(_)),
+            matches!(err, Error::Other(_)),
             "expected the platform's own error for a missing pipe, got {err:?}"
         );
     }

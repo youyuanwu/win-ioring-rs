@@ -697,6 +697,134 @@ distinguish from a won one. Two techniques carry most of the weight:
   never reporting, `Drop for Park` not clearing its waker — and required to fail.
   The counts above (two caught, then four) are the reason that is not optional.
 
+### Name the deliverable that is obviously the point
+
+The deliverable most likely to go missing is the one so obviously the point of
+the work that nobody writes a criterion for it. The guard is: **not "the type
+exists" but "a public method returns it".** State the observable thing a caller
+would do, not the artefact you intend to build.
+
+This is not a theoretical hazard. It has happened four times in this repository,
+and it survived a process built specifically to catch missing coverage:
+
+1. **Named pipes, SC-001.** The headline criterion of the feature. Assigned,
+   cited in the plan, reported covered — and never implemented. Caught at the
+   final gate.
+2. **Per-API errors, at spec time.** The design specified six error types, and
+   the pipe surface had no I/O methods at all. `pipe::Error` would have existed,
+   compiled, passed review, and had no operation to be returned *from*. The
+   entire feature would have shipped as a no-op. Caught while writing
+   requirements, only because the map was cut by "what can this API surface?"
+   rather than "what types exist?".
+3. **Per-API errors, in the plan.** The plan did not contain the migration the
+   change was made of — the retyping of every signature, which was the bulk of
+   the work. Caught before implementation, and fixed by planning that phase
+   against an explicit inventory (twenty signatures, one re-export, ~38
+   intra-doc links, 19 test call sites) rather than a description. **An
+   inventory can be checked off and can be wrong in a way someone notices; a
+   description cannot.**
+4. **Twenty-six `Display` messages, silently reworded** inside a diff that read
+   as "fifty new variants". This one is an *addition* rather than an omission,
+   and it generalises the pattern: **a change riding inside a larger one is
+   invisible in proportion to how much it resembles its host.**
+
+The first three share a shape. In each, the missing thing was the reason the work
+existed, and that is precisely why no one wrote it down — a criterion for it felt
+like a criterion for "do the task".
+
+### A guard that enumerates syntax is unbounded and loses
+
+Prefer a guard that makes the bad state **unrepresentable** over one that
+**searches** for it.
+
+The evidence is unusually clear. A text-scanning guard was written to forbid a
+second `HRESULT` classification table — it scanned the source for `match`
+statements naming `ERROR_*` identifiers. Across three review rounds it was
+defeated nine times, by sixteen findings, with no sign of converging:
+
+- `let mapped = match …`, which does not start a line with `match`
+- `#![allow]` inside the body rather than `#[allow]` above it
+- a second table keyed on `io::ErrorKind`, naming no `ERROR_*` identifier at all
+
+Those are not three bugs. They are three samples from an infinite space — every
+syntactic form a construct can take — and the next round would have drawn three
+more. A guard that must anticipate every spelling of a construct is playing a
+game it cannot win.
+
+The replacement was a trait with one method per condition and no default bodies,
+so a missing case is `E0046` under plain `cargo build`, and un-`allow`able. Its
+residual hazard is bounded: a default body, at a named set of sites, enumerated
+by a test that fails if the set grows. That is a difference in *kind*, not
+degree, and it is the same choice this repository has made repeatedly — the
+`Send + Sync` compile-time pin over a comment, the exhaustive `ArmedEvent`
+ordering test over an assertion, `Prepared`'s per-variant `block_on` over a
+runtime check.
+
+Two riders, both learned the hard way:
+
+- **Bounded is not the same as singular.** The trait was adopted on the argument
+  that its residual hazard was one declaration a reviewer trips over. It turned
+  out to be four, and there was a second door besides: a new variant can be
+  routed to an *existing* method, which `E0046` cannot see because no method is
+  missing. Enumerate the sites from something that *fails when the set grows*,
+  never from a hand-written list.
+- **The compiler is not automatically the guard you think.** `E0004` on an
+  exhaustive match is defeated by adding a wildcard, and a comment saying "do not
+  add a wildcard here" is not a guard. `#[deny(clippy::wildcard_enum_match_arm)]`
+  is.
+- **Say which property the guard actually guarantees, or it gets credited with
+  more than it does.** This is the sharper version of the lesson, and it was
+  learned by getting it wrong. The trait above was described, here and in the
+  crate, as making a second classification table *unrepresentable*. It did not.
+  It made a **missing case** unrepresentable -- it bought **totality**, that every
+  view accounts for every condition. It never bought **singularity**: each view
+  method received the raw `HRESULT` and could always have compared it, so a
+  second table was exactly as writable with the trait as without. The thing
+  actually preventing a second table was, throughout, the source-text guard in
+  `error_classification_policy.rs`.
+
+  The cost of the confusion was two review rounds spent defending the trait
+  against removal on the strength of a guarantee it was not providing. When it
+  was finally prototyped, the mechanism turned out to be five implementations of
+  thirty methods expressing five code comparisons, and it was retired. Naming the
+  property would have surfaced that far sooner: *totality* is easy to test
+  against a proposal, whereas "makes the bad state unrepresentable" is a slogan
+  that fits any guard you are fond of.
+
+- **A value check beats a text check, where one is available.** The successor
+  design has two classification tables instead of one, which is safe only while
+  their code sets stay disjoint. That is asserted by reading the two tables and
+  intersecting them -- data, not source text. There is no way to spell a code
+  that makes set intersection miss it, which is precisely what the nine defeated
+  scanners lacked. Where a property can be checked against values, the unbounded
+  syntax problem does not arise at all.
+
+  The rider on *that*: such a check is only as good as its source. If the tables
+  were hand-written `if` chains and the test compared two hand-written lists, the
+  test would pass while proving nothing the moment a chain and its list diverged.
+  The tables are arrays, and the classifiers and the test read the same arrays,
+  so a code cannot exist in a classifier and be invisible to the check.
+
+### A mutation must fail for the reason under test
+
+A failing build is not evidence. Two instances, from opposite directions:
+
+- The named-pipes feature shipped a `compile_fail` test that reported `ok`
+  because a rename made it fail for an unrelated reason. It pinned nothing while
+  looking like it pinned everything.
+- Proving that removing `Client::write_at` breaks the guard on pipe I/O methods,
+  the first attempt deleted the method by slicing the source and took one brace
+  too many. The build failed — with `unexpected closing delimiter`, not
+  `no method`. A syntax error fails *every* mutation ever attempted, so it
+  distinguishes nothing.
+
+Prefer mutations that cannot change the syntax: rename a method rather than
+delete it, change a mapping rather than remove an arm. And where a
+`compile_fail` test is unavoidable, give it a **sibling that must succeed**,
+sharing the same setup and differing only in the offending element — then
+deliberately break the shared setup once and confirm the pair cannot both report
+`ok`.
+
 ### What cannot be tested here
 
 Say so in the test module rather than writing something that passes vacuously:

@@ -11,10 +11,10 @@
 //!
 //! Building an operation is pure field validation: it inspects the `Option`s the
 //! caller filled in and touches no platform call, so the set of ways it can fail
-//! is closed by construction rather than by inspection. That makes it one of the
-//! few surfaces in this crate that can honestly report a narrower type than
-//! [`crate::Error`]. Most cannot — see `docs/errors-and-the-funnel.md` for why
-//! the crate's errors do not partition by API, and what was costed and declined.
+//! is closed by construction rather than by inspection. That is a stronger
+//! property than the other error types in this crate have: they are closed by
+//! design and enforcement, which needs guards to stay honest, while this one
+//! cannot reach the classifier at all. See `docs/errors-and-the-funnel.md`.
 
 use windows::Win32::{
     Foundation::HANDLE,
@@ -32,8 +32,8 @@ use windows::Win32::{
 /// Those methods do nothing but check that the fields the caller set cover the
 /// ones the platform requires, so this is the only way any of them can fail.
 ///
-/// Converts into [`crate::Error::MissingField`] with [`From`], so a caller
-/// working in [`crate::Result`] can still use `?`. The same condition exists in
+/// Converts into each surface's `MissingField` with [`From`], so a caller
+/// working in that surface's `Result` can still use `?`. The same condition exists in
 /// both types deliberately: driver-level registration
 /// ([`Handle::register_buffers`](crate::runtime::Handle::register_buffers),
 /// [`Handle::register_files`](crate::runtime::Handle::register_files)) reports a
@@ -41,7 +41,7 @@ use windows::Win32::{
 ///
 /// # Why this is `#[non_exhaustive]`
 ///
-/// For consistency with [`crate::Error`] and to leave cheap room, not because a
+/// For consistency with the surface error types and to leave cheap room, not because a
 /// second field is anticipated. One plausible candidate exists — which builder
 /// produced the error — but it is weak, since the caller knows which `build` it
 /// called. Do not read the attribute as a plan to add fields, and do not remove
@@ -626,12 +626,12 @@ mod tests {
     /// here too. A test that built the value itself would keep passing while the
     /// builder reported something else entirely.
     #[test]
-    fn a_builder_failure_widens_into_the_crate_error_with_its_field_intact() {
+    fn a_builder_failure_widens_into_the_driver_error_with_its_field_intact() {
         let narrow = FlushOp::builder().build().err().unwrap();
-        let wide: crate::Error = narrow.clone().into();
+        let wide: crate::runtime::error::Error = narrow.clone().into();
         assert!(matches!(
             wide,
-            crate::Error::MissingField { field: "handle" }
+            crate::runtime::error::Error::MissingField { field: "handle" }
         ));
 
         let narrow = CancelOp::builder()
@@ -639,10 +639,10 @@ mod tests {
             .build()
             .err()
             .unwrap();
-        let wide: crate::Error = narrow.into();
+        let wide: crate::runtime::error::Error = narrow.into();
         assert!(matches!(
             wide,
-            crate::Error::MissingField {
+            crate::runtime::error::Error::MissingField {
                 field: "op_to_cancel"
             }
         ));
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn the_narrow_and_wide_types_print_identically() {
         let narrow = FlushOp::builder().build().err().unwrap();
-        let wide: crate::Error = narrow.clone().into();
+        let wide: crate::runtime::error::Error = narrow.clone().into();
         assert_eq!(narrow.to_string(), "required field `handle` was not set");
         assert_eq!(narrow.to_string(), wide.to_string());
     }

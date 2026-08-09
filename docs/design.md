@@ -301,8 +301,8 @@ Only the non-waiting `submit(0, 0)` feeds the submission-failure count.
 #### What callers see
 
 Every future resolves, with its buffer, either with its own outcome or with
-`Error::AbandonedAtShutdown`. A drain that is not converging reports
-`Error::ShutdownStalled { outstanding }` to the error observer, throttled, so a
+`runtime::Error::AbandonedAtShutdown`. A drain that is not converging reports
+`runtime::Error::ShutdownStalled { outstanding }` to the error observer, throttled, so a
 stalled shutdown is distinguishable from a hang.
 
 Each individual wait blocks its thread for up to `DRAIN_TIMEOUT_MS`, which
@@ -322,7 +322,7 @@ kernel.
 `Outcome<T, B>` no longer exists. Operations resolve to `BufResult<T, B>`
 unconditionally, because there is no longer a case in which the buffer does not
 come back: the drain waits until the kernel is finished with it. An operation the
-driver ended itself reports `Error::AbandonedAtShutdown` — a named teardown
+driver ended itself reports `runtime::Error::AbandonedAtShutdown` — a named teardown
 error, not a fabricated I/O failure — and still returns the buffer alongside it.
 
 Why ownership rather than a borrowed slice, and what it would take to accept one,

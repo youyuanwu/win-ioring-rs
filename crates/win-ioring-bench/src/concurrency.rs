@@ -207,6 +207,69 @@ pub struct Achieved {
     pub shortfall: Shortfall,
 }
 
+thread_local! {
+    /// How many [`Runner::run`] calls this thread is currently inside.
+    ///
+    /// A depth rather than a flag so nesting cannot clear the mark early.
+    static TIMED_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the measured region for as long as it is held.
+///
+/// # What this is for
+///
+/// The published matrix in `docs/performance.md` times what happens inside
+/// [`Runner::run`]. Work that must not be charged to a backend — opening files,
+/// building a ring, committing writes — is deliberately placed outside it, and
+/// until now that placement was preserved only by whoever was editing being
+/// aware of it.
+///
+/// That was not good enough once `File::flush` started returning a wrapper
+/// future: moving a `sync` inside the loop would have put a wrapper into the
+/// measured region, changing what the matrix measures, and nothing would have
+/// said so. `Backend::sync` implementations that reach `File::flush` assert
+/// against this, so the move fails loudly instead.
+///
+/// # Why a region and not a scan
+///
+/// A test that reads the source looking for a `sync` call between `run(` and its
+/// closing brace has to anticipate every way that call can be spelled. This
+/// crate's sibling work retired exactly such a guard after it was defeated nine
+/// times across three review rounds. Observing the run costs one thread-local
+/// increment per phase — not per operation — and cannot be spelled around.
+///
+/// # Why it cannot fire spuriously
+///
+/// The mark is per-thread and is set only while `run` is being polled. A `sync`
+/// awaited outside the region belongs to a task that never entered it, so it
+/// reads zero even if another thread is mid-run. A `sync` awaited *inside* is
+/// part of the same future as the `run` that set the mark, so it is polled on
+/// the thread that set it. Failures are therefore possible only in the direction
+/// of missing a violation, never of inventing one.
+pub struct TimedRegion;
+
+impl TimedRegion {
+    /// Enters the measured region until the returned value is dropped.
+    pub fn enter() -> Self {
+        TIMED_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+impl Drop for TimedRegion {
+    fn drop(&mut self) {
+        TIMED_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Whether this task is currently inside [`Runner::run`].
+///
+/// Call this from anything that must not be charged to the measured region. See
+/// [`TimedRegion`].
+pub fn in_timed_region() -> bool {
+    TIMED_DEPTH.with(|d| d.get()) > 0
+}
+
 /// Drives a bounded set of operations, recording what completed.
 pub struct Runner<'a, B: Backend> {
     backend: &'a B,
@@ -238,6 +301,9 @@ impl<'a, B: Backend> Runner<'a, B> {
 
     /// Runs `count` operations, keeping the configured number outstanding.
     ///
+    /// For the duration of this call the task is marked as being inside the
+    /// measured region. See [`TimedRegion`] for what reads that mark and why.
+    ///
     /// `make` produces the *n*th operation as a future yielding its file offset
     /// alongside its outcome, so a completion can be matched to what was asked
     /// for without depending on the order completions arrive in.
@@ -256,6 +322,7 @@ impl<'a, B: Backend> Runner<'a, B> {
         F: FnMut(usize) -> io::Result<Fut>,
         Fut: Future<Output = (u64, io::Result<(u32, B::Buf)>)>,
     {
+        let _region = TimedRegion::enter();
         let mut pending = FuturesUnordered::new();
         let mut issued = 0;
         loop {
@@ -445,6 +512,67 @@ mod tests {
         fn sync(&self, _file: &Self::File) -> impl Future<Output = io::Result<()>> {
             std::future::ready(Ok(()))
         }
+    }
+
+    /// The measured region is marked while `run` is being polled, and only then.
+    ///
+    /// This is the whole basis of the SC-14 guard in `backends/ioring.rs`: those
+    /// `sync` implementations reach `File::flush`, whose wrapper future must not
+    /// enter the region `docs/performance.md` times, and they detect that by
+    /// asking [`in_timed_region`].
+    ///
+    /// The inside observation is **counted**, not merely asserted. An assertion
+    /// inside a closure that never ran passes silently, which is how a guard in
+    /// this repository has previously reported `ok` while checking nothing; the
+    /// count at the end is what makes that visible here.
+    #[test]
+    fn the_measured_region_is_marked_only_while_the_run_is_polled() {
+        assert!(
+            !in_timed_region(),
+            "the mark must be clear before any run starts"
+        );
+
+        let backend = FakeBackend::new();
+        let mut runner = Runner::new(&backend, 2, Shape::Rolling);
+        let mut trace = Trace::new();
+        let observed_inside = std::cell::Cell::new(0_usize);
+        let observed_clear_inside = std::cell::Cell::new(0_usize);
+
+        futures::executor::block_on(runner.run(4, Phase::Read, &mut trace, |_| {
+            let observed = &observed_inside;
+            let clear = &observed_clear_inside;
+            if in_timed_region() {
+                observed.set(observed.get() + 1);
+            } else {
+                clear.set(clear.get() + 1);
+            }
+            Ok(async move {
+                if in_timed_region() {
+                    observed.set(observed.get() + 1);
+                } else {
+                    clear.set(clear.get() + 1);
+                }
+                (0, Ok((4, FakeBuf(vec![0_u8; 4]))))
+            })
+        }))
+        .unwrap();
+
+        assert_eq!(
+            observed_clear_inside.get(),
+            0,
+            "every observation taken during the run must see the mark set"
+        );
+        assert!(
+            observed_inside.get() >= 8,
+            "expected both the builder and the future body to observe the mark \
+             for each of the four operations, got {}; a low count means the \
+             closure did not run and the check above was vacuous",
+            observed_inside.get()
+        );
+        assert!(
+            !in_timed_region(),
+            "the mark must be clear once the run has returned"
+        );
     }
 
     /// Drives `count` trivially-ready operations and returns what was achieved.

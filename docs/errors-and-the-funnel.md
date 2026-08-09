@@ -1,62 +1,69 @@
 # Errors and the funnel
 
-Why this crate has one error type for almost everything, why that is not
-laziness, and what it would cost to change.
+Why this crate classifies platform errors in exactly one place, why each public
+API nonetheless reports its own error type, and which of the two is the
+load-bearing constraint.
 
-This document exists because "each API should report its own error type" is a
-reasonable-sounding idea that someone will have again. It was tried, costed, and
-mostly declined — and the reasons are structural rather than aesthetic, so they
-will still hold next time unless the architecture changes.
+> **This document previously concluded the opposite.** It argued that this
+> crate's errors could not partition by API, and that conclusion has been
+> refuted — by execution, not by argument. The revision is kept visible rather
+> than tidied away, because most of the reasoning survived intact and it is worth
+> knowing exactly which part did not. See [What this document got
+> wrong](#what-this-document-got-wrong).
 
 ## The question
 
-Before this change, `crate::Error` had 25 variants and every fallible API in the
-crate returned it. So `IoRing::builder().build()` could return `PipeBroken`, and
+The crate used to have one `crate::Error` with 25 variants, returned by every
+fallible API. So `IoRing::builder().build()` could return `PipeBroken`, and
 `RegisteredBuffers::check_out()` could return `NoFileOffset`. Neither can
 actually happen. A caller reading the signature cannot tell.
 
-The obvious fix is one error type per module: `io_ring::Error`, `runtime::Error`,
-`file::Error`, `pipe::Error`. The obvious fix does not work.
+## The answer: classification funnels, error *types* do not
 
-## The answer: the errors do not partition by API
+The two are separable, and conflating them is what produced the earlier wrong
+conclusion.
 
-Grouping all 25 variants by which public surface can produce them gives **10
-reachable from exactly one surface and 15 reachable from two or more**. The
-shared 15 include every variant a caller is most likely to match on.
+- **Classification** — turning an `HRESULT` into a named condition — happens in
+  exactly one place and must keep happening in exactly one place. That is a hard
+  constraint, and the reasoning for it below is unchanged.
+- **Which type carries the condition** is decided at the public boundary, where
+  the API is known. That is a different question, and it has a different answer.
 
-Three structural reasons, each checkable.
+The crate now has six error types:
 
-### 1. Three pipe error variants have no producer in `pipe/`
+| Type | Variants |
+|---|---|
+| `io_ring::BuildError` | 4 |
+| `io_ring::Error` | 4 |
+| `buf::Error` | 2 |
+| `runtime::Error` | 13 |
+| `file::Error` | 10 |
+| `pipe::Error` | 13 |
+| **Total public slots** | **46** |
 
-`PipeBusy`, `PipeBroken` and `PipeNoPeer` are constructed in exactly one place in
-the entire crate: `Error::from_hresult` in `error.rs`. Nothing under `pipe/`
-constructs them.
+Forty-six slots against the previous twenty-five. That is the honest cost: the
+duplication is real and roughly doubles the number of variants a reader can
+encounter across the crate. What it buys is that no single signature exposes more
+than it can produce — `File::read_at` returns 10 possibilities instead of 25, and
+`Client::read_at` returns 13 that are actually a pipe's.
 
-They are not pipe-module errors. They are values that `runtime::ReadFuture` can
-yield, and a file read can yield them just as a pipe read can, because the
-classifier matches on the platform code alone and a code is all it has.
+`runtime::Error` carries 13 rather than the 17 an earlier draft of this document
+reported. It named the four pipe conditions until it was observed that nothing it
+is reached through can know a handle is a pipe: `Handle::read` takes a `&File`,
+`read_registered` takes a registration index, and `Client::file()` hands out a
+`&File`. Naming was therefore a guess, and it is now the rule that **only
+`pipe::Error` names a pipe condition**.
 
-### 2. Pipes and files share the same futures
+The mechanism that makes this affordable is a single `Other` variant on each
+type. A surface names the conditions it can produce and everything else falls
+through *carrying its `HRESULT`*, so no type has to enumerate the platform.
 
-Not "similar futures" — the same ones. `Server::file()` hands out a `&File`, and
-`Client` implements `Deref<Target = File>`, so a `Client` *is* a `File` for every
-purpose including method resolution. Neither type exposes a read, write or flush
-of its own; pipe I/O is `Handle::read` and `Handle::write`, returning
-`ReadFuture` and `WriteFuture`. See `docs/pipes-and-the-ring.md`, which reaches
-the same conclusion from the other direction.
+## The constraint that is real: one classifier
 
-There is therefore no pipe I/O error channel to give a distinct type to. A
-`pipe::Error` would have exactly one variant of its own: `AcceptOutstanding`.
+This is the part of the original argument that survived, and it is worth
+restating because the new design is built to respect it rather than to escape it.
 
-The converse trap is sharper, and it is where a first pass at this went wrong.
-`NoFileOffset` lives in `file.rs` and looks like a file error. It exists **for
-pipes**: `File::read` and `File::write` track a cursor, a pipe has no meaningful
-file position, and the platform ignores the offset rather than rejecting it — so
-the crate refuses those two calls on a pipe rather than returning wrong data
-successfully. It is documented as pipe behaviour on `pipe::Client`. Grouping it
-under "file" because of where it is constructed gets it exactly backwards.
-
-### 3. The driver classifies the error before it knows the operation
+### The driver classifies before it knows the operation
 
 In `DriverInner::reap_completions`:
 
@@ -72,94 +79,168 @@ let Some(payload) = self.slab.complete(token) else {   // identified five lines 
 ```
 
 At the moment of classification the driver holds an `IORING_CQE` and nothing
-else. And identifying the operation would not help: `OpPayload` has seven fields
-— buffer, file, slot, registered buffer, registered file, pending registration,
-and a sequential-I/O drop guard — and **none records which API issued the
-operation**.
+else, and identifying the operation would not help: `OpPayload` records no field
+naming the API that issued it.
 
-So a per-API error type on the completion path would require the driver to carry
-an API discriminator it does not have and has no reason to want. This is the
-constraint that settles the design: **on the completion path there is only one
-error type by design**, and the single funnel is the expression of that, not an
-accident.
+**This is still true, and the design does not change it.** The driver still
+classifies into one type. What changed is that the classified value is converted
+at the public boundary, where the API *is* known — so the driver never needs an
+API discriminator, and the completion path is untouched.
 
-## What is irreducibly shared
+The original document read this constraint as fatal to per-API types. It is only
+fatal to classifying *at the funnel*. Deferring the choice of type to the
+boundary was never in tension with it.
 
-| Variant | Why it cannot belong to one module |
-|---|---|
-| `Os` | the `from_hresult` fallback, reachable from every surface |
-| `QueueFull` | slab exhaustion *and* a platform code |
-| `RingClosed` | `ensure_open` guards every ring touch |
-| `UnsupportedOp` | `ensure_op_supported` is public *and* called by every submit path |
-| `ShuttingDown`, `AbandonedAtShutdown` | teardown resolves any operation |
-| `BufferTooSmall`, `UninitializedWriteRange` | `buf`'s check functions are public *and* called by `try_read`/`try_write` |
-| `MissingField` | driver registration reports it too |
-| `PipeBusy`, `PipeBroken`, `PipeNoPeer` | one classifier, reachable from all four surfaces |
-| `PipeListening` | classified from `ERROR_PIPE_LISTENING` like the three above, *and* produced directly in `pipe/server.rs` |
-| `OperationOutstanding`, `NoFileOffset` | produced in `file.rs`, reachable on a pipe through `Deref` |
+### Why a second classifier is forbidden
 
-Ten variants do partition: `Unsupported`, `UnsupportedVersion` and
-`UnsupportedFeature` (ring construction only); `InvalidRegisteredIndex`,
-`RegisteredRangeOutOfBounds`, `BufferCheckedOut`, `RegistrationSuperseded`,
-`RegistrationPending` and `ShutdownStalled` (runtime only); `AcceptOutstanding`
-(pipe only).
+The crate's own words, in `pipe::client`:
 
-A single method, `Handle::read`, can return **twelve** of the twenty-five.
+> `ERROR_PIPE_BUSY` from a failed open and `ERROR_PIPE_BUSY` from a completion
+> must produce the same variant, and two independent match arms are exactly how
+> that stops being true after someone edits one of them.
 
-## Why a second classifier is forbidden
+This is the sharpest objection to per-API error types, and it is correct. Per-API
+*classifiers* would reintroduce exactly this hazard.
 
-Any design that gives the pipe *setup* path its own error type has to decide what
-`ERROR_PIPE_BUSY` means at the point a client fails to open. The crate already
-answers this, in `pipe::client`:
+The design's answer is not to note the risk but to remove the possibility. A
+given code is compared in exactly **one** place. `error::pipe_table` holds the
+four pipe codes; `error::ring_table` holds the one ring code; their code sets are
+**disjoint**, asserted by `the_two_tables_name_disjoint_codes` reading the tables
+themselves. `pipe::Error` consults the pipe table, `io_ring::Error` the ring
+table, and `file::Error` and `runtime::Error` compare nothing at all -- they
+delegate to the ring surface, wrap what it recognised, and demote the rest
+carrying the code. `error_classification_has_one_home` polices the source text so
+no third comparison site appears.
 
-> Routes through `Error::from_hresult`, which is the same funnel every ring
-> completion passes through, rather than repeating the code comparisons here.
-> That matters more than it looks: `ERROR_PIPE_BUSY` from a failed open and
-> `ERROR_PIPE_BUSY` from a completion must produce the same variant, and two
-> independent match arms are exactly how that stops being true after someone
-> edits one of them.
+### The mechanism this replaced, and the lesson that outlived it
 
-A `pipe::SetupError` must therefore either re-derive the pipe codes in a second
-match — the thing this forbids — or convert from the shared classifier anyway, in
-which case it is not closed and buys no precision.
+The original design was a `Condition` enum with a `ConditionView` trait: one
+method per condition, implemented by five error types, dispatched by a single
+`view` function, so a new condition was `E0004` at the dispatch and `E0046` at
+every view. It was adopted for good reason and defended twice against proposals
+to remove it.
 
-Worth recording plainly: **the first draft of the design work behind this change
-proposed `pipe::SetupError`**, and cited lines seven away from the rationale
-against it. It was the shape that made the original request look achievable,
-which is exactly why it needed the most scrutiny and got the least. Review caught
-it.
+It was retired when a prototype showed its load-bearing justification did not
+hold. That justification was that four views must *recognise*
+`IORING_E_SUBMISSION_QUEUE_FULL`, so one table did work no `From` implementation
+could absorb. They do not recognise it -- they **wrap** what the ring surface
+recognised, which delegation absorbs exactly. Five implementations of thirty
+methods were expressing five code comparisons and three wrapping rules; two of
+the five were textually identical and a third named nothing.
 
-## What was carved, and why that one
+The lesson worth keeping is narrower than the one first drawn, and getting it
+wrong is how the mechanism was over-credited for two rounds: **the trait bought
+totality, not singularity.** It forced every view to *account for* every
+condition. It never prevented a second table -- a view method received the raw
+`HRESULT` and could always have compared it. Preventing a second table was, and
+remains, the job of the source-text guards. Retiring the trait surrendered
+`E0046`, and `E0046`'s benefit did not survive attack: a type that cannot name a
+condition must demote it, and demotion is already what an unrecognised code does.
 
-`io_ring::ops::MissingField`. The operation builders' `build()` methods do
-nothing but check that the `Option`s the caller filled cover the ones the
-platform requires. The module imports Win32 *types*, but contains no `unsafe`
-block and makes no Win32 call, so nothing in it can reach the classifier — every
-failure is an `Option::ok_or`. The failure set is closed **by construction rather
-than by inspection**. Four methods went from 25 reachable variants to 1.
+One door was found and shut during the original implementation, and it still
+stands:
 
-That is the test a carve has to pass here: not "does this module feel distinct"
-but "is this surface's outcome set closed without consulting the platform".
-Almost nothing in this crate passes it, which is the whole finding.
+- A wildcard arm in a boundary conversion would silently route a *new* condition
+  into the driver-only sink. `#[deny(clippy::wildcard_enum_match_arm)]` makes
+  that arm a compile error. A comment forbidding it was the previous guard, and
+  a comment is not a guard.
 
-## What was declined
+The residual hazard recorded against the trait -- a new condition routed to an
+*existing* view method, which `E0046` cannot see -- no longer applies, because
+there are no view methods. Its successor is smaller and named here: a code added
+to the wrong table. `the_two_tables_name_disjoint_codes` catches the case where
+it is added to both; nothing catches a pipe code filed only in the ring table,
+beyond the round-trip tests that exercise every table entry.
 
-`io_ring::BuildError` and `runtime::RegistryError` were fully costed and not
-taken; see `docs/pending-work.md` for the numbers and the reasoning, so that
-proposing them again starts from the evidence rather than from scratch.
+## What this document got wrong
 
-The short version: carving them would have left the retained type at 22 of 25
-variants while duplicating 8 conditions across four types. The surfaces they
-narrow are touched once at startup; the surface callers touch in a loop would not
-have been narrowed at all. A refactor whose gain is documentary is not worth a
-breaking change.
+The earlier conclusion rested on a producer/consumer map that grouped the 25
+variants by **which surface can produce them**, found 15 reachable from two or
+more surfaces, and treated that as fatal.
+
+Multi-surface reachability is not fatal. It is duplication, and duplication is
+affordable when each type lists only what it can produce and demotes the rest.
+The map answered "who produces this?" when the design needed "what can this API
+surface?" — a different question with a different shape, and the document did not
+notice it had substituted one for the other.
+
+Three specific errors:
+
+1. **"A `pipe::Error` would have exactly one variant of its own:
+   `AcceptOutstanding`."** It has 13. The estimate followed from the map's
+   producer-side cut: the pipe conditions are *constructed* in `error.rs`, so
+   they were counted as belonging to no module rather than as reachable from the
+   pipe surface.
+
+2. **"Pipes and files share the same futures... there is therefore no pipe I/O
+   error channel to give a distinct type to."** True when written, and no longer,
+   because the work changed it: `Client` and `Server` now have their own
+   `read_at`/`write_at` returning `pipe::Error`, and `Deref<Target = File>` is
+   gone. The premise was a fact about the code rather than a constraint on it,
+   and the document did not distinguish those.
+
+3. **`NoFileOffset` (now `file::Error::NotSeekable`) was listed as
+   pipe-reachable**, via `Client::into_file()` followed by a sequential read.
+   That was correct at the time. Removing `into_file` closes the route:
+   `Client::file()` hands out a `&File`, and `File::read`/`File::write` take
+   `&mut self`, so a borrow cannot reach the cursor-tracking methods. The
+   condition is now genuinely file-only.
+
+`PipeListening` deserves a line of its own. The earlier map recorded at `:98`
+that it is *both* classified from `ERROR_PIPE_LISTENING` and produced directly in
+`pipe/server.rs`, and a later section was then written as though it were only the
+former. It has three direct producers — `Server::file()`, `Server::disconnect()`,
+and a defensive arm in the accept future — as well as the classified route. A
+condition with two origins needs both pinned separately; asserting one and
+generalising is how the distinction gets lost, and it got lost inside this
+document once already.
+
+## What is genuinely shared, and what that costs
+
+Some conditions really are reachable from several surfaces, and under the new
+design they are named by several types. That is the duplication the table above
+prices at 46 slots.
+
+The pipe conditions are **not** among them any more. They are reachable from
+several surfaces but named by exactly one, which is why the total fell by four:
+reachability earns a demotion carrying the code, not a name.
+
+It is not *divergence*, because every one of them is a view over the same table
+entry: the same `HRESULT` produces the same condition everywhere, and a test
+walks every condition through every view to prove it rather than asserting it.
+
+Ten conditions still partition cleanly — ring construction's three
+(`Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`), the runtime's six
+registration and shutdown conditions, and the pipe's `AcceptOutstanding`. The
+four pipe conditions now partition too, by decision rather than by reachability.
+
+The two exhaustion conditions deserve care because they look identical and are
+not. `io_ring::Error::QueueFull` is the kernel's submission queue;
+`runtime::Error::TooManyOperations` is this crate's slab of operation slots. Both
+mean "too many in flight", both bind at 65,536, and only the order of the two
+checks separates them. They call for different remedies, so they are pinned by a
+test that reaches *both* producers rather than one that asserts a negative.
+
+## What was carved by construction
+
+`io_ring::ops::MissingField`. The operation builders check that the `Option`s a
+caller filled cover the ones the platform requires; the module makes no Win32
+call, so nothing in it can reach the classifier. Its failure set is closed **by
+construction rather than by inspection**.
+
+That remains the strongest form a narrow error type can take, and it is worth
+distinguishing from the rest: the six types above are closed by *design and
+enforcement*, which is weaker than closed by construction and needs its guards to
+stay honest.
 
 ## The honest summary
 
 The request that started this work was "each API should use its own error enum".
-The answer is that this crate cannot do that, for reasons that are properties of
-the ring model rather than of this implementation: one completion queue, one
-classifier, and a deliberate decision that a pipe is a file once it is connected.
+The answer is yes — at a cost of doubling the total variant count, and only
+because classification stays in one place while the *type* is chosen at the
+boundary.
 
-One surface could be carved and was. The rest is not a backlog item — it is a
-finding.
+The previous answer was no, and it was wrong for an instructive reason. It
+established a real constraint on the completion path and then applied it to a
+question the completion path does not decide. The constraint is still there; it
+simply never reached as far as the conclusion drawn from it.

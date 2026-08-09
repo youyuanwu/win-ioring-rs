@@ -13,6 +13,13 @@
 //! was dropped. Raw handles remain available through [`crate::io_ring`], which
 //! is unsafe and documents the obligation.
 
+pub mod error;
+
+/// Re-exported so callers write `file::Error` rather than
+/// naming the module twice. The module stays public: a caller who wants the
+/// long form still has it.
+pub use error::Error;
+
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -33,7 +40,6 @@ use windows::Win32::Storage::FileSystem::{
 const FILE_FLAG_OVERLAPPED: u32 = windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0;
 
 use crate::buf::{BufResult, IoBuf, IoBufMut};
-use crate::error::Error;
 use crate::io_ring::ops::SqeFlags;
 use crate::runtime::{FlushFuture, Handle, OperationId, ReadFuture, WriteFuture};
 
@@ -54,6 +60,9 @@ pub struct FileState {
     /// sequential operation's future releases that access while the kernel is
     /// still working, so a second operation could otherwise start against a
     /// cursor position the first is about to consume.
+    /// Unused on the pipe path: the pipe surface issues positional I/O only, so
+    /// a pipe's `File` never reaches the guard that sets this, nor the cursor
+    /// below.
     sequential_outstanding: Cell<bool>,
     /// What `GetFileType` said about this handle, cached after the first
     /// sequential use.
@@ -116,7 +125,7 @@ impl FileState {
         };
 
         if file_type == FILE_TYPE_PIPE.0 || file_type == FILE_TYPE_CHAR.0 {
-            Err(Error::NoFileOffset { file_type })
+            Err(Error::NotSeekable { file_type })
         } else {
             Ok(())
         }
@@ -450,8 +459,10 @@ impl File {
         buffer: B,
         len: u32,
         offset: u64,
-    ) -> ReadFuture<B> {
-        handle.read(self, buffer, len, offset)
+    ) -> PositionalRead<B> {
+        PositionalRead {
+            inner: handle.read(self, buffer, len, offset),
+        }
     }
 
     /// Writes `len` bytes from `buffer` at `offset`, without touching the
@@ -462,8 +473,10 @@ impl File {
         buffer: B,
         len: u32,
         offset: u64,
-    ) -> WriteFuture<B> {
-        handle.write(self, buffer, len, offset)
+    ) -> PositionalWrite<B> {
+        PositionalWrite {
+            inner: handle.write(self, buffer, len, offset),
+        }
     }
 
     /// Reads `len` bytes from the cursor into `buffer`, advancing the cursor.
@@ -479,7 +492,7 @@ impl File {
     ///
     /// # Handles with no file offset
     ///
-    /// This fails with [`Error::NoFileOffset`] on a pipe or a character device.
+    /// This fails with [`Error::NotSeekable`] on a pipe or a character device.
     /// Those handles have no file offset, so the cursor this method maintains
     /// describes nothing: the platform ignores the offset and consumes from the
     /// head of the stream. Were the operation permitted, every read after the
@@ -498,7 +511,8 @@ impl File {
     ) -> SequentialRead<'a, B> {
         if let Err(error) = self.state.check_has_file_offset() {
             return SequentialRead {
-                inner: ReadFuture::failed(error, buffer),
+                inner: None,
+                rejected: Some((error, buffer)),
                 state: Rc::clone(&self.state),
                 _file: PhantomData,
             };
@@ -508,14 +522,16 @@ impl File {
             Some(guard) => guard,
             None => {
                 return SequentialRead {
-                    inner: ReadFuture::failed(Error::OperationOutstanding, buffer),
+                    inner: None,
+                    rejected: Some((Error::OperationOutstanding, buffer)),
                     state: Rc::clone(&self.state),
                     _file: PhantomData,
                 };
             }
         };
         SequentialRead {
-            inner: handle.read_sequential(self, buffer, len, offset, guard),
+            inner: Some(handle.read_sequential(self, buffer, len, offset, guard)),
+            rejected: None,
             state: Rc::clone(&self.state),
             _file: PhantomData,
         }
@@ -524,7 +540,7 @@ impl File {
     /// Writes `len` bytes from `buffer` at the cursor, advancing the cursor.
     ///
     /// The same exclusivity and cursor rules apply as for [`File::read`], and so
-    /// does its refusal: this fails with [`Error::NoFileOffset`] on a pipe or a
+    /// does its refusal: this fails with [`Error::NotSeekable`] on a pipe or a
     /// character device, because the offset it would supply describes nothing
     /// there. A permitted write would append regardless of the cursor and report
     /// success, leaving the cursor claiming a position the stream does not have.
@@ -537,7 +553,8 @@ impl File {
     ) -> SequentialWrite<'a, B> {
         if let Err(error) = self.state.check_has_file_offset() {
             return SequentialWrite {
-                inner: WriteFuture::failed(error, buffer),
+                inner: None,
+                rejected: Some((error, buffer)),
                 state: Rc::clone(&self.state),
                 _file: PhantomData,
             };
@@ -547,27 +564,121 @@ impl File {
             Some(guard) => guard,
             None => {
                 return SequentialWrite {
-                    inner: WriteFuture::failed(Error::OperationOutstanding, buffer),
+                    inner: None,
+                    rejected: Some((Error::OperationOutstanding, buffer)),
                     state: Rc::clone(&self.state),
                     _file: PhantomData,
                 };
             }
         };
         SequentialWrite {
-            inner: handle.write_sequential(self, buffer, len, offset, guard),
+            inner: Some(handle.write_sequential(self, buffer, len, offset, guard)),
+            rejected: None,
             state: Rc::clone(&self.state),
             _file: PhantomData,
         }
     }
 
     /// Flushes the file, using the platform's default flush mode.
-    pub fn flush(&self, handle: &Handle) -> FlushFuture {
-        handle.flush(self)
+    pub fn flush(&self, handle: &Handle) -> Flush {
+        Flush {
+            inner: handle.flush(self),
+        }
     }
 
     /// Flushes the file with an explicit flush mode.
-    pub fn flush_with_mode(&self, handle: &Handle, mode: FILE_FLUSH_MODE) -> FlushFuture {
-        handle.flush_with_options(self, mode, SqeFlags::NONE)
+    pub fn flush_with_mode(&self, handle: &Handle, mode: FILE_FLUSH_MODE) -> Flush {
+        Flush {
+            inner: handle.flush_with_options(self, mode, SqeFlags::NONE),
+        }
+    }
+}
+
+/// A positional read in progress, reporting failures as [`Error`].
+///
+/// A thin wrapper over the driver's own future. The wrapping is what gives the
+/// file surface its own error type without the driver having one per caller:
+/// the driver classifies once, and this maps that condition onto the type this
+/// surface returns.
+///
+/// It is a wrapper rather than a type parameter on the driver's future because
+/// the driver's completion path is inside the region `docs/performance.md`'s
+/// matrix times. A type parameter would reach into that path; a wrapper cannot.
+pub struct PositionalRead<B: IoBufMut> {
+    inner: ReadFuture<B>,
+}
+
+impl<B: IoBufMut> PositionalRead<B> {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBufMut> Future for PositionalRead<B> {
+    type Output = BufResult<u32, B, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Delegated, so the double-poll panic stays where it was: this wrapper
+        // holds no state of its own to get wrong.
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(BufResult::new(
+            outcome.result.map_err(Error::from),
+            outcome.buffer,
+        ))
+    }
+}
+
+/// A positional write in progress, reporting failures as [`Error`].
+///
+/// See [`PositionalRead`] for why this is a wrapper.
+pub struct PositionalWrite<B: IoBuf> {
+    inner: WriteFuture<B>,
+}
+
+impl<B: IoBuf> PositionalWrite<B> {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl<B: IoBuf> Future for PositionalWrite<B> {
+    type Output = BufResult<u32, B, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(BufResult::new(
+            outcome.result.map_err(Error::from),
+            outcome.buffer,
+        ))
+    }
+}
+
+/// A flush in progress, reporting failures as [`Error`].
+///
+/// Decision 9: the error type is decided by the public surface that returns the
+/// future, not by where the future is defined. `FlushFuture` is reachable both
+/// from here and from [`Handle::flush`](crate::runtime::Handle::flush); the
+/// former answers with a file error and the latter with a driver error, and each
+/// is right for its own caller.
+pub struct Flush {
+    inner: FlushFuture,
+}
+
+impl Flush {
+    /// The driver's identifier for this operation, once it has one.
+    pub fn operation_id(&self) -> Option<OperationId> {
+        self.inner.operation_id()
+    }
+}
+
+impl Future for Flush {
+    type Output = Result<(), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        Poll::Ready(outcome.map_err(Error::from))
     }
 }
 
@@ -576,7 +687,13 @@ impl File {
 /// Borrows the file exclusively, so a second sequential operation cannot be
 /// started while this exists.
 pub struct SequentialRead<'a, B: IoBufMut> {
-    inner: ReadFuture<B>,
+    inner: Option<ReadFuture<B>>,
+    /// A rejection that never reached the driver, with the caller's buffer.
+    ///
+    /// Held here rather than inside the future because these conditions are
+    /// file-only: `runtime::Error` cannot represent them, so they cannot be
+    /// carried by a driver future.
+    rejected: Option<(Error, B)>,
     state: Rc<FileState>,
     _file: PhantomData<&'a mut File>,
 }
@@ -586,15 +703,25 @@ impl<B: IoBufMut> SequentialRead<'_, B> {
     ///
     /// Absent if the operation was rejected before reaching the kernel.
     pub fn operation_id(&self) -> Option<OperationId> {
-        self.inner.operation_id()
+        self.inner.as_ref().and_then(|f| f.operation_id())
     }
 }
 
 impl<B: IoBufMut> Future for SequentialRead<'_, B> {
-    type Output = BufResult<u32, B>;
+    type Output = BufResult<u32, B, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        if let Some((error, buffer)) = self.rejected.take() {
+            return Poll::Ready(BufResult::new(Err(error), buffer));
+        }
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("a sequential operation is either rejected or in flight");
+        let outcome = std::task::ready!(Pin::new(inner).poll(cx));
+        // The boundary conversion: the driver classified once, and this maps
+        // that condition onto the type this surface returns.
+        let outcome = BufResult::new(outcome.result.map_err(Error::from), outcome.buffer);
         advance_on_success(&self.state, &outcome);
         Poll::Ready(outcome)
     }
@@ -604,7 +731,9 @@ impl<B: IoBufMut> Future for SequentialRead<'_, B> {
 ///
 /// Borrows the file exclusively, as [`SequentialRead`] does.
 pub struct SequentialWrite<'a, B: IoBuf> {
-    inner: WriteFuture<B>,
+    inner: Option<WriteFuture<B>>,
+    /// See [`SequentialRead::rejected`].
+    rejected: Option<(Error, B)>,
     state: Rc<FileState>,
     _file: PhantomData<&'a mut File>,
 }
@@ -614,15 +743,25 @@ impl<B: IoBuf> SequentialWrite<'_, B> {
     ///
     /// Absent if the operation was rejected before reaching the kernel.
     pub fn operation_id(&self) -> Option<OperationId> {
-        self.inner.operation_id()
+        self.inner.as_ref().and_then(|f| f.operation_id())
     }
 }
 
 impl<B: IoBuf> Future for SequentialWrite<'_, B> {
-    type Output = BufResult<u32, B>;
+    type Output = BufResult<u32, B, Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let outcome = std::task::ready!(Pin::new(&mut self.inner).poll(cx));
+        if let Some((error, buffer)) = self.rejected.take() {
+            return Poll::Ready(BufResult::new(Err(error), buffer));
+        }
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("a sequential operation is either rejected or in flight");
+        let outcome = std::task::ready!(Pin::new(inner).poll(cx));
+        // The boundary conversion: the driver classified once, and this maps
+        // that condition onto the type this surface returns.
+        let outcome = BufResult::new(outcome.result.map_err(Error::from), outcome.buffer);
         advance_on_success(&self.state, &outcome);
         Poll::Ready(outcome)
     }
@@ -632,7 +771,7 @@ impl<B: IoBuf> Future for SequentialWrite<'_, B> {
 ///
 /// A failure transfers nothing, so it leaves the cursor alone. So does a
 /// zero-byte transfer, trivially.
-fn advance_on_success<B>(state: &FileState, outcome: &BufResult<u32, B>) {
+fn advance_on_success<B>(state: &FileState, outcome: &BufResult<u32, B, Error>) {
     if let Ok(transferred) = &outcome.result {
         state
             .cursor

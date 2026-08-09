@@ -34,7 +34,7 @@ use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
 
-use crate::error::{Error, Result};
+use crate::runtime::error::Error;
 
 /// The per-buffer bookkeeping a registration keeps.
 ///
@@ -200,7 +200,7 @@ impl RegistryInner {
     /// The registry-local half of checkout. The driver-consulting guards —
     /// shutdown, a registration in flight, and supersession — wrap this in
     /// [`RegisteredBuffers::check_out`].
-    fn claim(self: &Rc<Self>, index: u32) -> Result<RegisteredBuf> {
+    fn claim(self: &Rc<Self>, index: u32) -> Result<RegisteredBuf, Error> {
         let mut slots = self.slots.borrow_mut();
         let slot = slots
             .get_mut(index as usize)
@@ -285,7 +285,7 @@ impl RegisteredBuffers {
     /// - [`Error::BufferCheckedOut`] if a handle to it already exists. A buffer
     ///   held by an operation returns when that operation reports, which may be
     ///   later than the point its future was dropped.
-    pub fn check_out(&self, index: u32) -> Result<RegisteredBuf> {
+    pub fn check_out(&self, index: u32) -> Result<RegisteredBuf, Error> {
         let driver = self.inner.driver.upgrade().ok_or(Error::ShuttingDown)?;
         {
             let driver = driver.borrow();
@@ -364,14 +364,15 @@ impl RegisteredBuf {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::BufferTooSmall`] if `src` is longer than the registered
+    /// Returns [`Error::Buf`] carrying [`buf::Error::TooSmall`](crate::buf::error::Error::TooSmall)
+    /// if `src` is longer than the registered
     /// extent.
-    pub fn fill(&mut self, src: &[u8]) -> Result<()> {
+    pub fn fill(&mut self, src: &[u8]) -> Result<(), Error> {
         if src.len() > self.extent {
-            return Err(Error::BufferTooSmall {
+            return Err(Error::Buf(crate::buf::error::Error::TooSmall {
                 requested: src.len() as u64,
                 available: self.extent as u64,
-            });
+            }));
         }
         if !src.is_empty() {
             // SAFETY: `ptr` is the registered base address, valid for writes of
@@ -509,7 +510,7 @@ mod tests {
     }
 
     /// Claims a buffer without the driver-consulting guards.
-    fn claim(buffers: &RegisteredBuffers, index: u32) -> Result<RegisteredBuf> {
+    fn claim(buffers: &RegisteredBuffers, index: u32) -> Result<RegisteredBuf, Error> {
         buffers.inner().claim(index)
     }
 
@@ -582,14 +583,14 @@ mod tests {
         let mut buf = claim(&buffers, 0).expect("index 0 exists");
 
         match buf.fill(b"too long") {
-            Err(Error::BufferTooSmall {
+            Err(Error::Buf(crate::buf::error::Error::TooSmall {
                 requested,
                 available,
-            }) => {
+            })) => {
                 assert_eq!(requested, 8);
                 assert_eq!(available, 4);
             }
-            other => panic!("expected BufferTooSmall, got {other:?}"),
+            other => panic!("expected Buf(TooSmall), got {other:?}"),
         }
         assert!(
             buf.is_empty(),

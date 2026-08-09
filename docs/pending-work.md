@@ -106,7 +106,7 @@ across `File` clones are unsupported.
 Sequential exclusivity is meant to be enforced at compile time by `&mut self`,
 and a `compile_fail` doc-test asserts it. Two clones give two independent `&mut`
 paths to one `FileState`. The runtime guard catches it with
-`Error::OperationOutstanding`, so it degrades gracefully — the compile-time check
+`file::Error::OperationOutstanding`, so it degrades gracefully — the compile-time check
 is per-value, the runtime check is per-file. Worth a sentence in the `File::clone`
 rustdoc.
 
@@ -206,30 +206,33 @@ in two ways rather than one, or correct the string. It is listed here rather tha
 fixed inside the Criterion migration because it changes what is measured, and
 that migration's whole premise is that what is measured did not change.
 
-### `io_ring::BuildError` was costed and declined
+### `io_ring::BuildError` was costed, declined, then done
 
-Carving a `BuildError` for `IoRingBuilder::build`, `IoRing::create` and
-`query_io_ring_capabilities` would narrow those three from 25 reachable variants
-to 4 — `Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`, `Os`.
+**Superseded.** The per-API error work carved exactly this type. `BuildError`
+now covers `IoRingBuilder::build`, `IoRing::create` and
+`query_io_ring_capabilities` with the four variants proposed here —
+`Unsupported`, `UnsupportedVersion`, `UnsupportedFeature`, and `Other` in place
+of `Os`.
 
-Declined because the gain and the cost are the same fact. The gain is that
-`build()` could no longer return `PipeBroken`; the cost is that
-`Error::from_create_failure` would stop delegating to `Error::from_hresult`, so a
-creation failure carrying any of that table's **five** codes — including
-`IORING_E_SUBMISSION_QUEUE_FULL` → `QueueFull`, not only the pipe codes — would
-become `Os`. Neither `CreateIoRing` nor `QueryIoRingCapabilities` realistically
-emits any of them, which means the defect being fixed is documentary and the
-regression introduced is theoretical. Paying a breaking change for that is not
-obviously right in either direction, so it was left alone.
+The cost that justified declining it did not materialise, and the reason is
+worth keeping. The objection was that `from_create_failure` would stop
+delegating to the shared classifier, so a creation failure carrying one of the
+table's five codes would flatten to `Os`. Under the design that shipped it still
+delegates — `crate::error::view::<BuildError>(err.code())` at
+`crates/win-ioring/src/io_ring/error.rs:88` — because each per-API type is a
+*view* over the one classification table rather than a private table of its own.
+A code the view does not name lands in `Other` carrying its `HRESULT`, so
+nothing is flattened.
 
-If taken later: `from_create_failure` has exactly two callers, both inside the
-proposed surface, so the change is contained. Pin all five rows, not just the
-pipe ones.
+That is a general point about this entry's reasoning rather than a lucky escape:
+the cost was real for a design where each API classifies independently, and it
+was the shared-table mechanism that removed it. See
+`docs/errors-and-the-funnel.md`.
 
 ### `runtime::RegistryError` was costed and declined
 
 Carving a `RegistryError` for `RegisteredBuffers::check_out` and
-`RegisteredBuf::fill` would narrow them from 25 variants to 6: `ShuttingDown`,
+`RegisteredBuf::fill` would narrow them from the 17 variants of `runtime::Error` to 6: `ShuttingDown`,
 `RegistrationPending`, `RegistrationSuperseded`, `InvalidRegisteredIndex`,
 `BufferCheckedOut`, `BufferTooSmall`.
 
@@ -242,23 +245,32 @@ would have introduced, for two methods. And the set it would enforce is
 refusals in order with the reason for each. The carve buys compiler enforcement
 of a promise the documentation already makes precisely, at +6 variant slots.
 
-Both of these were declined together with a wider per-module split; see
-`docs/errors-and-the-funnel.md` for why the errors do not partition by API at
-all.
+Both of these were declined at the time, together with a wider per-module
+split. **The wider split has since been done** — the crate now has six per-API
+error types — so the reasoning that bundled these two with it no longer applies
+and they would need re-costing on their own merits. See
+`docs/errors-and-the-funnel.md`.
 
-### `source()` chains only through `Error::Os`
+### `source()` chaining is now partial rather than absent
 
-`std::error::Error::source` returns `Some` only for `Error::Os`; every other
-variant is a leaf, including the ones that wrap a condition with a cause worth
-naming. `ops::MissingField` matches this deliberately.
+**Partly resolved, and the remainder re-costed.** The entry used to read
+"`source()` returns `Some` only for `Error::Os`". `Os` no longer exists. Each of
+the six per-API types now chains through every variant that genuinely wraps
+another error — `Ring`, `Buf`, `Other`, and on `file::Error` and `pipe::Error`
+also `Driver` — because those variants hold the wrapped value and had nowhere
+else to put it.
 
-Adding chaining would be an improvement and is a behaviour change: code that
-walks the source chain would start seeing links that were not there. It was left
-out of the error-type work deliberately rather than bundled into it, on the
-grounds that improvements should not ride along inside a refactor where nobody is
-looking for them. Cost if taken: an audit of all 25 variants for what their cause
-actually is, plus a decision about whether `Display` should then stop repeating
-what the source already says.
+What remains undone is the original point: the variants that name a *condition*
+are still leaves, even where the condition has a cause worth naming.
+`ops::MissingField` matches this deliberately.
+
+This was not an improvement smuggled into a refactor. The chaining that appeared
+is a consequence of the wrapping variants existing at all, not a separate
+decision; the audit that was declined is still declined. Cost if taken: an audit
+of all 50 variants across the six types for what their cause actually is — up
+from 25 across one type, so the change got more expensive, not less — plus a
+decision about whether `Display` should then stop repeating what the source
+already says.
 
 ### SQE flags are not available on every path
 
@@ -278,7 +290,7 @@ Two specific hazards follow, both accepted rather than solved:
 - **An operation that never completes hangs the shutdown.** Cancellation is
   best-effort, so an operation the platform will not abandon has no exit. The
   alternative — giving up and freeing memory the kernel may still write into —
-  is a use-after-free, so hanging is the lesser failure. `Error::ShutdownStalled`
+  is a use-after-free, so hanging is the lesser failure. `runtime::Error::ShutdownStalled`
   exists so the caller can at least see it happening.
 - **Registrations cannot be cancelled at all.** A cancellation must name the file
   its target named, and a registration names none, so one in flight can only be
@@ -530,6 +542,195 @@ closed-form prediction for the declared shape and routes a mismatch through
   forgotten". Closing the gap needs a link from each criterion to the tests that
   gate it, which this repository has no convention for.
 
+## Deferred by the per-API errors work
+
+### Accepted deviation: `TimedRegion` adds code inside the measured region
+
+**Disclosed, not deferred.** The constraint on the per-API error work was stated
+twice as *nothing may touch a timed path*. `TimedRegion::enter()` is the first
+statement of `Runner::run`
+(`crates/win-ioring-bench/src/concurrency.rs:325`), and `Runner::run` is what
+Criterion times. So the letter of the constraint held — `docs/performance.md` is
+byte-identical to `main` — while the spirit was **traded for a guard, on
+purpose**. A reader told "nothing touches the timed path" would not go looking
+for a thread-local in `Runner::run`, which is why it is written here.
+
+**What was added.** One increment of a `const`-initialised
+`thread_local! { Cell<usize> }` on entry and one decrement on drop. Nothing
+else; no allocation, no syscall, no branch on a shared value.
+
+**What it costs, measured.** 1.98 ns net per enter-and-drop pair: release build,
+tight loop of 2e8 iterations, `black_box` on the guard, best of five, minus an
+empty-loop baseline measured the same way. It is charged **per `run` call, not
+per operation** — and `run` is called once per iteration for the three read
+scenarios and twice for write-then-read (`scenario.rs:353`, `:399`, `:418`),
+which is the same 1/1/2/1 pattern as the opens column above.
+
+| scenario | `run` calls | added | iteration | share |
+| --- | --- | --- | --- | --- |
+| sequential read | 1 | 1.98 ns | 18.11 ms | **0.000011%** |
+| random read | 1 | 1.98 ns | 5.08 ms | **0.000039%** |
+| write then read | 2 | 3.96 ns | 44.08 ms | **0.0000090%** |
+| bulk read | 1 | 1.98 ns | 18.48 ms | **0.000011%** |
+
+The worst share is **0.000039%**, about six orders of magnitude below the
++24% edge of the null band every ratio is judged against. The measurement is
+optimistic in one way — a tight loop keeps the TLS address in a register, where
+a cold resolution in situ would cost more — so allow a 10x margin and the worst
+share becomes 0.00039%, still five orders below the band edge. For scale,
+`docs/performance.md` already discloses and reasons about a 29.1 µs per-iteration
+fairness cost, which is roughly **15,000x larger** than this one.
+
+**Why an observation rather than a source scan.** The alternative was a test
+reading the source for a `sync` call between `run(` and its closing brace. The
+sibling per-API error work retired exactly that species of guard after it was
+defeated nine times across three review rounds, all instances of one unbounded
+class: get a construct past a text scanner. Observing the run cannot be spelled
+around. This is the same bounded-versus-unbounded choice recorded in
+`docs/testing.md`.
+
+**The next matrix re-run inherits this.** It is present in every timed
+iteration from now on. Do not attribute a shift to it without checking — at
+1e-7 relative it cannot produce one — and equally do not rule it out by
+assumption; the figures above are what a check should reproduce.
+
+**The `assert!` is outside the region.** `Backend::sync` implementations that
+reach `File::flush` assert `!in_timed_region()`
+(`backends/ioring.rs:291`, `:486`). `sync` is called outside `Runner::run`, so
+the assert costs nothing measured. Its safety property is that failures are
+possible only in the direction of **missing** a violation, never of inventing
+one: the mark is per-thread and set only while `run` is polled, so a `sync`
+outside the region reads zero even while another thread is mid-run, and a `sync`
+inside is part of the same future as the `run` that set the mark and is polled
+on that thread.
+
+
+### `a_pipe_read_succeeds_through_a_registered_file_handle` fails intermittently on CI
+
+Unattributed. It failed once on a GitHub runner with
+`Other(HRESULT(0x80070006), "The handle is invalid.")` at
+`crates/win-ioring-tests/tests/pipe_tests.rs:194` — the `read_registered`
+against `FileTarget::Registered { index: 0 }`.
+
+The evidence, in full, because it does not settle the question:
+
+| Where | Runs | Failures |
+|---|---|---|
+| `feature/per-api-errors` | 6 | 1 |
+| `main` (pushed to throwaway branches) | 7 | 0 |
+| Local, same test in a loop | 25 | 0 |
+
+1-in-6 against 0-in-7 is not a difference; it is two samples consistent with the
+same underlying rate. **So this is recorded as unattributed rather than as a
+pre-existing flake**, which is the reading that would let the per-API error work
+off the hook.
+
+Two things were ruled out:
+
+- **`File::clone` at `:182` is not a double-close.** `File` is
+  `Rc<FileState>`; cloning shares the handle.
+- **The test text is unchanged from `main`.** But the crate underneath it
+  changed substantially, so that alone clears nothing.
+
+One piece of evidence was withdrawn: `main` appeared to have 19 consecutive
+green runs, which looked like strong baseline. Only **one** of them postdates
+the named-pipes merge that added this test, so the figure was worthless. The
+seven baseline runs above were generated deliberately for this reason.
+
+This is most likely the same failure as the single unattributed local failure
+during Phase 7 of the per-API error work, which cleared before its name could be
+captured. That is a hypothesis, not an identification.
+
+Worth suspecting first if it recurs: registered *file handles* are the most
+version-sensitive IoRing feature this crate uses, and the runner's Windows build
+need not match a developer machine's. See `docs/platform-notes.md`.
+
+**New evidence, from the Option B work.** A second test was written against
+`FileTarget::Registered { index: 0 }` on a pipe, to pin the demoted-but-code-
+preserved behaviour. It failed on its **first** full-workspace run with the same
+`0x80070006`, then passed **12 of 12** runs in isolation. That is a second test,
+with different text and a different assertion, failing the same way on the same
+primitive — which shifts the suspicion further towards `register_files` itself
+and away from anything specific to the original test. It is still not an
+identification: the isolation result says the failure needs concurrent load to
+appear, and nothing here explains *why*.
+
+That test was rebuilt on `FileTarget::Owned` and has since passed 6 of 6
+full-workspace runs. **That change is not evidence about the flake** — it is a
+test moved off a suspect primitive so it reports on the design decision it exists
+to pin rather than on the platform. The `Registered { index }` path is still
+covered by the original test above, which remains the one to watch.
+
+
+Three recorded decisions, not omissions. Each was reached during the split of
+`crate::Error` into six per-API types and deliberately left out of it.
+
+### The pipe surface has no ordering interlock
+
+`Client` and `Server` now have `read_at`/`write_at` returning `pipe::Error`
+(FR-18). Neither has the interlock the file surface has for sequential I/O:
+`File::read`/`File::write` refuse to run concurrently with themselves because
+they track a cursor, and `sequential_outstanding` enforces that. The pipe methods
+are positional and hold no cursor, so nothing there needs the same guard — but
+nothing stops a caller issuing overlapping reads on a stream, where the *kernel*
+does not guarantee which lands first.
+
+**Cost of doing it:** an outstanding-operation flag per pipe handle, plus a
+`pipe::Error` variant to report the refusal. **Cost of not doing it:** a caller
+who overlaps pipe reads gets interleaved bytes with no diagnostic. Deferred
+because it is a pre-existing property of positional I/O rather than something the
+error split introduced, and adding a refusal is a behaviour change that wants its
+own justification rather than riding inside an error-type change.
+
+### `register_files` is not generalised over the new types
+
+Registration takes files specifically. Now that pipes have their own surface and
+their own error type, the natural question is whether a pipe handle can be
+registered the same way. It can — `Client` and `Server` hold a `File` — but the
+API says `File` and the error it returns is `runtime::Error`.
+
+**Cost:** a generic bound plus a decision about which error type a registration
+failure reports when the thing registered is a pipe. That decision is the same
+shape as the one the error split spent most of its design budget on, and it did
+not need re-opening to ship the split. Deferred with the reasoning intact.
+
+### Registered pipe I/O cannot report a named pipe condition
+
+`read_registered` / `write_registered` are the only pipe-capable I/O with no
+pipe-surface wrapper, so a caller reading a pipe through a registration gets a
+`runtime::Error`. Only `pipe::Error` names a pipe condition, so a broken pipe
+arrives there as `Other(ERROR_BROKEN_PIPE)` rather than as `Broken`.
+
+This is a **deliberate trade, not an oversight**. `FileTarget::Registered { index }`
+is a slot number; nothing in it can say the handle behind it is a pipe, and
+`FileTarget::Owned(&File)` cannot either, because `Client::file()` and
+`Server::file()` hand out a `&File`. Naming the condition there would be a guess
+that happened to be right in the cases anyone tested.
+
+**What is lost is the name only.** The read works, the platform's own code is
+carried in `Other` and reachable through `os_error()`, and
+`pipe::Error::from(code)` recovers the condition for a caller who knows what they
+registered. `a_registered_pipe_read_demotes_its_condition_but_keeps_the_code`
+pins exactly that, so the trade fails loudly if either half stops holding.
+
+**Cost to close:** a pipe-surface wrapper for registered I/O, which needs a
+registration that remembers what kind of handle it holds — the same decision
+deferred by *`register_files` is not generalised over the new types* above, and
+the two should be done together or not at all.
+
+### Shutdown with a full slab drains slowly in unoptimised builds
+
+Tearing down a driver holding 65,536 outstanding operations takes ~40 seconds in
+a debug build and ~1.7 seconds in release — roughly 0.6 ms per operation
+unoptimised against 26 µs optimised. Measured while pinning the two exhaustion
+producers (`crates/win-ioring-tests/tests/exhaustion.rs`), which is why that test
+carries a stated cost.
+
+The 23x ratio says this is unoptimised-build overhead rather than a shutdown
+defect, so it is recorded rather than filed as a bug. It is worth knowing before
+anyone adds a second test that leaves the slab full: the cost is per-operation
+and it is paid in every debug `cargo test` run.
+
 ## Minor
 
 - **`cargo bench -p win-ioring-bench -- --list` builds the full working set.**
@@ -556,7 +757,7 @@ closed-form prediction for the declared shape and routes a mismatch through
 - `cqe.Information as Transferred` is an unchecked `usize` → `u32` truncation.
   Safe today because every submission path bounds the length by a `u32` argument,
   but a `debug_assert!` would document and enforce that invariant for free.
-- `AsyncEvent::wait_sync` maps `WAIT_TIMEOUT` to `Error::from_thread()`, which
+- `AsyncEvent::wait_sync` maps `WAIT_TIMEOUT` to `windows::core::Error::from_thread()`, which
   reports whatever unrelated error happens to be in thread-local storage.
   `WAIT_TIMEOUT` is a return value, not a last-error condition. Both match arms
   are also identical, so the explicit `WAIT_TIMEOUT` arm looks like it

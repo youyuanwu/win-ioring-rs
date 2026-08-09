@@ -25,9 +25,12 @@
 //! deliberately not trusted in the other, because one is a synchronous return
 //! this code just observed and the other is an inference about kernel state.
 
-use crate::error::Error;
+use crate::buf::{IoBuf, IoBufMut};
 use crate::file::File;
+use crate::pipe::error::Error;
+use crate::pipe::io::{PipeRead, PipeWrite};
 use crate::runtime::AbortOnUnwind;
+use crate::runtime::Handle;
 use crate::sys::{ArmedEvent, Registration};
 use windows::Win32::Foundation::{
     ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_PIPE_CONNECTED, HANDLE,
@@ -133,7 +136,7 @@ thread_local! {
 /// use win_ioring::pipe::ServerOptions;
 ///
 /// let server = ServerOptions::new().max_instances(4).create("demo")?;
-/// # Ok::<(), win_ioring::Error>(())
+/// # Ok::<(), win_ioring::pipe::Error>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -233,7 +236,7 @@ impl ServerOptions {
     /// created, or if [`ServerOptions::first_instance_only`] was set and it is
     /// not the first. An options set with neither direction allowed is refused
     /// by the platform with `ERROR_INVALID_PARAMETER`.
-    pub fn create(&self, name: impl AsRef<str>) -> crate::Result<Server> {
+    pub fn create(&self, name: impl AsRef<str>) -> Result<Server, Error> {
         let path = super::qualify(name.as_ref());
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -275,9 +278,7 @@ impl ServerOptions {
         };
 
         if handle.is_invalid() {
-            return Err(Error::from_hresult(
-                windows::core::Error::from_thread().code(),
-            ));
+            return Err(Error::from(windows::core::Error::from_thread().code()));
         }
 
         Ok(Server {
@@ -390,7 +391,7 @@ enum AcceptState {
 /// one on, so the name is never left without something listening:
 ///
 /// ```
-/// # fn main() -> win_ioring::Result<()> {
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// use win_ioring::pipe::{ClientOptions, ServerOptions};
 ///
 /// let name = format!("win-ioring-doc-serve-{}", std::process::id());
@@ -415,7 +416,7 @@ enum AcceptState {
 ///                 if let Ok(client) = ClientOptions::new().open(&name) {
 ///                     // Held, not dropped. A client that closes before the
 ///                     // server accepts leaves nothing to connect to, and the
-///                     // accept reports `Error::PipeNoPeer` rather than a
+///                     // accept reports `Error::NoPeer` rather than a
 ///                     // connection.
 ///                     held.push(client);
 ///                     break;
@@ -443,7 +444,7 @@ enum AcceptState {
 ///             served += 1;
 ///             drop(connected);
 ///         }
-///         Ok::<_, win_ioring::Error>(served)
+///         Ok::<_, win_ioring::pipe::Error>(served)
 ///     })?;
 ///
 /// // Release the clients now the server has finished with them.
@@ -476,7 +477,7 @@ impl std::fmt::Debug for Server {
 
 impl Server {
     /// Creates one instance with default options.
-    pub fn create(name: impl AsRef<str>) -> crate::Result<Self> {
+    pub fn create(name: impl AsRef<str>) -> Result<Self, Error> {
         ServerOptions::new().create(name)
     }
 
@@ -549,14 +550,52 @@ impl Server {
     ///
     /// Refused unless a client is connected **and observed**, because the other
     /// states would produce wrong results rather than obvious ones: a read on a
-    /// listening instance fails with [`Error::PipeListening`], and a read on an
+    /// listening instance fails with [`Error::Listening`], and a read on an
     /// instance whose accept completed but was never collected would succeed
     /// against a peer the caller has not been told exists.
-    pub fn file(&self) -> crate::Result<&File> {
+    pub fn file(&self) -> Result<&File, Error> {
         match &self.accept {
             AcceptState::Connected => Ok(&self.file),
-            AcceptState::Fresh | AcceptState::Idle => Err(Error::PipeListening),
+            AcceptState::Fresh | AcceptState::Idle => Err(Error::Listening),
             AcceptState::Accepting(_) => Err(Error::AcceptOutstanding),
+        }
+    }
+
+    /// Reads up to `len` bytes into `buffer`, reporting failures as [`Error`].
+    ///
+    /// Refused with [`Error::Listening`] or [`Error::AcceptOutstanding`] if no
+    /// client is connected yet. The refusal is delivered by the returned future
+    /// rather than by a `Result` around it, so `buffer` comes back either way —
+    /// the same contract every other operation in this crate keeps.
+    ///
+    /// The offset is ignored and there is no sequential counterpart; see
+    /// [`Client::read_at`](crate::pipe::Client::read_at) for why.
+    pub fn read_at<B: IoBufMut>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeRead<B> {
+        match self.file() {
+            Ok(file) => PipeRead::issue(handle, file, buffer, len, offset),
+            Err(e) => PipeRead::rejected(e, buffer),
+        }
+    }
+
+    /// Writes `len` bytes from `buffer`, reporting failures as [`Error`].
+    ///
+    /// Refused exactly as [`read_at`](Self::read_at) is.
+    pub fn write_at<B: IoBuf>(
+        &self,
+        handle: &Handle,
+        buffer: B,
+        len: u32,
+        offset: u64,
+    ) -> PipeWrite<B> {
+        match self.file() {
+            Ok(file) => PipeWrite::issue(handle, file, buffer, len, offset),
+            Err(e) => PipeWrite::rejected(e, buffer),
         }
     }
 
@@ -588,7 +627,7 @@ impl Server {
     /// unrepresentable rather than merely refused at runtime:
     ///
     /// ```compile_fail
-    /// # fn demo() -> win_ioring::Result<()> {
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
     /// use win_ioring::pipe::ServerOptions;
     ///
     /// let mut server = ServerOptions::new().create("demo")?;
@@ -607,7 +646,7 @@ impl Server {
     /// what establishes that the failure above is the borrow and not a typo:
     ///
     /// ```
-    /// # fn demo() -> win_ioring::Result<()> {
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
     /// use win_ioring::pipe::ServerOptions;
     ///
     /// let mut server = ServerOptions::new().create("demo")?;
@@ -635,7 +674,7 @@ impl Server {
     ///
     /// `Ok(true)` means a client is connected now and the future has nothing to
     /// wait for. `Ok(false)` means the caller must wait on the slot's event.
-    fn begin_accept(&mut self) -> crate::Result<bool> {
+    fn begin_accept(&mut self) -> Result<bool, Error> {
         match &self.accept {
             // Already serving somebody; nothing to submit.
             AcceptState::Connected => return Ok(true),
@@ -714,7 +753,7 @@ impl Server {
                 // before, and `Fresh` and `Idle` differ in a way a blanket
                 // reset would destroy. Dropping `slot` here is correct for the
                 // same reason -- the kernel never took the pointer.
-                Err(Error::from_hresult(e.code()))
+                Err(Error::from(e.code()))
             }
         }
     }
@@ -724,7 +763,7 @@ impl Server {
     /// `Ok(true)` means a client is now connected and observed. `Ok(false)`
     /// means the operation is still outstanding and the caller must keep
     /// waiting on it — it is not an error and it is not a connection.
-    fn collect(&mut self) -> crate::Result<bool> {
+    fn collect(&mut self) -> Result<bool, Error> {
         let AcceptState::Accepting(slot) = &self.accept else {
             // Nothing outstanding. Whatever the state is, it is not one this can
             // advance, and the caller's `Connected` check is what decides.
@@ -778,7 +817,7 @@ impl Server {
             // `is_connected()` false, which is the silent-wrong-answer class
             // this state machine exists to prevent.
             Err(e) if e.code() == ERROR_IO_INCOMPLETE.to_hresult() => Ok(false),
-            Err(e) => Err(Error::from_hresult(e.code())),
+            Err(e) => Err(Error::from(e.code())),
         }
     }
 
@@ -810,12 +849,12 @@ impl Server {
     /// still writing a connect result for would leave that result describing a
     /// connection that no longer exists.
     ///
-    /// Refused with [`Error::PipeListening`] when there is no client to
+    /// Refused with [`Error::Listening`] when there is no client to
     /// disconnect.
-    pub fn disconnect(&mut self) -> crate::Result<()> {
+    pub fn disconnect(&mut self) -> Result<(), Error> {
         match &self.accept {
             AcceptState::Connected => {}
-            AcceptState::Fresh | AcceptState::Idle => return Err(Error::PipeListening),
+            AcceptState::Fresh | AcceptState::Idle => return Err(Error::Listening),
             AcceptState::Accepting(_) => return Err(Error::AcceptOutstanding),
         }
 
@@ -823,7 +862,7 @@ impl Server {
         // no connect is outstanding, so nothing is writing into an `OVERLAPPED`
         // for this handle.
         unsafe { DisconnectNamedPipe(self.file.as_raw_handle()) }
-            .map_err(|e| Error::from_hresult(e.code()))?;
+            .map_err(|e| Error::from(e.code()))?;
 
         // `Idle`, not `Fresh`: the platform will not admit a client here until a
         // connect is submitted, and the two states exist to keep that difference
@@ -1008,7 +1047,7 @@ impl<'a> Accept<'a> {
 }
 
 impl std::future::Future for Accept<'_> {
-    type Output = crate::Result<()>;
+    type Output = Result<(), Error>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -1031,7 +1070,7 @@ impl std::future::Future for Accept<'_> {
                     // exclusively: nothing else can call `disconnect`, and
                     // `Drop` cannot run. Reported rather than assumed away.
                     AcceptState::Fresh | AcceptState::Idle => {
-                        return Poll::Ready(Err(Error::PipeListening));
+                        return Poll::Ready(Err(Error::Listening));
                     }
                 };
 
@@ -1806,12 +1845,12 @@ mod tests {
         assert!(!server.accept_outstanding());
         assert_eq!(server.connect_submissions(), 0);
         assert!(
-            matches!(server.file(), Err(Error::PipeListening)),
+            matches!(server.file(), Err(Error::Listening)),
             "a listening instance has no peer, which is not the same condition \
              as an accept being in progress, got {:?}",
             server.file().err()
         );
-        assert!(matches!(server.disconnect(), Err(Error::PipeListening)));
+        assert!(matches!(server.disconnect(), Err(Error::Listening)));
     }
 
     /// A disconnected instance is **not** a listening one, and serves again
@@ -1850,7 +1889,7 @@ mod tests {
              submitted -- reporting otherwise is the defect this test exists for"
         );
         assert!(
-            matches!(Client::connect(&name), Err(Error::PipeBusy)),
+            matches!(Client::connect(&name), Err(Error::Busy)),
             "and the platform agrees: the instance is not listening yet"
         );
 
