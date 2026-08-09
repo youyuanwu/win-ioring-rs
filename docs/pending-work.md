@@ -544,6 +544,67 @@ closed-form prediction for the declared shape and routes a mismatch through
 
 ## Deferred by the per-API errors work
 
+### Accepted deviation: `TimedRegion` adds code inside the measured region
+
+**Disclosed, not deferred.** The constraint on the per-API error work was stated
+twice as *nothing may touch a timed path*. `TimedRegion::enter()` is the first
+statement of `Runner::run`
+(`crates/win-ioring-bench/src/concurrency.rs:325`), and `Runner::run` is what
+Criterion times. So the letter of the constraint held — `docs/performance.md` is
+byte-identical to `main` — while the spirit was **traded for a guard, on
+purpose**. A reader told "nothing touches the timed path" would not go looking
+for a thread-local in `Runner::run`, which is why it is written here.
+
+**What was added.** One increment of a `const`-initialised
+`thread_local! { Cell<usize> }` on entry and one decrement on drop. Nothing
+else; no allocation, no syscall, no branch on a shared value.
+
+**What it costs, measured.** 1.98 ns net per enter-and-drop pair: release build,
+tight loop of 2e8 iterations, `black_box` on the guard, best of five, minus an
+empty-loop baseline measured the same way. It is charged **per `run` call, not
+per operation** — and `run` is called once per iteration for the three read
+scenarios and twice for write-then-read (`scenario.rs:353`, `:399`, `:418`),
+which is the same 1/1/2/1 pattern as the opens column above.
+
+| scenario | `run` calls | added | iteration | share |
+| --- | --- | --- | --- | --- |
+| sequential read | 1 | 1.98 ns | 18.11 ms | **0.000011%** |
+| random read | 1 | 1.98 ns | 5.08 ms | **0.000039%** |
+| write then read | 2 | 3.96 ns | 44.08 ms | **0.0000090%** |
+| bulk read | 1 | 1.98 ns | 18.48 ms | **0.000011%** |
+
+The worst share is **0.000039%**, about six orders of magnitude below the
++24% edge of the null band every ratio is judged against. The measurement is
+optimistic in one way — a tight loop keeps the TLS address in a register, where
+a cold resolution in situ would cost more — so allow a 10x margin and the worst
+share becomes 0.00039%, still five orders below the band edge. For scale,
+`docs/performance.md` already discloses and reasons about a 29.1 µs per-iteration
+fairness cost, which is roughly **15,000x larger** than this one.
+
+**Why an observation rather than a source scan.** The alternative was a test
+reading the source for a `sync` call between `run(` and its closing brace. The
+sibling per-API error work retired exactly that species of guard after it was
+defeated nine times across three review rounds, all instances of one unbounded
+class: get a construct past a text scanner. Observing the run cannot be spelled
+around. This is the same bounded-versus-unbounded choice recorded in
+`docs/testing.md`.
+
+**The next matrix re-run inherits this.** It is present in every timed
+iteration from now on. Do not attribute a shift to it without checking — at
+1e-7 relative it cannot produce one — and equally do not rule it out by
+assumption; the figures above are what a check should reproduce.
+
+**The `assert!` is outside the region.** `Backend::sync` implementations that
+reach `File::flush` assert `!in_timed_region()`
+(`backends/ioring.rs:291`, `:486`). `sync` is called outside `Runner::run`, so
+the assert costs nothing measured. Its safety property is that failures are
+possible only in the direction of **missing** a violation, never of inventing
+one: the mark is per-thread and set only while `run` is polled, so a `sync`
+outside the region reads zero even while another thread is mid-run, and a `sync`
+inside is part of the same future as the `run` that set the mark and is polled
+on that thread.
+
+
 ### `a_pipe_read_succeeds_through_a_registered_file_handle` fails intermittently on CI
 
 Unattributed. It failed once on a GitHub runner with
